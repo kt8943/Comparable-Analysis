@@ -71,8 +71,8 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 # ── Cloud secrets bootstrap (Streamlit Cloud) ──────────────────────────────────
 # On Streamlit Cloud there is no on-prem shared_settings.json. Build it from
-# st.secrets / env vars so the LLM (OpenAI) and the geocoding providers work, and
-# so backend subprocesses inherit the keys via the environment. No-op locally.
+# st.secrets / env vars so the LLM (OpenAI) and geocoding providers work, and so
+# backend subprocesses inherit the keys via the environment. No-op locally.
 def _bootstrap_cloud_secrets() -> None:
     import json as _j
     keys = ("OPENAI_API_KEY", "MAPBOX_TOKEN", "GOOGLE_MAPS_KEY",
@@ -87,8 +87,8 @@ def _bootstrap_cloud_secrets() -> None:
     for k in keys:
         vals.setdefault(k, os.environ.get(k, ""))
     if not any(vals.values()):
-        return  # nothing configured (e.g. running locally) — leave things alone
-    for k, v in vals.items():          # expose to backend subprocesses
+        return
+    for k, v in vals.items():
         if v and not os.environ.get(k):
             os.environ[k] = v
     cfgdir = ROOT / "configs"
@@ -102,10 +102,10 @@ def _bootstrap_cloud_secrets() -> None:
             existing = {}
     existing["geocoding_provider"] = (
         vals.get("GEOCODING_PROVIDER") or existing.get("geocoding_provider") or "mapbox")
-    if vals.get("MAPBOX_TOKEN"):    existing["mapbox_token"]   = vals["MAPBOX_TOKEN"]
+    if vals.get("MAPBOX_TOKEN"):    existing["mapbox_token"]    = vals["MAPBOX_TOKEN"]
     if vals.get("GOOGLE_MAPS_KEY"): existing["google_maps_key"] = vals["GOOGLE_MAPS_KEY"]
-    if vals.get("KAKAO_API_KEY"):   existing["kakao_api_key"]  = vals["KAKAO_API_KEY"]
-    if vals.get("OPENAI_API_KEY"):  existing["openai_api_key"] = vals["OPENAI_API_KEY"]
+    if vals.get("KAKAO_API_KEY"):   existing["kakao_api_key"]   = vals["KAKAO_API_KEY"]
+    if vals.get("OPENAI_API_KEY"):  existing["openai_api_key"]  = vals["OPENAI_API_KEY"]
     try:
         ssp.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
     except Exception:
@@ -889,6 +889,7 @@ def _show_interactive_map(geo_path, excel_path, context: str):
             "property": c.get("property", ""),
             "address":  c.get("address", ""),
             "marker":   str(c["map_marker"]),
+            "color":    c.get("color"),
         }
         for c in all_comps
         if c.get("lon") is not None and not c.get("hidden", False)
@@ -946,65 +947,83 @@ def _show_interactive_map(geo_path, excel_path, context: str):
         },
     }
 
-    # Per-pin colour. An explicit "color" on the comp ("red"/"navy") wins; else the
-    # default (red when the subject is hidden, navy otherwise). Matches the PNG.
-    _RED, _NAVY = [210, 40, 40, 240], [25, 90, 200, 230]
-    _default_rgba = _RED if not _show_subject else _NAVY
-    for _c in visible:
-        _col = str(_c.get("color") or "").lower()
-        _c["_rgba"] = (_RED if _col in ("red", "subject")
-                       else _NAVY if _col in ("navy", "blue", "comp")
-                       else _default_rgba)
-    comp_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=visible,
-        get_position=["lon", "lat"],
-        get_color="_rgba",
-        get_radius=160,
-        radius_min_pixels=10,
-        radius_max_pixels=26,
-        pickable=True,
-        auto_highlight=True,
-    )
-    subj_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=subject_pt,
-        get_position=["lon", "lat"],
-        get_color=[210, 40, 40, 240],
-        get_radius=180,
-        radius_min_pixels=11,
-        radius_max_pixels=28,
-        pickable=True,
-        auto_highlight=True,
-    )
-    label_layer = pdk.Layer(
-        "TextLayer",
-        data=visible,
-        get_position=["lon", "lat"],
-        get_text="marker",
-        get_size=14,
-        get_color=[255, 255, 255, 255],
-        get_alignment_baseline="'center'",
-        pickable=False,
-    )
-    view = pdk.ViewState(longitude=center_lon, latitude=center_lat,
-                         zoom=_fit_zoom(all_pts), pitch=0)
+    # ── Interactive Google Map (default roadmap style) ────────────────────────
+    # Rendered via the Google Maps JavaScript API — reachable on corporate networks
+    # that block Mapbox/Carto vector basemaps. Requires a google_maps_key with the
+    # "Maps JavaScript API" enabled. Numbered markers, per-pin colour, click = info.
+    _gkey = ""
+    try:
+        _gkey = json.loads((ROOT / "configs" / "shared_settings.json").read_text(
+            encoding="utf-8")).get("google_maps_key", "") or ""
+    except Exception:
+        _gkey = ""
+    _gkey = _gkey or os.environ.get("GOOGLE_MAPS_KEY", "")
 
-    # Interactive basemap: ALWAYS use Carto (token-free) tiles. They load without a
-    # Mapbox key AND — crucially — are reachable on restrictive corporate networks
-    # that block api.mapbox.com (Mapbox tiles render blank there). The static PNG
-    # map still uses Mapbox server-side.
-    map_style = "light"
-    map_prov  = "carto"
+    def _pin_hex(c):
+        _col = str(c.get("color") or "").lower()
+        if _col in ("red", "subject"):
+            return "#c0392b"
+        if _col in ("navy", "blue", "comp"):
+            return "#1a5276"
+        return "#c0392b" if not _show_subject else "#1a5276"
 
-    deck = pdk.Deck(
-        layers=[comp_layer] + ([subj_layer] if _show_subject else []) + [label_layer],
-        initial_view_state=view,
-        tooltip=tooltip,
-        map_provider=map_prov,
-        map_style=map_style,
-    )
-    st.pydeck_chart(deck, use_container_width=True, height=520)
+    _gmarkers = [{"lat": c["lat"], "lng": c["lon"], "label": str(c.get("marker", "")),
+                  "title": str(c.get("property") or ""),
+                  "addr": str(c.get("address") or ""), "color": _pin_hex(c)}
+                 for c in visible]
+    _gsubject = (json.dumps({"lat": s_lat, "lng": s_lon})
+                 if (_show_subject and s_lat is not None) else "null")
+
+    if not _gkey:
+        st.warning("Add a Google Maps API key (Shared Settings → **google_maps_key**) "
+                   "with the **Maps JavaScript API** enabled to display the map.")
+    else:
+        _gmap_html = """
+<div id="cmap" style="width:100%;height:520px;border-radius:8px;"></div>
+<script>
+  function initCompMap() {
+    const comps = __MARKERS__;
+    const subject = __SUBJECT__;
+    const map = new google.maps.Map(document.getElementById("cmap"), {
+      mapTypeControl: true, streetViewControl: false, fullscreenControl: true
+    });
+    const bounds = new google.maps.LatLngBounds();
+    const info = new google.maps.InfoWindow();
+    comps.forEach(function(m) {
+      const mk = new google.maps.Marker({
+        position: {lat: m.lat, lng: m.lng}, map: map,
+        label: {text: m.label, color: "#ffffff", fontSize: "12px", fontWeight: "bold"},
+        icon: {path: google.maps.SymbolPath.CIRCLE, scale: 13, fillColor: m.color,
+               fillOpacity: 1, strokeColor: "#ffffff", strokeWeight: 2}
+      });
+      mk.addListener("click", function() {
+        info.setContent("<div style='font-family:sans-serif'><b>" + m.label + ". " +
+          m.title + "</b><br><span style='color:#666;font-size:11px'>" + m.addr +
+          "</span></div>");
+        info.open(map, mk);
+      });
+      bounds.extend(mk.getPosition());
+    });
+    if (subject) {
+      const s = new google.maps.Marker({
+        position: subject, map: map, zIndex: 999,
+        label: {text: "\\u2605", color: "#ffffff", fontSize: "15px"},
+        icon: {path: google.maps.SymbolPath.CIRCLE, scale: 15, fillColor: "#c0392b",
+               fillOpacity: 1, strokeColor: "#ffffff", strokeWeight: 2}
+      });
+      bounds.extend(s.getPosition());
+    }
+    const n = comps.length + (subject ? 1 : 0);
+    if (n <= 1) { map.setCenter(bounds.getCenter()); map.setZoom(15); }
+    else { map.fitBounds(bounds); }
+  }
+</script>
+<script async src="https://maps.googleapis.com/maps/api/js?key=__KEY__&callback=initCompMap"></script>
+"""
+        _gmap_html = (_gmap_html.replace("__MARKERS__", json.dumps(_gmarkers))
+                                .replace("__SUBJECT__", _gsubject)
+                                .replace("__KEY__", _gkey))
+        st.components.v1.html(_gmap_html, height=540)
 
     # ── Map credit ───────────────────────────────────────────────────────────
     _ss_credit = {}
