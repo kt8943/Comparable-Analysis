@@ -17,7 +17,5 @@ offline_packages/
 offline_packages_OLD_backup/
 fastembed*/
 backend/data/*.geojson
-backend/data/*.pkl
-backend/data/_onemap_tourism.json
 *.zip
 tmp*.json

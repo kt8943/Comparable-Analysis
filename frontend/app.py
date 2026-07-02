@@ -68,6 +68,52 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "backend"))
 
+
+# ── Cloud secrets bootstrap (Streamlit Cloud) ──────────────────────────────────
+# On Streamlit Cloud there is no on-prem shared_settings.json. Build it from
+# st.secrets / env vars so the LLM (OpenAI) and the geocoding providers work, and
+# so backend subprocesses inherit the keys via the environment. No-op locally.
+def _bootstrap_cloud_secrets() -> None:
+    import json as _j
+    keys = ("OPENAI_API_KEY", "MAPBOX_TOKEN", "GOOGLE_MAPS_KEY",
+            "KAKAO_API_KEY", "GEOCODING_PROVIDER")
+    vals = {}
+    try:
+        for k in keys:
+            if k in st.secrets:
+                vals[k] = str(st.secrets[k])
+    except Exception:
+        pass
+    for k in keys:
+        vals.setdefault(k, os.environ.get(k, ""))
+    if not any(vals.values()):
+        return  # nothing configured (e.g. running locally) — leave things alone
+    for k, v in vals.items():          # expose to backend subprocesses
+        if v and not os.environ.get(k):
+            os.environ[k] = v
+    cfgdir = ROOT / "configs"
+    cfgdir.mkdir(exist_ok=True)
+    ssp = cfgdir / "shared_settings.json"
+    existing = {}
+    if ssp.exists():
+        try:
+            existing = _j.loads(ssp.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    existing["geocoding_provider"] = (
+        vals.get("GEOCODING_PROVIDER") or existing.get("geocoding_provider") or "mapbox")
+    if vals.get("MAPBOX_TOKEN"):    existing["mapbox_token"]   = vals["MAPBOX_TOKEN"]
+    if vals.get("GOOGLE_MAPS_KEY"): existing["google_maps_key"] = vals["GOOGLE_MAPS_KEY"]
+    if vals.get("KAKAO_API_KEY"):   existing["kakao_api_key"]  = vals["KAKAO_API_KEY"]
+    if vals.get("OPENAI_API_KEY"):  existing["openai_api_key"] = vals["OPENAI_API_KEY"]
+    try:
+        ssp.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_bootstrap_cloud_secrets()
+
 # ── Corporate proxy TLS fix (trust OS cert store; no-op without truststore) ────
 from tools import corp_ssl  # noqa: F401  — must import before any HTTPS call
 
