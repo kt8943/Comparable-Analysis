@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/
+
+# Secrets & confidential data — never commit
+configs/
+Input_files/
+output/
+*.xlsx
+*.pdf
+get_coordinates.ipynb
+*.ipynb
+
+# Large / generated artifacts (transfer separately or use git-LFS)
+offline_packages/
+offline_packages_OLD_backup/
+fastembed*/
+backend/data/*.geojson
+backend/data/*.pkl
+backend/data/_onemap_tourism.json
+*.zip
+tmp*.json

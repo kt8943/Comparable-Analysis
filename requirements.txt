@@ -1,0 +1,72 @@
+# PGIM Deal Analysis Platform — Python dependencies
+# Tested on Python 3.10+
+#
+# Install all at once:
+#   pip install -r requirements.txt
+#
+# Runtime prerequisites (NOT pip packages — install separately):
+#   Ollama  https://ollama.com            — local LLM inference (fallback only for mapping/classify)
+#   Mapbox  https://account.mapbox.com   — static map rendering (token in deal config)
+#
+# Runtime DATA files (NOT pip packages — must be present, not installable):
+#   backend/data/MasterPlan2025.geojson   — URA Master Plan land-use polygons.
+#       Required for the SG Location-competitiveness score and for filling a comp's
+#       Land Zoning from land use. Fully local/on-prem; a centroid cache
+#       (_landuse_buckets.pkl) is built automatically on first use.
+#   OneMap account (email + password)     — set in shared_settings.json for auto
+#       token refresh; only needed for OneMap Themes (e.g. tourism proximity).
+#       Public OneMap geocoding needs no token.
+#
+# Optional:
+#   OpenAI API key — required for online comp search and GPT analysis models
+#   Set via env var:  export OPENAI_API_KEY="sk-..."
+#
+# NOTE: The Location-competitiveness score and Land-Zoning-from-land-use features
+# add NO new pip dependencies — they use only the standard library plus the
+# GeoJSON data file above.
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+streamlit==1.56.0
+pandas==2.3.3
+pydeck>=0.9.0          # interactive map viewer in the dashboard
+
+# ── Excel read / write ────────────────────────────────────────────────────────
+openpyxl==3.1.5
+
+# ── PDF reading ───────────────────────────────────────────────────────────────
+# Note: pypdf is the rebranded successor to PyPDF2.
+# If you have PyPDF2 installed, run:  pip uninstall PyPDF2 && pip install pypdf
+pypdf>=5.0.0          # market reports + deal brief text extraction
+pdfplumber>=0.11.0    # text fallback extraction (table detection replaced by camelot)
+camelot-py[cv]>=0.11.0  # table extraction via stream mode (whitespace/text-position based)
+# PyMuPDF>=1.24.0     # PDF → image rendering for GPT-4o vision path (optional, install separately if needed)
+# OPTIONAL — classical OCR table-detection fallback (NOT the image-LLM path, which
+# needs no extra packages). Pulls in torch (~1 GB) and is not in offline_packages.
+# Uncomment + install separately only if you need OCR of scanned/borderless images.
+# img2table>=1.3.0    # visual table detection fallback when pdfplumber finds no grid lines
+# easyocr>=1.7.0      # OCR backend for img2table (CPU-only, no GPU needed)
+
+# ── Word document export (.docx download for Investment Rationale) ────────────
+python-docx>=1.1.0
+
+# ── Online search + GPT analysis models (optional) ───────────────────────────
+# Only required when using AI-powered online comp search or GPT models.
+openai>=1.0.0
+
+# ── Map rendering ─────────────────────────────────────────────────────────────
+# Required only when mapbox.pin_size is "xl" or "xxl" in the deal config.
+# Safe to omit if using the default "l" pin size.
+Pillow==12.2.0
+
+# ── Embedding-based column mapping (Tier 2) ───────────────────────────────────
+# Uses ONNX Runtime (no torch dependency). Falls back to LLM-only if not installed.
+# IMPORTANT: must be installed in the SAME Python that launches Streamlit (the
+# pipeline runs as a subprocess of sys.executable). Launch with, e.g.,
+#   python3.x -m streamlit run frontend/app.py   (NOT a bare `streamlit` shim on
+# an older interpreter without fastembed, or Tier 2 silently disables).
+fastembed>=0.3.0
+
+# ── Corporate proxy TLS (Zscaler etc.) ────────────────────────────────────────
+# Makes Python trust the OS certificate store so HTTPS works behind a
+# TLS-intercepting proxy. No-op (safe) when not behind such a proxy.
+truststore>=0.9.0
