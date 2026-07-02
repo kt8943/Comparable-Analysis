@@ -2502,6 +2502,46 @@ def render_new_deal_form():
 # ROUTE C:  Comparable Analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _ensure_adhoc_config(name: str, addr: str, asset_class: str, country: str) -> str:
+    """Create/refresh a lightweight ad-hoc subject config so Comparable Analysis can
+    run without a full New Deal setup. Named 'adhoc_config_*' so it does NOT appear
+    in the Existing Deals list (load_deals only globs 'deal_config*')."""
+    import re as _re
+    raw  = name or addr.split(",")[0]
+    slug = _re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", raw).strip(" .").replace(" ", "_") or "subject"
+    path = ROOT / "configs" / f"adhoc_config_{slug}.json"
+    cfg  = {}
+    if path.exists():
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    subj = cfg.get("subject_property", {})
+    subj.update({
+        "deal_name":     name or slug,
+        "property_name": name,
+        "address":       addr,
+        "asset_class":   asset_class,
+        "country_name":  country or "Singapore",
+        "country_code":  "sg" if (country or "").strip().lower() == "singapore" else "",
+    })
+    subj.setdefault("gfa_sf", 0)
+    subj.setdefault("gfa_unit", "sf")
+    subj.setdefault("quality", "")
+    subj.setdefault("remaining_leasehold_yrs", 0)
+    cfg["subject_property"] = subj
+    cfg.setdefault("output_file",
+                   f"output/{slug}/Transaction_Comparables_{slug}.xlsx")
+    cfg.setdefault("mapbox", {"style": "streets-v12", "width": 1200, "height": 900,
+                              "padding": 100, "pin_size": "l"})
+    cfg.setdefault("llm", {"provider": "ollama",
+                           "ollama": {"base_url": "http://localhost:11434",
+                                      "model": "qwen2.5:3b"}})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return str(path)
+
+
 def render_comparable_analysis():
     """
     ROUTE C — Run comparable analysis for a selected deal.
@@ -2540,27 +2580,48 @@ def render_comparable_analysis():
     """
     st.title("📋  Comparable Analysis")
 
-    if not deals:
-        st.info("No deals yet — create one in **New Deal** first.")
-        return
+    # Subject can come from an existing deal, OR be keyed in ad-hoc (no full New
+    # Deal setup needed) — just a name / location.
+    _modes = (["📁  Existing deal", "✏️  New subject property"] if deals
+              else ["✏️  New subject property"])
+    _mode = st.radio("Subject property source", _modes, horizontal=True,
+                     key="comp_subject_mode")
 
-    # Deal selector at top of main page
-    default_idx = 0
-    if "comp_deal" in st.session_state and st.session_state["comp_deal"] in deals:
-        default_idx = list(deals.keys()).index(st.session_state["comp_deal"])
+    if _mode.startswith("📁") and deals:
+        default_idx = 0
+        if "comp_deal" in st.session_state and st.session_state["comp_deal"] in deals:
+            default_idx = list(deals.keys()).index(st.session_state["comp_deal"])
+        selected    = st.selectbox("Select Deal", list(deals.keys()),
+                                   index=default_idx, key="comp_deal_select")
+        config_path = deals[selected]
+        cfg         = load_config(config_path)
+        subj        = cfg["subject_property"]
+    else:
+        c1, c2 = st.columns(2)
+        _ah_name = c1.text_input("Subject property name", key="adhoc_name",
+                                 placeholder="e.g. Marina Bay Tower")
+        _ah_addr = c2.text_input("Location / address", key="adhoc_addr",
+                                 placeholder="e.g. 10 Marina Blvd, Singapore")
+        c3, c4 = st.columns(2)
+        _ah_class   = c3.selectbox("Asset class",
+                                   ["office", "retail", "industrial", "logistics",
+                                    "hospitality", "residential", "mixed"],
+                                   key="adhoc_class")
+        _ah_country = c4.text_input("Country", value="Singapore", key="adhoc_country")
+        if not (_ah_name.strip() or _ah_addr.strip()):
+            st.info("Enter a subject property **name or location** to begin.")
+            return
+        config_path = _ensure_adhoc_config(_ah_name.strip(), _ah_addr.strip(),
+                                           _ah_class, _ah_country.strip())
+        cfg  = load_config(config_path)
+        subj = cfg["subject_property"]
 
-    selected = st.selectbox("Select Deal", list(deals.keys()),
-                             index=default_idx, key="comp_deal_select")
-    config_path = deals[selected]
-    cfg         = load_config(config_path)
-    subj        = cfg["subject_property"]
-
-    # Inline deal info strip
+    # Inline subject info strip
     i1, i2, i3, i4 = st.columns(4)
-    i1.markdown(f"**📍** {subj.get('address','—')}")
-    i2.markdown(f"**Class:** {subj.get('asset_class','—').title()}")
-    i3.markdown(f"**GFA:** {int(subj.get('gfa_sf',0)):,} {subj.get('gfa_unit','sf').upper()}")
-    i4.markdown(f"**Quality:** {subj.get('quality','—')}")
+    i1.markdown(f"**📍** {subj.get('address') or '—'}")
+    i2.markdown(f"**Class:** {(subj.get('asset_class') or '—').title()}")
+    i3.markdown(f"**GFA:** {int(subj.get('gfa_sf', 0) or 0):,} {subj.get('gfa_unit', 'sf').upper()}")
+    i4.markdown(f"**Quality:** {subj.get('quality') or '—'}")
 
     st.divider()
 
