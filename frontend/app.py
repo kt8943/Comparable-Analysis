@@ -990,20 +990,12 @@ def _show_interactive_map(geo_path, excel_path, context: str):
     view = pdk.ViewState(longitude=center_lon, latitude=center_lat,
                          zoom=_fit_zoom(all_pts), pitch=0)
 
-    if token:
-        # pydeck 0.9 only picks up the Mapbox token via the env var —
-        # api_keys= constructor param and pdk.settings are both ignored.
-        import os as _os
-        _os.environ["MAPBOX_API_KEY"] = token
-        # Ensure full Mapbox style URL (config stores short form e.g. "streets-v12")
-        raw_style = mb.get("style", "streets-v12")
-        map_style = (raw_style if raw_style.startswith("mapbox://")
-                     else f"mapbox://styles/mapbox/{raw_style}")
-        map_prov  = "mapbox"
-    else:
-        # No token — Carto tiles work without auth
-        map_style = "carto-positron"
-        map_prov  = "carto"
+    # Interactive basemap: ALWAYS use Carto (token-free) tiles. They load without a
+    # Mapbox key AND — crucially — are reachable on restrictive corporate networks
+    # that block api.mapbox.com (Mapbox tiles render blank there). The static PNG
+    # map still uses Mapbox server-side.
+    map_style = "carto-positron"
+    map_prov  = "carto"
 
     deck = pdk.Deck(
         layers=[comp_layer] + ([subj_layer] if _show_subject else []) + [label_layer],
