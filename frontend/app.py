@@ -981,39 +981,51 @@ def _show_interactive_map(geo_path, excel_path, context: str):
   function initCompMap() {
     const comps = __MARKERS__;
     const subject = __SUBJECT__;
-    const AdvancedMarkerElement = google.maps.marker.AdvancedMarkerElement;
-    const PinElement = google.maps.marker.PinElement;
+    const PIN = "M 0,0 C -2,-20 -10,-22 -10,-30 A 10,10 0 1,1 10,-30 C 10,-22 2,-20 0,0 z";
+    function pinIcon(color, scale) {
+      return {path: PIN, fillColor: color, fillOpacity: 1, strokeColor: "#ffffff",
+              strokeWeight: 1.5, scale: scale,
+              anchor: new google.maps.Point(0, 0),
+              labelOrigin: new google.maps.Point(0, -30)};
+    }
     const map = new google.maps.Map(document.getElementById("cmap"), {
-      mapId: "DEMO_MAP_ID", mapTypeControl: true, streetViewControl: false, fullscreenControl: true
+      mapTypeControl: true, streetViewControl: false, fullscreenControl: true,
+      styles: [
+        {featureType: "poi", stylers: [{visibility: "off"}]},
+        {featureType: "transit", stylers: [{visibility: "off"}]},
+        {featureType: "road", elementType: "labels.icon", stylers: [{visibility: "off"}]}
+      ]
     });
     const bounds = new google.maps.LatLngBounds();
     const info = new google.maps.InfoWindow();
     comps.forEach(function(m) {
-      const pin = new PinElement({glyph: m.label, glyphColor: "#ffffff",
-        background: m.color, borderColor: "#ffffff", scale: 1.1});
-      const mk = new AdvancedMarkerElement({map: map, position: {lat: m.lat, lng: m.lng},
-        content: pin.element, title: m.title, gmpClickable: true});
+      const mk = new google.maps.Marker({
+        position: {lat: m.lat, lng: m.lng}, map: map, title: m.title,
+        icon: pinIcon(m.color, 1.1),
+        label: {text: m.label, color: "#ffffff", fontSize: "11px", fontWeight: "bold"}
+      });
       mk.addListener("click", function() {
         info.setContent("<div style='font-family:sans-serif'><b>" + m.label + ". " +
           m.title + "</b><br><span style='color:#666;font-size:11px'>" + m.addr +
           "</span></div>");
-        info.open({map: map, anchor: mk});
+        info.open(map, mk);
       });
-      bounds.extend({lat: m.lat, lng: m.lng});
+      bounds.extend(mk.getPosition());
     });
     if (subject) {
-      const spin = new PinElement({glyph: "\\u2605", glyphColor: "#ffffff",
-        background: "#c0392b", borderColor: "#ffffff", scale: 1.3});
-      new AdvancedMarkerElement({map: map, position: subject, content: spin.element,
-        title: "Subject property", zIndex: 999});
-      bounds.extend(subject);
+      const s = new google.maps.Marker({
+        position: subject, map: map, zIndex: 999, title: "Subject property",
+        icon: pinIcon("#c0392b", 1.35),
+        label: {text: "\\u2605", color: "#ffffff", fontSize: "13px"}
+      });
+      bounds.extend(s.getPosition());
     }
     const n = comps.length + (subject ? 1 : 0);
     if (n <= 1) { map.setCenter(bounds.getCenter()); map.setZoom(15); }
     else { map.fitBounds(bounds); }
   }
 </script>
-<script async src="https://maps.googleapis.com/maps/api/js?key=__KEY__&libraries=marker&callback=initCompMap"></script>
+<script async src="https://maps.googleapis.com/maps/api/js?key=__KEY__&callback=initCompMap"></script>
 """
         _gmap_html = (_gmap_html.replace("__MARKERS__", json.dumps(_gmarkers))
                                 .replace("__SUBJECT__", _gsubject)
