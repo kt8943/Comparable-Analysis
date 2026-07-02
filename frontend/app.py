@@ -992,6 +992,24 @@ def _show_interactive_map(geo_path, excel_path, context: str):
     )
     st.pydeck_chart(deck, use_container_width=True, height=520)
 
+    # ── Map debug (blank-map diagnosis; DevTools is blocked on corporate) ──────
+    print(f"[map] provider={map_prov} style={map_style!r} "
+          f"mapbox_token={'set(' + str(len(token)) + ')' if token else 'MISSING'} "
+          f"comps={len(visible)} subject={'yes' if _show_subject else 'no'} "
+          f"center=({center_lat:.5f},{center_lon:.5f})")
+    with st.expander("🔧 Map debug info", expanded=False):
+        st.json({
+            "geo_file":          geo_path.name,
+            "map_provider":      map_prov,
+            "map_style":         map_style,
+            "mapbox_token_set":  bool(token),
+            "mapbox_token_len":  len(token or ""),
+            "comps_plotted":     len(visible),
+            "subject_shown":     bool(_show_subject),
+            "center":            [round(center_lat, 5), round(center_lon, 5)],
+            "first_comp":        (visible[0] if visible else None),
+        })
+
     # ── Map credit ───────────────────────────────────────────────────────────
     _ss_credit = {}
     try:
