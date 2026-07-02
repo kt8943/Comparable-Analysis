@@ -994,7 +994,7 @@ def _show_interactive_map(geo_path, excel_path, context: str):
     # Mapbox key AND — crucially — are reachable on restrictive corporate networks
     # that block api.mapbox.com (Mapbox tiles render blank there). The static PNG
     # map still uses Mapbox server-side.
-    map_style = "carto-positron"
+    map_style = "light"
     map_prov  = "carto"
 
     deck = pdk.Deck(
