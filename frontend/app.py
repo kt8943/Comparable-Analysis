@@ -944,93 +944,53 @@ def _show_interactive_map(geo_path, excel_path, context: str):
         },
     }
 
-    # ── Interactive Google Map (default roadmap style) ────────────────────────
-    # Rendered via the Google Maps JavaScript API — reachable on corporate networks
-    # that block Mapbox/Carto vector basemaps. Requires a google_maps_key with the
-    # "Maps JavaScript API" enabled. Numbered markers, per-pin colour, click = info.
-    _gkey = ""
-    try:
-        _gkey = json.loads((ROOT / "configs" / "shared_settings.json").read_text(
-            encoding="utf-8")).get("google_maps_key", "") or ""
-    except Exception:
-        _gkey = ""
-    _gkey = _gkey or os.environ.get("GOOGLE_MAPS_KEY", "")
+    # Per-pin colour. An explicit "color" on the comp ("red"/"navy") wins; else the
+    # default (red when the subject is hidden, navy otherwise). Matches the PNG.
+    _RED, _NAVY = [210, 40, 40, 240], [25, 90, 200, 230]
+    _default_rgba = _RED if not _show_subject else _NAVY
+    for _c in visible:
+        _col = str(_c.get("color") or "").lower()
+        _c["_rgba"] = (_RED if _col in ("red", "subject")
+                       else _NAVY if _col in ("navy", "blue", "comp")
+                       else _default_rgba)
+    comp_layer = pdk.Layer(
+        "ScatterplotLayer", data=visible, get_position=["lon", "lat"],
+        get_color="_rgba", get_radius=160, radius_min_pixels=10,
+        radius_max_pixels=26, pickable=True, auto_highlight=True,
+    )
+    subj_layer = pdk.Layer(
+        "ScatterplotLayer", data=subject_pt, get_position=["lon", "lat"],
+        get_color=[210, 40, 40, 240], get_radius=180, radius_min_pixels=11,
+        radius_max_pixels=28, pickable=True, auto_highlight=True,
+    )
+    label_layer = pdk.Layer(
+        "TextLayer", data=visible, get_position=["lon", "lat"], get_text="marker",
+        get_size=14, get_color=[255, 255, 255, 255],
+        get_alignment_baseline="'center'", pickable=False,
+    )
+    view = pdk.ViewState(longitude=center_lon, latitude=center_lat,
+                         zoom=_fit_zoom(all_pts), pitch=0)
 
-    def _pin_hex(c):
-        _col = str(c.get("color") or "").lower()
-        if _col in ("red", "subject"):
-            return "#c0392b"
-        if _col in ("navy", "blue", "comp"):
-            return "#1a5276"
-        return "#c0392b" if not _show_subject else "#1a5276"
-
-    _gmarkers = [{"lat": c["lat"], "lng": c["lon"], "label": str(c.get("marker", "")),
-                  "title": str(c.get("property") or ""),
-                  "addr": str(c.get("address") or ""), "color": _pin_hex(c)}
-                 for c in visible]
-    _gsubject = (json.dumps({"lat": s_lat, "lng": s_lon})
-                 if (_show_subject and s_lat is not None) else "null")
-
-    if not _gkey:
-        st.warning("Add a Google Maps API key (Shared Settings → **google_maps_key**) "
-                   "with the **Maps JavaScript API** enabled to display the map.")
+    # Original Mapbox basemap when a token is set (best look); token-free Carto
+    # "light" (Carto positron) as fallback. Mapbox tiles need a valid token reaching
+    # the browser — may be blank on the cloud/corporate, but works locally.
+    if token:
+        import os as _os
+        _os.environ["MAPBOX_API_KEY"] = token
+        raw_style = mb.get("style", "streets-v12")
+        map_style = (raw_style if raw_style.startswith("mapbox://")
+                     else f"mapbox://styles/mapbox/{raw_style}")
+        map_prov  = "mapbox"
     else:
-        _gmap_html = """
-<div id="cmap" style="width:100%;height:520px;border-radius:8px;"></div>
-<script>
-  function initCompMap() {
-    const comps = __MARKERS__;
-    const subject = __SUBJECT__;
-    const PIN = "M 0,0 C -2,-20 -10,-22 -10,-30 A 10,10 0 1,1 10,-30 C 10,-22 2,-20 0,0 z";
-    function pinIcon(color, scale) {
-      return {path: PIN, fillColor: color, fillOpacity: 1, strokeColor: "#ffffff",
-              strokeWeight: 1.5, scale: scale,
-              anchor: new google.maps.Point(0, 0),
-              labelOrigin: new google.maps.Point(0, -30)};
-    }
-    const map = new google.maps.Map(document.getElementById("cmap"), {
-      mapTypeControl: true, streetViewControl: false, fullscreenControl: true,
-      styles: [
-        {featureType: "poi", stylers: [{visibility: "off"}]},
-        {featureType: "transit", stylers: [{visibility: "off"}]},
-        {featureType: "road", elementType: "labels.icon", stylers: [{visibility: "off"}]}
-      ]
-    });
-    const bounds = new google.maps.LatLngBounds();
-    const info = new google.maps.InfoWindow();
-    comps.forEach(function(m) {
-      const mk = new google.maps.Marker({
-        position: {lat: m.lat, lng: m.lng}, map: map, title: m.title,
-        icon: pinIcon(m.color, 1.1),
-        label: {text: m.label, color: "#ffffff", fontSize: "11px", fontWeight: "bold"}
-      });
-      mk.addListener("click", function() {
-        info.setContent("<div style='font-family:sans-serif'><b>" + m.label + ". " +
-          m.title + "</b><br><span style='color:#666;font-size:11px'>" + m.addr +
-          "</span></div>");
-        info.open(map, mk);
-      });
-      bounds.extend(mk.getPosition());
-    });
-    if (subject) {
-      const s = new google.maps.Marker({
-        position: subject, map: map, zIndex: 999, title: "Subject property",
-        icon: pinIcon("#c0392b", 1.35),
-        label: {text: "\\u2605", color: "#ffffff", fontSize: "13px"}
-      });
-      bounds.extend(s.getPosition());
-    }
-    const n = comps.length + (subject ? 1 : 0);
-    if (n <= 1) { map.setCenter(bounds.getCenter()); map.setZoom(15); }
-    else { map.fitBounds(bounds); }
-  }
-</script>
-<script async src="https://maps.googleapis.com/maps/api/js?key=__KEY__&callback=initCompMap"></script>
-"""
-        _gmap_html = (_gmap_html.replace("__MARKERS__", json.dumps(_gmarkers))
-                                .replace("__SUBJECT__", _gsubject)
-                                .replace("__KEY__", _gkey))
-        st.components.v1.html(_gmap_html, height=540)
+        map_style = "light"
+        map_prov  = "carto"
+
+    deck = pdk.Deck(
+        layers=[comp_layer] + ([subj_layer] if _show_subject else []) + [label_layer],
+        initial_view_state=view, tooltip=tooltip,
+        map_provider=map_prov, map_style=map_style,
+    )
+    st.pydeck_chart(deck, use_container_width=True, height=520)
 
     # ── Map credit ───────────────────────────────────────────────────────────
     _ss_credit = {}
