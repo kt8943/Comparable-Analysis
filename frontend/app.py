@@ -70,9 +70,6 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 
 # ── Cloud secrets bootstrap (Streamlit Cloud) ──────────────────────────────────
-# On Streamlit Cloud there is no on-prem shared_settings.json. Build it from
-# st.secrets / env vars so the LLM (OpenAI) and geocoding providers work, and so
-# backend subprocesses inherit the keys via the environment. No-op locally.
 def _bootstrap_cloud_secrets() -> None:
     import json as _j
     keys = ("OPENAI_API_KEY", "MAPBOX_TOKEN", "GOOGLE_MAPS_KEY",
@@ -984,41 +981,39 @@ def _show_interactive_map(geo_path, excel_path, context: str):
   function initCompMap() {
     const comps = __MARKERS__;
     const subject = __SUBJECT__;
+    const AdvancedMarkerElement = google.maps.marker.AdvancedMarkerElement;
+    const PinElement = google.maps.marker.PinElement;
     const map = new google.maps.Map(document.getElementById("cmap"), {
-      mapTypeControl: true, streetViewControl: false, fullscreenControl: true
+      mapId: "DEMO_MAP_ID", mapTypeControl: true, streetViewControl: false, fullscreenControl: true
     });
     const bounds = new google.maps.LatLngBounds();
     const info = new google.maps.InfoWindow();
     comps.forEach(function(m) {
-      const mk = new google.maps.Marker({
-        position: {lat: m.lat, lng: m.lng}, map: map,
-        label: {text: m.label, color: "#ffffff", fontSize: "12px", fontWeight: "bold"},
-        icon: {path: google.maps.SymbolPath.CIRCLE, scale: 13, fillColor: m.color,
-               fillOpacity: 1, strokeColor: "#ffffff", strokeWeight: 2}
-      });
+      const pin = new PinElement({glyph: m.label, glyphColor: "#ffffff",
+        background: m.color, borderColor: "#ffffff", scale: 1.1});
+      const mk = new AdvancedMarkerElement({map: map, position: {lat: m.lat, lng: m.lng},
+        content: pin.element, title: m.title, gmpClickable: true});
       mk.addListener("click", function() {
         info.setContent("<div style='font-family:sans-serif'><b>" + m.label + ". " +
           m.title + "</b><br><span style='color:#666;font-size:11px'>" + m.addr +
           "</span></div>");
-        info.open(map, mk);
+        info.open({map: map, anchor: mk});
       });
-      bounds.extend(mk.getPosition());
+      bounds.extend({lat: m.lat, lng: m.lng});
     });
     if (subject) {
-      const s = new google.maps.Marker({
-        position: subject, map: map, zIndex: 999,
-        label: {text: "\\u2605", color: "#ffffff", fontSize: "15px"},
-        icon: {path: google.maps.SymbolPath.CIRCLE, scale: 15, fillColor: "#c0392b",
-               fillOpacity: 1, strokeColor: "#ffffff", strokeWeight: 2}
-      });
-      bounds.extend(s.getPosition());
+      const spin = new PinElement({glyph: "\\u2605", glyphColor: "#ffffff",
+        background: "#c0392b", borderColor: "#ffffff", scale: 1.3});
+      new AdvancedMarkerElement({map: map, position: subject, content: spin.element,
+        title: "Subject property", zIndex: 999});
+      bounds.extend(subject);
     }
     const n = comps.length + (subject ? 1 : 0);
     if (n <= 1) { map.setCenter(bounds.getCenter()); map.setZoom(15); }
     else { map.fitBounds(bounds); }
   }
 </script>
-<script async src="https://maps.googleapis.com/maps/api/js?key=__KEY__&callback=initCompMap"></script>
+<script async src="https://maps.googleapis.com/maps/api/js?key=__KEY__&libraries=marker&callback=initCompMap"></script>
 """
         _gmap_html = (_gmap_html.replace("__MARKERS__", json.dumps(_gmarkers))
                                 .replace("__SUBJECT__", _gsubject)
