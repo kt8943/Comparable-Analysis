@@ -2601,6 +2601,42 @@ def render_comparable_analysis():
     i3.markdown(f"**GFA:** {int(subj.get('gfa_sf', 0) or 0):,} {subj.get('gfa_unit', 'sf').upper()}")
     i4.markdown(f"**Quality:** {subj.get('quality') or '—'}")
 
+    # ── Export / Import deal (portable per-user storage; no server DB needed) ──
+    # On the cloud the filesystem is wiped on restart, so users keep their own deal
+    # as a JSON file on their machine: Export downloads it, Import restores it.
+    with st.expander("📤 Export / 📥 Import deal (save or restore as a file)"):
+        _ec, _ic = st.columns(2)
+        try:
+            with open(config_path, "rb") as _cf:
+                _ec.download_button("⬇️  Export this deal",
+                                    _cf.read(), file_name=Path(config_path).name,
+                                    mime="application/json", use_container_width=True)
+        except Exception:
+            _ec.caption("Nothing to export yet.")
+        _up = _ic.file_uploader("⬆️  Import a deal JSON", type=["json"],
+                                key="import_deal_upl")
+        if _up is not None and st.session_state.get("_last_import_name") != _up.name:
+            try:
+                _data = json.loads(_up.getvalue().decode("utf-8"))
+                if "subject_property" not in _data:
+                    raise ValueError("missing 'subject_property'")
+                _sp   = _data["subject_property"]
+                _dn   = (_sp.get("deal_name") or _sp.get("property_name")
+                         or Path(_up.name).stem)
+                import re as _re
+                _slug = (_re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", _dn)
+                         .strip(" .").replace(" ", "_") or "deal")
+                (ROOT / "configs").mkdir(exist_ok=True)
+                (ROOT / "configs" / f"deal_config_{_slug}.json").write_text(
+                    json.dumps(_data, indent=2), encoding="utf-8")
+                st.session_state["_last_import_name"] = _up.name
+                st.session_state["comp_deal"]         = _dn
+                st.success(f"✅  Imported **{_dn}** — switch the toggle above to "
+                           f"**📁 Existing deal** and select it.")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"Not a valid deal JSON: {_e}")
+
     st.divider()
 
     comp_type = st.radio(
