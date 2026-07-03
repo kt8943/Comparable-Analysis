@@ -70,11 +70,22 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "backend"))
 
 
-# ── Cloud secrets bootstrap (Streamlit Cloud) ──────────────────────────────────
+# ── Cloud secrets bootstrap (Streamlit Cloud only) ─────────────────────────────
+# On Streamlit Cloud there is no persistent configs/shared_settings.json, so build
+# it from st.secrets / env vars. Gated to the cloud (/mount/src path) so it is a
+# no-op locally / on a server that already has a real shared_settings.json.
 def _bootstrap_cloud_secrets() -> None:
     import json as _j
-    keys = ("OPENAI_API_KEY", "MAPBOX_TOKEN", "GOOGLE_MAPS_KEY",
-            "KAKAO_API_KEY", "GEOCODING_PROVIDER")
+    # secret name -> shared_settings.json key
+    _map = {
+        "MAPBOX_TOKEN":    "mapbox_token",
+        "GOOGLE_MAPS_KEY": "google_maps_key",
+        "KAKAO_API_KEY":   "kakao_api_key",
+        "OPENAI_API_KEY":  "openai_api_key",
+        "ONEMAP_EMAIL":    "onemap_email",
+        "ONEMAP_PASSWORD": "onemap_password",
+    }
+    keys = tuple(_map) + ("GEOCODING_PROVIDER",)
     vals = {}
     try:
         for k in keys:
@@ -86,7 +97,7 @@ def _bootstrap_cloud_secrets() -> None:
         vals.setdefault(k, os.environ.get(k, ""))
     if not any(vals.values()):
         return
-    for k, v in vals.items():
+    for k, v in vals.items():          # expose to backend subprocesses
         if v and not os.environ.get(k):
             os.environ[k] = v
     cfgdir = ROOT / "configs"
@@ -100,17 +111,17 @@ def _bootstrap_cloud_secrets() -> None:
             existing = {}
     existing["geocoding_provider"] = (
         vals.get("GEOCODING_PROVIDER") or existing.get("geocoding_provider") or "mapbox")
-    if vals.get("MAPBOX_TOKEN"):    existing["mapbox_token"]    = vals["MAPBOX_TOKEN"]
-    if vals.get("GOOGLE_MAPS_KEY"): existing["google_maps_key"] = vals["GOOGLE_MAPS_KEY"]
-    if vals.get("KAKAO_API_KEY"):   existing["kakao_api_key"]   = vals["KAKAO_API_KEY"]
-    if vals.get("OPENAI_API_KEY"):  existing["openai_api_key"]  = vals["OPENAI_API_KEY"]
+    for _sk, _dk in _map.items():
+        if vals.get(_sk):
+            existing[_dk] = vals[_sk]
     try:
         ssp.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
     except Exception:
         pass
 
 
-_bootstrap_cloud_secrets()
+if "/mount/" in str(ROOT):   # Streamlit Cloud only
+    _bootstrap_cloud_secrets()
 
 # ── Corporate proxy TLS fix (trust OS cert store; no-op without truststore) ────
 from tools import corp_ssl  # noqa: F401  — must import before any HTTPS call
