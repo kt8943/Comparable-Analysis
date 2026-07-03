@@ -899,6 +899,10 @@ _NON_ADDRESS_WORDS = {
     "office", "logistics", "retail", "industrial", "hospitality", "hotel",
     "residential", "commercial", "mixed", "mixed-use", "mixed use",
     "warehouse", "business park", "data centre", "data center", "others",
+    # Placeholder / "no address" values — geocoding these returns the country
+    # centroid, stacking every such comp on one point. Fall back to the name.
+    "n/a", "na", "n.a.", "n.a", "nil", "none", "tbd", "-", "--", "—",
+    "not available", "unknown", ".",
 }
 
 

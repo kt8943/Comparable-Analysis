@@ -486,10 +486,7 @@ def _camelot_raw_tables(pdf_path: str, page_num: int) -> list:
     try:
         import camelot
     except ImportError:
-        # camelot unavailable (e.g. Streamlit Cloud — no Ghostscript/OpenCV).
-        # Fall back to pdfplumber line-based table extraction so PDF parsing
-        # still works (bordered tables; borderless ones degrade).
-        return _pdfplumber_line_tables(pdf_path, page_num)
+        raise ImportError("camelot-py required: pip install 'camelot-py[cv]'")
 
     result: list = []
 

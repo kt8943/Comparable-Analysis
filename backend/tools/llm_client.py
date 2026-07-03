@@ -72,11 +72,6 @@ def openai_chat(llm_cfg: dict, messages: list,
     kwargs: dict = {"model": model, "messages": messages, "temperature": 0}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
-        # OpenAI returns 400 unless the literal word "json" appears somewhere in the
-        # messages when using json_object response_format. Inject it if missing.
-        if not any("json" in str(m.get("content", "")).lower() for m in messages):
-            kwargs["messages"] = messages + [
-                {"role": "system", "content": "Respond with a valid JSON object."}]
     resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content
 
