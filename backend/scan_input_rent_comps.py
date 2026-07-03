@@ -353,6 +353,14 @@ Rules:
 - Do not invent or estimate values — only extract what is visible in the image.
 - Skip header rows and average/total rows.
 - Rent ranges like "12-14" should be returned as the string "12-14" (not split).
+- SCOPE — this is a LEASING / RENT analysis. Extract ONLY lease / rental transactions
+  (a tenant leasing space at a rent). Do NOT extract:
+    * ASSET / INVESTMENT SALES tables (e.g. columns Buyer, Vendor, Sale Price, Cap Rate,
+      $ psf capital value), and
+    * GLS / land tender tables (e.g. columns Tender, Tenderer, psf ppr, Site Area).
+  Also ignore market-statistics tables (island-wide rent indices, vacancy, supply). If a
+  table is a sales/land/statistics table, ignore it. If the image has no leasing table,
+  return an empty array [].
 """
 
 

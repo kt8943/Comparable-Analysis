@@ -400,6 +400,13 @@ Rules:
 - Do not invent or estimate values — only extract what is visible in the image.
 - Skip header rows and average/total rows.
 - Price ranges like "600-630" should be returned as the string "600-630" (not split).
+- SCOPE — this is a LAND SALES / GLS / SITE TENDER analysis. Extract ONLY land / site /
+  government-land-tender transactions. Do NOT extract:
+    * ASSET / INVESTMENT SALES of standing buildings (e.g. columns Buyer, Vendor,
+      Purchaser, NPI/Cap Rate, NLA, Tenant), and
+    * RENTAL / LEASING tables (e.g. columns Rent, $ psf/month, Lease, Tenant, Occupancy).
+  If a table is an asset-sales or leasing table, ignore it entirely. If the image has no
+  land / GLS table, return an empty array [].
 """
 
 

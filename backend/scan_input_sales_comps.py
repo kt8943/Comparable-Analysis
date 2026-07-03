@@ -461,6 +461,14 @@ Rules:
 - Do not invent or estimate values — only extract what is visible in the image.
 - Skip header rows and average/total rows.
 - Price ranges like "600-630" should be returned as the string "600-630" (not split).
+- SCOPE — this is an ASSET SALES / INVESTMENT analysis. Extract ONLY completed asset
+  sale / investment transactions of standing buildings. Do NOT extract:
+    * GLS / government land tender / development-site tables (e.g. columns Tender,
+      Tenderer, Successful Tender, psf ppr, plot ratio, Site Area, land parcel), and
+    * RENTAL / LEASING tables (e.g. columns Rent, $ psf/month, Lease, Tenant,
+      Occupancy, Vacancy, take-up).
+  If a table is a land-tender or leasing table, ignore it entirely. If the image has
+  no asset-sales table, return an empty array [].
 """
 
 
