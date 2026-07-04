@@ -22,6 +22,38 @@ Record shapes (per comp_type) the connectors must emit — same as the extractor
 from __future__ import annotations
 
 import re
+from datetime import datetime
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def months_ago(date_str: str):
+    """Approx. months between today and a sale date given in varied formats:
+    'Jun-26', 'Jun 2025', 'Jun-2025', 'Q2 2025', '2025', '01 Jun 2026'.
+    Returns int months (>=0) or None when unparseable (caller should KEEP on None)."""
+    s = (date_str or "").strip().lower()
+    if not s:
+        return None
+    now = datetime.now()
+    yr = mo = None
+    mq = re.search(r"q([1-4])\D*(\d{4})", s)              # Q2 2025
+    if mq:
+        yr, mo = int(mq.group(2)), (int(mq.group(1)) - 1) * 3 + 2
+    if yr is None:                                        # Jun-26 / Jun 2025
+        mm = re.search(r"([a-z]{3})[\s\-/]*(\d{2,4})", s)
+        if mm and mm.group(1) in _MONTHS:
+            mo = _MONTHS[mm.group(1)]
+            y = int(mm.group(2))
+            yr = 2000 + y if y < 100 else y
+    if yr is None:                                        # bare year
+        my = re.search(r"((?:19|20)\d{2})", s)
+        if my:
+            yr, mo = int(my.group(1)), 6                  # mid-year assumption
+    if yr is None:
+        return None
+    return max(0, (now.year - yr) * 12 + (now.month - (mo or 6)))
 
 
 class SourceConnector:

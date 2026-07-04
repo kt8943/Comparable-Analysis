@@ -824,11 +824,20 @@ def run(config_path: str = "configs/deal_config.json",
             _cleaned = validate_dedup_land(_raw, subject_name=prop_name,
                                            subject_country=country_name,
                                            subject_asset_class=subject_cfg.get("asset_class", ""))
+            # ── Comparability rules on grounded records ──────────────────────
+            from sources.base import months_ago as _months_ago
+            _rec_m = int(sc_cfg.get("recency_months", 12) or 12)
+            _before = len(_cleaned)
+            _cleaned = [r for r in _cleaned
+                        if (_months_ago(str(r.get("launch_date") or r.get("sale_date") or "")) or 0) <= _rec_m]
+            if _before != len(_cleaned):
+                print(f"  · recency ≤{_rec_m}mo: kept {len(_cleaned)}/{_before}")
             _geo = geocode_land_records(_cleaned, mapbox_tok, country_code,
                                         country_name=country_name)
+            # Location: same sub-market (tight comp radius, not city-wide).
             _added = _merge_geocoded(
                 _geo, _srcs or [{"title": _conn.label or _conn.name, "url": ""}],
-                market_km, source_name=_conn.name)
+                submarket_km, source_name=_conn.name)
             _lbl = _conn.label or _conn.name
             if _lbl not in levels_used:
                 levels_used.append(_lbl)
