@@ -54,6 +54,19 @@ from generate_rent_comps_table import (
 from generate_rent_comps_map import geocode_with_fallbacks, _parse_property_text
 
 
+def _shared_mapbox_token() -> str:
+    """Mapbox token fallback: shared_settings.json (single source of truth) → env."""
+    try:
+        p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
+        if p.exists():
+            tok = (json.loads(p.read_text(encoding="utf-8")) or {}).get("mapbox_token", "")
+            if tok:
+                return tok
+    except Exception:
+        pass
+    return os.environ.get("MAPBOX_TOKEN", "") or os.environ.get("MAPBOX_API_KEY", "")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — QUERY BUILDING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -451,7 +464,7 @@ def run(config_path: str = "configs/deal_config.json",
 
     subject_cfg   = cfg["subject_property"]
     mb_cfg        = cfg.get("mapbox", {})
-    mapbox_tok    = mb_cfg.get("token", "")
+    mapbox_tok    = mb_cfg.get("token", "") or _shared_mapbox_token()
     oa_cfg        = cfg.get("openai", {})
     api_key       = oa_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
     search_model  = oa_cfg.get("search_model",  "gpt-4o-mini-search-preview")

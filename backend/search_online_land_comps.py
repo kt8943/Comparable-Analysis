@@ -67,6 +67,19 @@ from generate_land_comps_table import (
 from openpyxl.utils import get_column_letter
 
 
+def _shared_mapbox_token() -> str:
+    """Mapbox token fallback: shared_settings.json (single source of truth) → env."""
+    try:
+        p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
+        if p.exists():
+            tok = (json.loads(p.read_text(encoding="utf-8")) or {}).get("mapbox_token", "")
+            if tok:
+                return tok
+    except Exception:
+        pass
+    return os.environ.get("MAPBOX_TOKEN", "") or os.environ.get("MAPBOX_API_KEY", "")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SEARCH QUERIES  (land-specific)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -649,7 +662,7 @@ def run(config_path: str = "configs/deal_config.json",
     params        = cfg.get("parameters", {})
     bala_yield    = params.get("bala_yield",   0.06)
     mb_cfg        = cfg.get("mapbox", {})
-    mapbox_tok    = mb_cfg.get("token", "")
+    mapbox_tok    = mb_cfg.get("token", "") or _shared_mapbox_token()
     oa_cfg        = cfg.get("openai", {})
     api_key       = oa_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
     search_model  = oa_cfg.get("search_model",  "gpt-4o-mini-search-preview")
@@ -674,7 +687,8 @@ def run(config_path: str = "configs/deal_config.json",
         raise ValueError("OpenAI API key not found.  Set openai.api_key in config or "
                          "export OPENAI_API_KEY=sk-...")
     if not mapbox_tok:
-        raise ValueError("Add mapbox.token to deal config (needed for geocoding).")
+        raise ValueError("No Mapbox token found (needed for geocoding). Set it in "
+                         "Shared Settings / MAPBOX_TOKEN secret, or mapbox.token in the deal config.")
 
     try:
         from openai import OpenAI
