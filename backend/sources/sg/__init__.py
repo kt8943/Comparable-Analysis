@@ -1,0 +1,1 @@
+"""Singapore data-source connectors."""

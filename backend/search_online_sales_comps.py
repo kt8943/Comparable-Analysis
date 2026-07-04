@@ -817,6 +817,9 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     years_back_max  = sc_cfg.get("years_back_max",  8)
     years_back_step = sc_cfg.get("years_back_step", 2)
     max_level       = sc_cfg.get("max_level",       3)   # 1=proximity only, 2=+submarket, 3=+broader
+    # Grounded data sources to combine with (or instead of) OpenAI web search.
+    # Defaults to web-search only → identical behaviour to before.
+    sources_cfg     = sc_cfg.get("sources") or ["web_search"]
 
     if not api_key:
         raise ValueError(
@@ -889,6 +892,45 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
 
         yrs = years_back   # will increment on temporal expansion
 
+        def _merge_geocoded(geocoded, srcs, max_km, source_name=""):
+            """Distance-filter + (coordinate & name) dedup-merge a batch of geocoded
+            records into all_records; returns count added. Shared by web search and
+            grounded connectors so every source is treated identically."""
+            added = 0
+            srcs  = srcs or []
+            for r in geocoded:
+                price = float(r.get('price_sgd_m') or 0)
+                key   = re.sub(r"\W+", "", str(r.get("property_name", "")).lower())[:24] \
+                        + f"_{price:.0f}"
+                if max_km is not None and r.get("lon") is not None:
+                    if _haversine_km(r["lon"], r["lat"], s_lon, s_lat) > max_km:
+                        continue
+                _srcs = [({**s, "source_name": source_name} if source_name else s) for s in srcs]
+                if r.get("lon") is not None and price > 0:
+                    p_bucket  = round(price / max(price * 0.05, 0.5))
+                    coord_key = (round(r["lon"], 2), round(r["lat"], 2), p_bucket)
+                    if coord_key in seen_coord_keys:
+                        if key in seen_keys:
+                            idx = seen_keys[key]
+                            existing = {s.get("url") for s in all_records[idx].get("sources", [])}
+                            for s in _srcs:
+                                if s.get("url") and s["url"] not in existing:
+                                    all_records[idx].setdefault("sources", []).append(s)
+                        continue
+                    seen_coord_keys.add(coord_key)
+                if key in seen_keys:
+                    idx = seen_keys[key]
+                    existing = {s.get("url") for s in all_records[idx].get("sources", [])}
+                    for s in _srcs:
+                        if s.get("url") and s["url"] not in existing:
+                            all_records[idx].setdefault("sources", []).append(s)
+                    continue
+                r["sources"] = list(_srcs)
+                seen_keys[key] = len(all_records)
+                all_records.append(r)
+                added += 1
+            return added
+
         def _run_level(level_id, max_km, level_label, yrs_used):
             """Run one search level; return count of new records added."""
             queries   = build_search_queries_for_level(subject_cfg, level_id, yrs_used)
@@ -909,77 +951,76 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                                           subject_asset_class=subject_cfg.get("asset_class", ""))
                 geocoded = geocode_records(cleaned, mapbox_tok, country_code,
                                            country_name=country_name)
-                for r in geocoded:
-                    price = float(r.get('price_sgd_m') or 0)
-                    key   = re.sub(r"\W+", "", str(r.get("property_name", "")).lower())[:24] \
-                            + f"_{price:.0f}"
-                    if max_km is not None and r.get("lon") is not None:
-                        if _haversine_km(r["lon"], r["lat"], s_lon, s_lat) > max_km:
-                            continue
-                    # Coordinate-based dedup: catches bilingual duplicates (same property
-                    # reported in two languages / by two sources at same location+price)
-                    if r.get("lon") is not None and price > 0:
-                        p_bucket  = round(price / max(price * 0.05, 0.5))
-                        coord_key = (round(r["lon"], 2), round(r["lat"], 2), p_bucket)
-                        if coord_key in seen_coord_keys:
-                            # Merge sources into whichever record occupies this slot
-                            if key in seen_keys:
-                                idx = seen_keys[key]
-                                existing_urls = {s["url"] for s in all_records[idx].get("sources", [])}
-                                for s in q_sources:
-                                    if s["url"] and s["url"] not in existing_urls:
-                                        all_records[idx].setdefault("sources", []).append(s)
-                            continue
-                        seen_coord_keys.add(coord_key)
-                    if key in seen_keys:
-                        # Merge any new source URLs into the existing record
-                        idx = seen_keys[key]
-                        existing_urls = {s["url"] for s in all_records[idx].get("sources", [])}
-                        for s in q_sources:
-                            if s["url"] and s["url"] not in existing_urls:
-                                all_records[idx].setdefault("sources", []).append(s)
-                        continue
-                    r["sources"] = list(q_sources)   # attach sources to new record
-                    seen_keys[key] = len(all_records)
-                    all_records.append(r)
-                    level_new += 1
+                level_new += _merge_geocoded(geocoded, q_sources, max_km)
             label_str = f"{level_label} (yrs:{yrs_used})"
             if label_str not in levels_used:
                 levels_used.append(label_str)
             print(f"  → {level_new} new  |  total: {len(all_records)}")
             return level_new
 
-        # ── Phase 1: geo levels (proximity + submarket) with temporal expansion ──
-        active_levels = GEO_LEVELS[:max_level]
-        if max_level < 3:
-            print(f"  (Level 3 'Broader market' disabled — max_level={max_level})")
+        if "web_search" in sources_cfg:
+            # ── Phase 1: geo levels (proximity + submarket) with temporal expansion ──
+            active_levels = GEO_LEVELS[:max_level]
+            if max_level < 3:
+                print(f"  (Level 3 'Broader market' disabled — max_level={max_level})")
 
-        while len(all_records) < min_results:
-            for level_id, max_km, level_label in active_levels:
-                _run_level(level_id, max_km, level_label, yrs)
+            while len(all_records) < min_results:
+                for level_id, max_km, level_label in active_levels:
+                    _run_level(level_id, max_km, level_label, yrs)
+                    if len(all_records) >= min_results:
+                        break
+
                 if len(all_records) >= min_results:
+                    print(f"  ✓ min_results ({min_results}) reached.")
                     break
 
-            if len(all_records) >= min_results:
-                print(f"  ✓ min_results ({min_results}) reached.")
-                break
+                # Temporal expansion
+                if yrs < years_back_max:
+                    yrs += years_back_step
+                    print(f"\n  ↩  Sparse results ({len(all_records)}). "
+                          f"Extending search window to {yrs} years back…")
+                else:
+                    print(f"\n  ↩  Temporal limit ({years_back_max} yrs) reached. "
+                          f"{len(all_records)} record(s) found in geo levels.")
+                    break
 
-            # Temporal expansion
-            if yrs < years_back_max:
-                yrs += years_back_step
-                print(f"\n  ↩  Sparse results ({len(all_records)}). "
-                      f"Extending search window to {yrs} years back…")
-            else:
-                print(f"\n  ↩  Temporal limit ({years_back_max} yrs) reached. "
-                      f"{len(all_records)} record(s) found in geo levels.")
-                break
+            # ── Phase 2: broader market (only if max_level=3 and still sparse) ───
+            if len(all_records) < min_results and max_level >= 3:
+                print(f"\n  Falling back to broader market search (geo levels exhausted).")
+                _run_level(*BROAD_LEVEL, yrs)
+                if len(all_records) < min_results:
+                    print(f"  ⚠  All levels exhausted — {len(all_records)} record(s) total.")
 
-        # ── Phase 2: broader market (only if max_level=3 and still sparse) ───
-        if len(all_records) < min_results and max_level >= 3:
-            print(f"\n  Falling back to broader market search (geo levels exhausted).")
-            _run_level(*BROAD_LEVEL, yrs)
-            if len(all_records) < min_results:
-                print(f"  ⚠  All levels exhausted — {len(all_records)} record(s) total.")
+        # ── Grounded connectors (URA PMI, …): fetch once, ingest via same pipeline ──
+        from sources.registry import get_grounded
+        _conn_params = {"country_code": country_code, "country_name": country_name,
+                        "years_back": yrs, "s_lon": s_lon, "s_lat": s_lat,
+                        "proximity_km": proximity_km, "submarket_km": submarket_km,
+                        "market_km": market_km,
+                        "ura_max_rows": sc_cfg.get("ura_max_rows", 60)}
+        for _conn in get_grounded((country_code or "sg").lower(), "sales",
+                                  sources_cfg, _conn_params):
+            print(f"\n[Source] {_conn.label or _conn.name}")
+            try:
+                _raw, _srcs = _conn.fetch(subject_cfg, _conn_params)
+            except Exception as e:
+                print(f"  ✗ {e.__class__.__name__}: {e}")
+                continue
+            if not _raw:
+                print("  → 0 records")
+                continue
+            _cleaned = validate_dedup(_raw, subject_name=prop_name,
+                                      subject_country=country_name,
+                                      subject_asset_class=subject_cfg.get("asset_class", ""))
+            _geo = geocode_records(_cleaned, mapbox_tok, country_code,
+                                   country_name=country_name)
+            _added = _merge_geocoded(
+                _geo, _srcs or [{"title": _conn.label or _conn.name, "url": ""}],
+                market_km, source_name=_conn.name)
+            _lbl = _conn.label or _conn.name
+            if _lbl not in levels_used:
+                levels_used.append(_lbl)
+            print(f"  → {_added} new  |  total: {len(all_records)}")
 
         save_cache(cache_path, all_records, levels_used, c_key)
 

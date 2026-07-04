@@ -3057,20 +3057,60 @@ def render_comparable_analysis():
 
             refresh = st.checkbox("Force refresh (ignore cache)", key="force_refresh")
 
-            # Determine script/prefix before the button so _show_results
-            # can be called unconditionally outside the button block.
+            # Determine script/prefix (and the search-config key to patch sources into).
             if is_asset_sales:
-                ol_script, ol_prefix = "search_online_sales_comps.py",  "Online_Comparables"
+                ol_script, ol_prefix, _sc_key = ("search_online_sales_comps.py",
+                                                 "Online_Comparables", "online_search")
+                _comp_type = "sales"
             elif is_land_sales:
-                ol_script, ol_prefix = "search_online_land_comps.py",   "Online_Land_Comps"
+                ol_script, ol_prefix, _sc_key = ("search_online_land_comps.py",
+                                                 "Online_Land_Comps", "land_search")
+                _comp_type = "land"
             else:
-                ol_script, ol_prefix = "search_online_rent_comps.py",   "Online_Rent_Comps"
+                ol_script, ol_prefix, _sc_key = ("search_online_rent_comps.py",
+                                                 "Online_Rent_Comps", "rent_search")
+                _comp_type = "rent"
             ol_flags = ["--map"] + (["--refresh"] if refresh else [])
+
+            # ── Data sources (grounded official sources + cited web search) ──────
+            _market = (cfg.get("country_code", "") or "sg").lower()
+            try:
+                from sources.registry import available as _sources_available
+                _src_opts = _sources_available(_market, _comp_type)
+            except Exception:
+                _src_opts = ["web_search"]
+            _src_labels = {
+                "web_search": "🌐 Web search (GPT, cited)",
+                "ura_pmi":    "🏛️ URA PMI — commercial transactions (SG, free)",
+                "ura_gls":    "🏛️ URA GLS — land tenders (SG, free)",
+            }
+            _selected_sources = st.multiselect(
+                "Data sources", _src_opts, default=_src_opts,
+                format_func=lambda s: _src_labels.get(s, s), key="online_sources",
+                help="Grounded official sources (e.g. URA) are combined with the "
+                     "citation-backed web search. Deselect to narrow.")
+            if not _selected_sources:
+                _selected_sources = ["web_search"]
 
             if st.button("▶  Search Online", key="run_online", type="primary",
                          disabled=not api_key):
-                if _run_script(ol_script, config_path, ol_flags):
-                    st.success("✅  Online search complete!")
+                # Patch the chosen sources into a temp config (cache auto-busts on change).
+                _patched = {**cfg}
+                _sc = {**_patched.get(_sc_key, {})}
+                _sc["sources"] = _selected_sources
+                _patched[_sc_key] = _sc
+                _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                                   dir=ROOT / "configs", delete=False,
+                                                   encoding="utf-8")
+                json.dump(_patched, _tmp); _tmp.close()
+                try:
+                    if _run_script(ol_script, _tmp.name, ol_flags):
+                        st.success("✅  Online search complete!")
+                finally:
+                    try:
+                        os.unlink(_tmp.name)
+                    except OSError:
+                        pass
 
             # Always render latest output — persists across re-runs
             _show_results(config_path, ol_prefix, context="online",
