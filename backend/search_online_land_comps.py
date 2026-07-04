@@ -809,7 +809,10 @@ def run(config_path: str = "configs/deal_config.json",
         _conn_params = {"country_code": country_code, "country_name": country_name,
                         "years_back": yrs, "s_lon": s_lon, "s_lat": s_lat,
                         "proximity_km": proximity_km, "submarket_km": submarket_km,
-                        "market_km": market_km}
+                        "market_km": market_km, "comp_type": "land",
+                        "client": client, "extract_model": extract_model,
+                        "broker_pages": sc_cfg.get("broker_pages"),
+                        "broker_max_pdfs": sc_cfg.get("broker_max_pdfs", 4)}
         for _conn in get_grounded((country_code or "sg").lower(), "land",
                                   sources_cfg, _conn_params):
             print(f"\n[Source] {_conn.label or _conn.name}")

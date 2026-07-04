@@ -3080,9 +3080,10 @@ def render_comparable_analysis():
             except Exception:
                 _src_opts = ["web_search"]
             _src_labels = {
-                "web_search": "🌐 Web search (GPT, cited)",
-                "ura_pmi":    "🏛️ URA PMI — commercial transactions (SG, free)",
-                "ura_gls":    "🏛️ URA GLS — land tenders (SG, free)",
+                "web_search":     "🌐 Web search (GPT, cited)",
+                "ura_pmi":        "🏛️ URA PMI — commercial transactions (SG, free)",
+                "ura_gls":        "🏛️ URA GLS — land tenders (SG, free)",
+                "broker_reports": "📑 Broker reports — Savills / C&W / CBRE (SG)",
             }
             _selected_sources = st.multiselect(
                 "Data sources", _src_opts, default=_src_opts,

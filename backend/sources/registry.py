@@ -31,7 +31,7 @@ def _ensure_loaded(market: str) -> None:
         return
     _LOADED.add(market)
     if market == "sg":
-        for _mod in ("ura_pmi",):   # add "ura_gls", "broker_reports_sg", … as built
+        for _mod in ("ura_pmi", "broker_reports_sg"):   # add "ura_gls", … as built
             try:
                 __import__(f"sources.sg.{_mod}")   # side-effect: register()
             except Exception as e:                 # pragma: no cover — fail soft
