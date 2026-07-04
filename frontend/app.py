@@ -413,25 +413,41 @@ def _run_script(script: str, config_path: str, flags: list = None,
     # Force the child pipeline to emit UTF-8 on its (piped) stdout/stderr. On Windows
     # a piped stdout defaults to the locale encoding (cp1252/GBK), so printing Korean
     # names or "㎡" would raise UnicodeEncodeError inside the child before we capture it.
-    _child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-    with st.spinner(f"Running `{script}`{model_label} …"):
-        res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT),
-                             encoding="utf-8", errors="replace", env=_child_env)
+    # PYTHONUNBUFFERED=1 makes the child flush each print() immediately, so the run log
+    # below streams live instead of appearing all at once when the script finishes.
+    _child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                  "PYTHONUNBUFFERED": "1"}
+
+    # Stream stdout+stderr line-by-line into a live-updating box so long-running
+    # scripts (e.g. Online Search) show progress instead of a silent spinner.
+    _lines, _live = [], st.empty()
+    with st.spinner(f"Running `{script}`{model_label} … (live log below)"):
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace", cwd=str(ROOT), env=_child_env,
+            bufsize=1,
+        )
+        for _ln in proc.stdout:
+            _lines.append(_ln.rstrip("\n"))
+            _live.code("\n".join(_lines[-40:]), language="text")   # last 40 lines, snappy
+        proc.wait()
+    _live.empty()   # replace the live tail with the full expander below
+    out, returncode = "\n".join(_lines), proc.returncode
 
     if tmp_path:
         try: os.unlink(tmp_path)
         except: pass
 
     _key = log_state_key or f"_runlog_{script}"
-    if res.stdout:
-        st.session_state[_key] = res.stdout
+    if out:
+        st.session_state[_key] = out
         with st.expander("📋 Run log", expanded=expand_log):
-            st.code(res.stdout, language="text")
-    if res.returncode != 0 and res.stderr:
-        st.session_state[f"{_key}_err"] = res.stderr
+            st.code(out, language="text")
+    if returncode != 0:
+        st.session_state[f"{_key}_err"] = out
         with st.expander("⚠️ Error details", expanded=True):
-            st.code(res.stderr, language="text")
-    return res.returncode == 0
+            st.code(out[-4000:] or "(no output)", language="text")
+    return returncode == 0
 
 
 def _read_excel_preview(excel_path: str) -> "pd.DataFrame | None":
