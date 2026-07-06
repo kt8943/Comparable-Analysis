@@ -116,20 +116,34 @@ _CBD_NODES = [
 
 # Regional / sub-regional centres (malls cluster here) — retail competitiveness
 # rises with closeness to one of these.
-# Retail catchment centres: (lon, lat, tier_penalty_km).
-# TIER 1 — prime retail (Orchard, CBD): penalty 0.
-# TIER 2 — URA Regional Centres (JLD, Tampines, Woodlands, Seletar): a +penalty km so
-#          being at a regional centre is treated as being _RETAIL_TIER_PENALTY km from a
-#          prime centre — i.e. Orchard/CBD proximity scores higher than a regional centre.
-_RETAIL_TIER_PENALTY = 2.0   # km — how much "further" a regional centre counts vs prime
+# Retail catchment centres: (lon, lat, tier_weight).
+# A property's "retail-centre attractiveness" = max over centres of
+#     tier_weight × proximity,   proximity = max(0, 1 − distance_km / _RETAIL_D0)
+# Prime centres (Orchard/CBD) have weight 1.0; the URA Regional Centres have 0.7 — a
+# SCORE penalty (0.3), so being AT a regional centre tops out at 0.7 while being AT a
+# prime centre reaches 1.0. Higher attractiveness = better retail location.
+_RETAIL_D0        = 3.0   # km — retail-centre influence radius (attractiveness → 0 beyond)
+_RETAIL_W_PRIME   = 1.0
+_RETAIL_W_REGION  = 0.7   # 0.3 score penalty vs a prime centre
 _RETAIL_CENTRES = [
-    (103.85176, 1.28348, 0.0),                  # CBD / Raffles Place   (prime)
-    (103.8330,  1.3040,  0.0),                  # Orchard               (prime)
-    (103.7420,  1.3330,  _RETAIL_TIER_PENALTY), # Jurong Lake District  (regional)
-    (103.9450,  1.3540,  _RETAIL_TIER_PENALTY), # Tampines              (regional)
-    (103.7860,  1.4370,  _RETAIL_TIER_PENALTY), # Woodlands             (regional)
-    (103.8850,  1.4050,  _RETAIL_TIER_PENALTY), # Seletar (approx.)     (regional)
+    (103.85176, 1.28348, _RETAIL_W_PRIME),   # CBD / Raffles Place   (prime)
+    (103.8330,  1.3040,  _RETAIL_W_PRIME),   # Orchard               (prime)
+    (103.7420,  1.3330,  _RETAIL_W_REGION),  # Jurong Lake District  (regional)
+    (103.9450,  1.3540,  _RETAIL_W_REGION),  # Tampines              (regional)
+    (103.7860,  1.4370,  _RETAIL_W_REGION),  # Woodlands             (regional)
+    (103.8850,  1.4050,  _RETAIL_W_REGION),  # Seletar (approx.)     (regional)
 ]
+
+
+def _retail_attractiveness(lon: float, lat: float) -> float:
+    """Best tier-weighted proximity to a retail centre, in [0, 1]. Prime centres reach
+    1.0 at the centre; regional centres top out at the regional weight (score penalty)."""
+    best = 0.0
+    for clon, clat, w in _RETAIL_CENTRES:
+        prox = 1.0 - U._hav(lon, lat, clon, clat) / _RETAIL_D0
+        if prox > 0:
+            best = max(best, w * prox)
+    return best
 
 
 def _sector_key(asset_class: str) -> str:
@@ -163,11 +177,10 @@ def _factors(lon: float, lat: float, sector: str) -> list:
         return [(cbd,                                            False, None),   # closer to CBD
                 (U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV)]  # commercial land share
     if sector == "retail":
-        # Tier-penalised distance: a prime centre (Orchard/CBD) at 0 km beats a regional
-        # centre at 0 km, because the regional centre carries a +penalty km.
-        reg = min(U._hav(lon, lat, c[0], c[1]) + c[2] for c in _RETAIL_CENTRES)
+        # Retail-centre attractiveness (higher better): tier-weighted proximity, so a prime
+        # centre scores up to 1.0 and a regional centre tops out at 0.7 (score penalty).
         return [(U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV),  # retail/commercial cluster
-                (reg,                                            False, None)]   # closer to a (weighted) retail centre
+                (_retail_attractiveness(lon, lat),               True, _K_COV)]  # tier-weighted centre attractiveness
     if sector == "hospitality":
         return [(_tourism_within(lon, lat, 1.0),                 True, _K_COUNT), # tourist draw (count)
                 (U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV)]   # commercial land share

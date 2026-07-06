@@ -36,10 +36,11 @@ coverage = (total area of parcels of that land use whose CENTRE is within 1 km) 
 **B. Distance to a landmark (a "proximity" factor).**
 Straight-line distance (km) to the **nearest** relevant node:
 - **CBD** = Raffles Place MRT `(1.28348° N, 103.85176° E)`.
-- **Retail centres** (retail): nearest of a **tiered** set — **prime** (Orchard, CBD) count
-  fully; **URA Regional Centres** (Jurong Lake District, Tampines, Woodlands, Seletar) carry
-  a **+2 km tier penalty**, so being at a regional centre is treated as being 2 km from a
-  prime centre. Prime-centre proximity therefore scores higher.
+- **Retail-centre attractiveness** (retail): a 0–1 score = `tier_weight × proximity`, where
+  `proximity = max(0, 1 − distance/3 km)` (distance still drives it) and `tier_weight` is
+  **1.0 for prime** centres (Orchard, CBD) and **0.7 for URA Regional Centres** (Jurong Lake
+  District, Tampines, Woodlands, Seletar). So being *at* a regional centre tops out at 0.7
+  while a prime centre reaches 1.0 — a **0.3 score penalty** for regional (higher = better).
 - **Freight nodes** (industrial): nearest of the 5 real port/airport hubs —
   **Tuas, Jurong, PSA/Keppel, Changi, Seletar** (offshore stray parcels removed).
 
