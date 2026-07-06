@@ -144,10 +144,16 @@ def build_land_queries(subject_cfg: dict, level: str, years_back: int = 3) -> li
         ]
 
     else:  # market
-        return [
+        qs = [
             f'{broader_land} ({yrs}) site area GFA tenure',
             f'{country_name} {asset_kw} land GLS tender award ({yrs}) URA JLL CBRE Savills',
         ]
+        # Singapore: point the web search at URA's own GLS award pages (ura.gov.sg
+        # past-sales-sites lists successful tenderer + tender price + $psm GFA).
+        if (country_name or "").lower().startswith("singapore"):
+            qs.append(f'URA GLS past sale sites tender result award ura.gov.sg '
+                      f'{asset_kw} successful tender price psm ({yrs})')
+        return qs
 
 
 # ─────────────────────────────────────────────────────────────────────────────

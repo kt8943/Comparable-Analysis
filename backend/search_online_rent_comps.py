@@ -614,8 +614,13 @@ def run(config_path: str = "configs/deal_config.json",
             print(f"  → {level_new} new  |  total: {len(all_records)}")
             return level_new
 
+        # Grounded data sources to combine with (or instead of) OpenAI web search.
+        # Defaults to web-search only → identical behaviour to before.
+        sources_cfg   = sc_cfg.get("sources") or ["web_search"]
+        _web          = "web_search" in sources_cfg
+
         active_levels = GEO_LEVELS[:max_level]
-        while len(all_records) < min_results:
+        while _web and len(all_records) < min_results:
             for level_id, max_km, level_label in active_levels:
                 _run_level(level_id, max_km, level_label, yrs)
                 if len(all_records) >= min_results:
@@ -632,11 +637,59 @@ def run(config_path: str = "configs/deal_config.json",
                       f"{len(all_records)} record(s) found in geo levels.")
                 break
 
-        if len(all_records) < min_results and max_level >= 3:
+        if _web and len(all_records) < min_results and max_level >= 3:
             print(f"\n  Falling back to broader market search.")
             _run_level(*BROAD_LEVEL, yrs)
             if len(all_records) < min_results:
                 print(f"  ⚠  All levels exhausted — {len(all_records)} record(s).")
+
+        # ── Grounded connectors (URA PMI rents, …): fetch once, ingest ──────────
+        from sources.registry import get_grounded
+        from sources.base import months_ago as _months_ago
+        _conn_params = {"country_code": country_code, "country_name": country_name,
+                        "years_back": yrs, "s_lon": s_lon, "s_lat": s_lat,
+                        "proximity_km": proximity_km, "submarket_km": submarket_km,
+                        "market_km": market_km, "comp_type": "rent",
+                        "client": client, "extract_model": extract_model,
+                        "ura_max_rows": sc_cfg.get("ura_max_rows", 300),
+                        "broker_pages": sc_cfg.get("broker_pages"),
+                        "broker_max_pdfs": sc_cfg.get("broker_max_pdfs", 4)}
+        _rec_m = int(sc_cfg.get("recency_months", 18) or 18)
+        for _conn in get_grounded((country_code or "sg").lower(), "rent",
+                                  sources_cfg, _conn_params):
+            print(f"\n[Source] {_conn.label or _conn.name}")
+            try:
+                _raw, _srcs = _conn.fetch(subject_cfg, _conn_params)
+            except Exception as e:
+                print(f"  ✗ {e.__class__.__name__}: {e}")
+                continue
+            if not _raw:
+                print("  → 0 records")
+                continue
+            _cleaned = validate_dedup_rent(
+                _raw, subject_name=prop_name, subject_country=country_name,
+                subject_asset_class=subject_cfg.get("asset_class", ""))
+            _geo = geocode_records(_cleaned, mapbox_tok, country_code, country_name)
+            _base_srcs = _srcs or [{"title": _conn.label or _conn.name, "url": ""}]
+            _added = 0
+            for r in _geo:
+                if r.get("lon") is None:
+                    continue
+                if _haversine_km(r["lon"], r["lat"], s_lon, s_lat) > submarket_km:
+                    continue
+                rent = float(r.get("asking_rent") or r.get("eff_rent") or 0)
+                key  = re.sub(r"\W+", "", str(r.get("property_name", "")).lower())[:24] \
+                       + f"_{rent:.1f}"
+                if key in seen_keys:
+                    continue
+                r["sources"] = [{**s, "source_name": _conn.name} for s in _base_srcs]
+                seen_keys[key] = len(all_records)
+                all_records.append(r)
+                _added += 1
+            _lbl = _conn.label or _conn.name
+            if _lbl not in levels_used:
+                levels_used.append(_lbl)
+            print(f"  → {_added} new  |  total: {len(all_records)}")
 
         save_cache(cache_path, all_records, levels_used, c_key)
 
