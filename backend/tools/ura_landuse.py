@@ -97,8 +97,16 @@ def _build() -> dict:
             continue
         area = _poly_area_km2(geom, cen[1])            # km² (for coverage weighting)
         for b, descs in _BUCKETS.items():
-            if lu in descs:
-                buckets[b].append((cen[0], cen[1], area))
+            if lu not in descs:
+                continue
+            # PORT / AIRPORT: keep only parcels inside mainland Singapore's bounds —
+            # this drops offshore stray parcels (e.g. ~104.08°E, ~104.41°E / Pedra
+            # Branca) so the industrial "nearest freight node" distance reflects only
+            # the real hubs (Tuas, Jurong, PSA/Keppel, Changi, Seletar).
+            if b == "port_airport" and not (103.60 <= cen[0] <= 104.05
+                                            and 1.15 <= cen[1] <= 1.48):
+                continue
+            buckets[b].append((cen[0], cen[1], area))
     try:
         with open(_CACHE, "wb") as fh:
             pickle.dump(buckets, fh)
