@@ -185,6 +185,78 @@ def _mapbox_geocode(address: str, token: str) -> dict:
         return {}
 
 
+# Deterministic market lookups for the rule-based (no-LLM) config generator.
+# Keyed by a lowercase substring found in the address; first match wins.
+_COUNTRY_RULES = {
+    "singapore":      dict(country_name="Singapore",      country_code="sg", currency="SGD", currency_symbol="S$",  gfa_unit="sf"),
+    "south korea":    dict(country_name="South Korea",    country_code="kr", currency="KRW", currency_symbol="₩",   gfa_unit="sqm"),
+    "korea":          dict(country_name="South Korea",    country_code="kr", currency="KRW", currency_symbol="₩",   gfa_unit="sqm"),
+    "seoul":          dict(country_name="South Korea",    country_code="kr", currency="KRW", currency_symbol="₩",   gfa_unit="sqm"),
+    "japan":          dict(country_name="Japan",          country_code="jp", currency="JPY", currency_symbol="¥",   gfa_unit="sqm"),
+    "tokyo":          dict(country_name="Japan",          country_code="jp", currency="JPY", currency_symbol="¥",   gfa_unit="sqm"),
+    "osaka":          dict(country_name="Japan",          country_code="jp", currency="JPY", currency_symbol="¥",   gfa_unit="sqm"),
+    "hong kong":      dict(country_name="Hong Kong",      country_code="hk", currency="HKD", currency_symbol="HK$", gfa_unit="sf"),
+    "shanghai":       dict(country_name="China",          country_code="cn", currency="CNY", currency_symbol="RMB", gfa_unit="sqm"),
+    "beijing":        dict(country_name="China",          country_code="cn", currency="CNY", currency_symbol="RMB", gfa_unit="sqm"),
+    "china":          dict(country_name="China",          country_code="cn", currency="CNY", currency_symbol="RMB", gfa_unit="sqm"),
+    "sydney":         dict(country_name="Australia",      country_code="au", currency="AUD", currency_symbol="A$",  gfa_unit="sqm"),
+    "melbourne":      dict(country_name="Australia",      country_code="au", currency="AUD", currency_symbol="A$",  gfa_unit="sqm"),
+    "australia":      dict(country_name="Australia",      country_code="au", currency="AUD", currency_symbol="A$",  gfa_unit="sqm"),
+    "kuala lumpur":   dict(country_name="Malaysia",       country_code="my", currency="MYR", currency_symbol="RM",  gfa_unit="sf"),
+    "malaysia":       dict(country_name="Malaysia",       country_code="my", currency="MYR", currency_symbol="RM",  gfa_unit="sf"),
+    "london":         dict(country_name="United Kingdom", country_code="gb", currency="GBP", currency_symbol="£",   gfa_unit="sf"),
+    "united kingdom": dict(country_name="United Kingdom", country_code="gb", currency="GBP", currency_symbol="£",   gfa_unit="sf"),
+    "new york":       dict(country_name="United States",  country_code="us", currency="USD", currency_symbol="US$", gfa_unit="sf"),
+    "united states":  dict(country_name="United States",  country_code="us", currency="USD", currency_symbol="US$", gfa_unit="sf"),
+    "usa":            dict(country_name="United States",  country_code="us", currency="USD", currency_symbol="US$", gfa_unit="sf"),
+}
+_DEFAULT_COUNTRY = dict(country_name="Singapore", country_code="sg",
+                        currency="SGD", currency_symbol="S$", gfa_unit="sf")
+# keyword-in-asset_class → (asset_search_keyword, land_zoning)
+_ASSET_RULES = [
+    ("logistic",    ("logistics warehouse",  "Logistics / Industrial")),
+    ("warehouse",   ("logistics warehouse",  "Logistics / Industrial")),
+    ("data",        ("data centre",          "Business Park / Industrial")),
+    ("industrial",  ("industrial",           "Industrial")),
+    ("office",      ("office building",      "Commercial")),
+    ("retail",      ("retail mall",          "Commercial")),
+    ("mall",        ("retail mall",          "Commercial")),
+    ("shop",        ("retail",               "Commercial")),
+    ("hotel",       ("hotel",                "Hospitality")),
+    ("hospitality", ("hotel",                "Hospitality")),
+    ("resid",       ("residential",          "Residential")),
+    ("mixed",       ("mixed use development", "Commercial")),
+]
+
+
+def _derive_fields_rules(address: str, asset_class: str) -> dict:
+    """Deterministic (no-LLM) counterpart of _derive_fields_with_llm.
+
+    Infers the market/config fields from the address string + asset class using
+    lookup tables — no model call, nothing leaves the machine. Mapbox geocoding
+    still refines ``location`` / ``submarket_keywords`` back in derive_market_fields.
+    """
+    a  = (address or "").lower()
+    ac = (asset_class or "").lower()
+    country = next((v for k, v in _COUNTRY_RULES.items() if k in a), _DEFAULT_COUNTRY)
+    kw, zoning = "commercial property", "Commercial"
+    for k, (kwv, zv) in _ASSET_RULES:
+        if k in ac:
+            kw, zoning = kwv, zv
+            break
+    # submarket fallback: the part before the country/postcode is usually the city/area
+    parts = [p.strip() for p in (address or "").split(",") if p.strip()]
+    loc   = parts[-2] if len(parts) >= 2 else (parts[0] if parts else country["country_name"])
+    return {
+        **country,
+        "land_zoning":          zoning,
+        "location":             loc,
+        "asset_search_keyword": kw,
+        "submarket_keywords":   [loc] if loc else [country["country_name"]],
+        "broader_market_query": f"{country['country_name']} {kw} investment sale",
+    }
+
+
 def _derive_fields_with_llm(address: str, asset_class: str,
                               llm_cfg: dict, openai_key: str = "") -> dict:
     """Ask the LLM to derive all config fields from address + asset class."""
@@ -606,7 +678,12 @@ def derive_market_fields(address: str, asset_class: str,
     fields automatically.  The user can then review and correct any value in
     Step 2 of the wizard before saving.
     """
-    fields = _derive_fields_with_llm(address, asset_class, llm_cfg, openai_key)
+    provider = (llm_cfg or {}).get("provider", "ollama")
+    if provider in ("none", "rules"):
+        print("  Deriving market fields via RULES (no LLM) …")
+        fields = _derive_fields_rules(address, asset_class)
+    else:
+        fields = _derive_fields_with_llm(address, asset_class, llm_cfg, openai_key)
 
     # Override submarket with real geodata from Mapbox if token is available
     if mapbox_token:

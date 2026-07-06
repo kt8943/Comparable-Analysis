@@ -2302,7 +2302,9 @@ def render_new_deal_form():
     _openai_key   = os.environ.get("OPENAI_API_KEY", "")
     _base_url     = _ollama_base_url()
 
-    if _active_model in _OPENAI_ANALYSIS_MODELS:
+    if _active_model == _NO_LLM_OPTION:
+        llm_cfg = {"provider": "rules"}
+    elif _active_model in _OPENAI_ANALYSIS_MODELS:
         llm_cfg = {"provider": "openai", "openai_model": _active_model}
     else:
         # Fall back to first installed Ollama model if sidebar somehow has no selection
@@ -2320,8 +2322,15 @@ def render_new_deal_form():
             "**Cloud LLM selected — data-privacy note.** Config generation sends the "
             "**address & asset class** (and any **uploaded deal-brief text**) to the cloud "
             "model (OpenAI) to infer the remaining fields. Don't upload confidential briefs "
-            "under a cloud model — switch the sidebar to a **local model (Ollama)** to keep "
-            "everything on-prem."
+            "under a cloud model — switch the sidebar to a **local model (Ollama)** or "
+            "**Rule-based (no LLM)** to keep everything on-prem."
+        )
+    elif llm_cfg["provider"] == "rules":
+        st.info(
+            "**Rule-based (no LLM) selected** — config fields are derived from the address "
+            "+ asset class using built-in rules and Mapbox geocoding only. **Nothing is sent "
+            "to any model.** Deal-brief text extraction is disabled in this mode; type the "
+            "address and details directly."
         )
     else:
         st.info(
@@ -2416,7 +2425,10 @@ def render_new_deal_form():
                 elif pasted.strip():
                     raw_text = pasted.strip()
 
-                if raw_text:
+                if raw_text and llm_cfg["provider"] == "rules":
+                    st.info("Rule-based mode: skipping deal-brief text extraction (needs an "
+                            "LLM). Using the fields you typed above.")
+                elif raw_text:
                     extracted = extract_from_document(raw_text, llm_cfg, _openai_key)
                     for k, v in extracted.items():
                         if v is not None and (fields.get(k) in (None, "", 0)):
