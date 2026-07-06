@@ -60,7 +60,7 @@ from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build
 from tools.calculations import haversine_km as _haversine_km, parse_num as _num
 from tools.json_utils import fix_json as _fix_json, split_json_arrays as _split_json_arrays
 from tools.llm_client import ollama_post as _ollama_post, apply_refinement as _apply_refinement
-from tools.excel_reader import find_best_sheet as _find_best_sheet, find_header_row as _find_header_row, sheet_keywords as _sheet_keywords
+from tools.excel_reader import find_best_sheet as _find_best_sheet, find_header_row as _find_header_row, sheet_keywords as _sheet_keywords, split_tables as _split_tables
 from tools.vision_llm import call_vision_llm as _call_vision_llm
 from tools.column_mapper import map_columns as _map_cols_tool
 from tools.geo_utils import write_geo_sidecar
@@ -113,24 +113,41 @@ def _map_columns(headers: list, sample_rows: list,
 
 
 def parse_input_excel(input_file: str, base_url: str, model: str,
-                      subject_name: str = "", llm_cfg: dict = None) -> list:
+                      subject_name: str = "", llm_cfg: dict = None,
+                      _segment: tuple = None) -> list:
     """
     Read any Excel file of rent comps. Uses LLM (GPT or Ollama) to map columns.
     Returns list of dicts with standardised field names ready for
     classify_rent_comps() and geocoding.
+
+    A single sheet may hold several STACKED tables with different column layouts;
+    each is detected and parsed with its OWN header row (via ``_segment`` recursion).
     """
-    wb   = openpyxl.load_workbook(input_file, data_only=True)
-    best = _best_sheet(wb)
-    ws   = wb[best]
-    rows = [tuple(c.value for c in row) for row in ws.iter_rows()]
+    if _segment is not None:
+        best, headers, data_rows = _segment
+        print(f"  Headers: {[h for h in headers if h]}")
+    else:
+        wb   = openpyxl.load_workbook(input_file, data_only=True)
+        best = _best_sheet(wb)
+        ws   = wb[best]
+        rows = [tuple(c.value for c in row) for row in ws.iter_rows()]
 
-    hdr_idx = _find_header_row(rows)
-    headers  = [str(c) if c is not None else "" for c in rows[hdr_idx]]
-    data_rows = [r for r in rows[hdr_idx + 1:] if any(c not in (None, "") for c in r)]
+        segments = _split_tables(rows, _sheet_kws)
+        if len(segments) > 1:
+            print(f"  Sheet {best!r}: {len(segments)} stacked tables detected — "
+                  "parsing each with its own header row.")
+            _all = []
+            for _k, (_hi, _sh, _sd) in enumerate(segments, 1):
+                print(f"\n  ══ Table {_k}/{len(segments)} — header row {_hi + 1}, "
+                      f"{len(_sd)} data row(s) ══")
+                _all += parse_input_excel(
+                    input_file, base_url, model, subject_name=subject_name,
+                    llm_cfg=llm_cfg, _segment=(best, _sh, _sd))
+            return _all
 
-    print(f"  Sheet: {best!r}  |  Header row: {hdr_idx + 1}"
-          f"  |  Data rows: {len(data_rows)}")
-    print(f"  Headers: {[h for h in headers if h]}")
+        _hi, headers, data_rows = segments[0]
+        print(f"  Sheet: {best!r}  |  Header row: {_hi + 1}  |  Data rows: {len(data_rows)}")
+        print(f"  Headers: {[h for h in headers if h]}")
 
     # Tiered column mapping: exact → keyword → fuzzy → Ollama (last resort)
     print(f"  Mapping columns …")

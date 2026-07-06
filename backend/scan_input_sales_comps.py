@@ -68,7 +68,7 @@ from tools.json_utils import (
     split_json_arrays as _split_json_arrays,
 )
 from tools.llm_client import ollama_post as _ollama_post, apply_refinement as _apply_refinement
-from tools.excel_reader import find_best_sheet as _find_best_sheet, find_header_row as _find_header_row, sheet_keywords as _sheet_keywords
+from tools.excel_reader import find_best_sheet as _find_best_sheet, find_header_row as _find_header_row, sheet_keywords as _sheet_keywords, split_tables as _split_tables
 from tools.vision_llm import call_vision_llm as _call_vision_llm
 from tools.column_mapper import map_columns as _map_columns
 from tools.geo_utils import write_geo_sidecar
@@ -129,26 +129,46 @@ _best_sheet = lambda wb: _find_best_sheet(wb, _sheet_kws)
 
 def parse_input_excel(input_file: str, base_url: str, model: str,
                       subject_name: str = "", llm_cfg: dict = None,
-                      area_unit: str = "sf") -> list:
+                      area_unit: str = "sf", _segment: tuple = None) -> list:
     """
     Read any Excel of asset sales comps.  Uses LLM (GPT or Ollama) to map columns.
     Returns list of dicts with standardised field names ready for
     classify_comps() and metrics calculation.
     All transaction types are kept exactly as extracted from the input.
     area_unit: target output unit for area fields — "sf" (default, SG) or "sqm" (global).
+
+    A single sheet may contain several STACKED tables with different column layouts;
+    each is detected and parsed with its OWN header row (via ``_segment`` recursion),
+    so a table below the first is never mapped using the first table's columns.
     """
-    wb   = openpyxl.load_workbook(input_file, data_only=True)
-    best = _best_sheet(wb)
-    ws   = wb[best]
-    rows = [tuple(c.value for c in row) for row in ws.iter_rows()]
+    if _segment is not None:
+        best, headers, data_rows = _segment
+        print(f"  Headers: {[h for h in headers if h]}")
+    else:
+        wb   = openpyxl.load_workbook(input_file, data_only=True)
+        best = _best_sheet(wb)
+        ws   = wb[best]
+        rows = [tuple(c.value for c in row) for row in ws.iter_rows()]
 
-    hdr_idx   = _find_header_row(rows)
-    headers   = [str(c) if c is not None else "" for c in rows[hdr_idx]]
-    data_rows = [r for r in rows[hdr_idx + 1:] if any(c not in (None, "") for c in r)]
+        segments = _split_tables(rows, _sheet_kws)
+        if len(segments) > 1:
+            print(f"  Sheet {best!r}: {len(segments)} stacked tables detected — "
+                  "parsing each with its own header row.")
+            _all, _cm0, _hd0, _pu0 = [], None, None, "M"
+            for _k, (_hi, _sh, _sd) in enumerate(segments, 1):
+                print(f"\n  ══ Table {_k}/{len(segments)} — header row {_hi + 1}, "
+                      f"{len(_sd)} data row(s) ══")
+                _recs, _cm, _hd, _pu = parse_input_excel(
+                    input_file, base_url, model, subject_name=subject_name,
+                    llm_cfg=llm_cfg, area_unit=area_unit, _segment=(best, _sh, _sd))
+                _all += _recs
+                if _cm0 is None:
+                    _cm0, _hd0, _pu0 = _cm, _hd, _pu
+            return _all, _cm0 or {}, _hd0 or [], _pu0
 
-    print(f"  Sheet: {best!r}  |  Header row: {hdr_idx + 1}"
-          f"  |  Data rows: {len(data_rows)}")
-    print(f"  Headers: {[h for h in headers if h]}")
+        _hi, headers, data_rows = segments[0]
+        print(f"  Sheet: {best!r}  |  Header row: {_hi + 1}  |  Data rows: {len(data_rows)}")
+        print(f"  Headers: {[h for h in headers if h]}")
 
     # Pick sample rows for Ollama: prefer rows with >= 3 non-empty cells
     # (avoids section sub-header rows that only have 1–2 cells filled)
