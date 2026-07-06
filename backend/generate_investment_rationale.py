@@ -1192,6 +1192,57 @@ def _fallback_citations_from_text(rationale_body: str) -> list[dict]:
     return entries
 
 
+def _build_input_summary(extracted_reports: list) -> str:
+    """Build the 'Input Summary' section from the Stage-1 extracted report facts.
+
+    Summarises, per input PDF, the key points and what they convey for this
+    investment — the evidence base that shapes the rationale that follows. Built
+    directly from the already-extracted structured facts (no extra LLM call).
+    """
+    reports = [r for r in (extracted_reports or []) if r.get("source_file")]
+    if not reports:
+        return ""
+
+    out = [
+        "## Input Summary\n",
+        "_Key points drawn from the market report(s) provided, and what they convey "
+        "for this investment — the evidence base for the rationale that follows._\n",
+    ]
+    for r in reports:
+        src     = r.get("source_file", "report")
+        sectors = r.get("sectors_covered")
+        sectors = ", ".join(sectors) if isinstance(sectors, list) else (sectors or "")
+        meta    = " · ".join(x for x in (r.get("country_region") or "", sectors,
+                                         r.get("report_period") or "") if x)
+        out.append(f"### {src}" + (f"  \n_{meta}_" if meta else ""))
+
+        overview = (r.get("market_overview") or "").strip()
+        if overview:
+            out.append(overview)
+
+        # "What it conveys" — the decision-relevant angles, when present.
+        for label, key in (
+            ("Demand drivers",            "demand_drivers"),
+            ("Supply & demand",           "supply_demand"),
+            ("Rents",                     "rental_trends"),
+            ("Capital values / yields",   "capital_values_transactions"),
+            ("Development pipeline",       "supply_pipeline"),
+            ("Outlook & risks",           "market_outlook"),
+        ):
+            val = (r.get(key) or "").strip()
+            if val:
+                out.append(f"- **{label}:** {val}")
+
+        stats = [s.strip() for s in (r.get("key_statistics") or [])
+                 if isinstance(s, str) and s.strip()][:3]
+        if stats:
+            out.append("- **Notable figures:** " + "; ".join(stats))
+        out.append("")   # blank line between reports
+
+    out.append("---\n")
+    return "\n".join(out) + "\n"
+
+
 def generate_rationale(
     extracted_reports: list[dict],
     subject_cfg: dict,
@@ -1343,9 +1394,11 @@ def generate_rationale(
     )
     if report_srcs:
         header += f"**Market Reports Used:** {report_srcs}  \n"
+    header += ("\n> _LLM-generated from the cited market reports — verify all figures "
+               "against the source PDFs before use._\n")
     header += "\n---\n\n"
 
-    rationale_md = header + rationale_body
+    rationale_md = header + _build_input_summary(extracted_reports) + rationale_body
 
     if audit_entries:
         rationale_md += (

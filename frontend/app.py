@@ -3196,6 +3196,14 @@ def render_investment_rationale():
         "Select a deal, tick the market reports you want to use, "
         "add any analyst notes, then generate a 3-section investment rationale."
     )
+    st.warning(
+        "**LLM-generated — be mindful of data privacy.** This feature sends the selected "
+        "market-report text and deal details to the chosen analysis model to extract "
+        "insights and write the memo. If a **cloud model (e.g. GPT)** is selected, that "
+        "content leaves your machine — only use reports cleared for external processing. "
+        "Select a **local model (Ollama)** to keep everything on-prem. Always verify the "
+        "output against the source PDFs."
+    )
     st.divider()
 
     if not deals:
