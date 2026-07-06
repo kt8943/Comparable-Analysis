@@ -1054,14 +1054,18 @@ def _gpt_extract_full_pdf(
     field_schema: list,
     subj_tokens: set,
     llm_cfg: dict,
-    max_pages: int = 30,
+    max_pages: int = 60,
+    batch_size: int = 8,
 ) -> list:
     """
     GPT-4o vision path — replaces Stages 1-4 entirely for OpenAI provider.
 
-    Renders all pages as images and sends them in one request.
-    GPT-4o finds the relevant comparable transactions section by keyword,
-    detects the table, and extracts all rows.
+    Renders pages as images and sends them to GPT-4o **in batches** (default 8
+    pages/request) rather than one giant request. Batching (a) keeps each request
+    within size/token limits so large PDFs don't silently fail — the failure mode
+    that made a 2nd/large PDF return nothing — and (b) lets us send higher-detail
+    images so borderless / dense tables are actually read. Rows from all batches
+    are aggregated (dedup happens in the caller).
     """
     try:
         import fitz
@@ -1069,10 +1073,10 @@ def _gpt_extract_full_pdf(
         raise ImportError("pymupdf required for GPT vision path: pip install pymupdf")
 
     import base64
-    doc      = fitz.open(pdf_path)
-    n_pages  = min(len(doc), max_pages)
-    detail   = "auto" if n_pages <= 15 else "low"
-    print(f"  [GPT-4o] rendering {n_pages} page(s) at detail={detail!r} ...")
+    from tools.llm_client import openai_chat as _openai_chat
+
+    doc     = fitz.open(pdf_path)
+    n_pages = min(len(doc), max_pages)
 
     field_list  = "\n".join(f'  "{k}": {d}' for _, k, d in field_schema)
     keyword_str = ", ".join(f'"{kw}"' for kw in section_keywords[:10])
@@ -1089,54 +1093,56 @@ def _gpt_extract_full_pdf(
         "- Copy property names exactly as printed — do not paraphrase or abbreviate."
     )
 
-    user_content: list = [{"type": "text", "text": (
-        f"The following {n_pages} page(s) are from a real estate report.\n"
-        f"Find tables under headings like: {keyword_str}.\n"
-        f"Extract every row and return as a JSON array.\n\n"
-        f"Fields to extract:\n{field_list}"
-    )}]
+    n_batches = max(1, (n_pages + batch_size - 1) // batch_size)
+    print(f"  [GPT-4o] {n_pages} page(s) → {n_batches} batch(es) of ≤{batch_size} "
+          f"at detail='high' ...")
 
-    for i in range(n_pages):
-        pix = doc[i].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        b64 = base64.b64encode(pix.tobytes("png")).decode()
-        user_content.append({"type": "text", "text": f"[Page {i + 1}]"})
-        user_content.append({"type": "image_url", "image_url": {
-            "url": f"data:image/png;base64,{b64}", "detail": detail,
-        }})
+    all_items: list = []
+    for b in range(n_batches):
+        start = b * batch_size
+        end   = min(start + batch_size, n_pages)
+        user_content: list = [{"type": "text", "text": (
+            f"These are pages {start + 1}-{end} of a real estate report.\n"
+            f"Find tables under headings like: {keyword_str}.\n"
+            f"Extract every row and return as a JSON array.\n\n"
+            f"Fields to extract:\n{field_list}"
+        )}]
+        for i in range(start, end):
+            pix = doc[i].get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+            b64 = base64.b64encode(pix.tobytes("png")).decode()
+            user_content.append({"type": "text", "text": f"[Page {i + 1}]"})
+            user_content.append({"type": "image_url", "image_url": {
+                "url": f"data:image/png;base64,{b64}", "detail": "high",
+            }})
+        messages = [{"role": "system", "content": system},
+                    {"role": "user",   "content": user_content}]
+        try:
+            print(f"  [GPT-4o] batch {b + 1}/{n_batches} — pages {start + 1}-{end} …")
+            raw = _openai_chat(llm_cfg, messages, timeout=300)
+            raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+            raw = re.sub(r"\n?```$", "", raw)
+            m   = re.search(r"\[[\s\S]*\]", raw)
+            if not m:
+                print(f"  [GPT-4o] batch {b + 1}: no JSON array in response")
+                continue
+            extracted = json.loads(m.group(0))
+            if isinstance(extracted, list):
+                all_items.extend(x for x in extracted if isinstance(x, dict))
+        except Exception as e:
+            print(f"  [GPT-4o] batch {b + 1} failed: {e}")
+            continue
     doc.close()
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user_content},
-    ]
-    try:
-        from tools.llm_client import openai_chat as _openai_chat
-        print(f"  [GPT-4o] sending {n_pages} page images — waiting for response ...")
-        raw = _openai_chat(llm_cfg, messages, timeout=300)
-        raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-        raw = re.sub(r"\n?```$", "", raw)
-        m   = re.search(r"\[[\s\S]*\]", raw)
-        if not m:
-            print("  [GPT-4o] no JSON array in response")
-            return []
-        extracted = json.loads(m.group(0))
-        if not isinstance(extracted, list):
-            return []
-        result = []
-        for item in extracted:
-            if not isinstance(item, dict):
-                continue
-            name = str(next((item.get(k, "") for k in _NAME_KEYS if item.get(k)), ""))
-            if _skip_subject(name, subj_tokens):
-                print(f"      SKIP {name!r:.60s}  — matches subject")
-                continue
-            price = item.get("price_sgd_m") or item.get("price_psf_gfa") or ""
-            print(f"      KEEP {name!r:.55s}  price={price!r:.20s}")
-            result.append(item)
-        return result
-    except Exception as e:
-        print(f"  [GPT-4o] extraction failed: {e}")
-        return []
+    result = []
+    for item in all_items:
+        name = str(next((item.get(k, "") for k in _NAME_KEYS if item.get(k)), ""))
+        if _skip_subject(name, subj_tokens):
+            print(f"      SKIP {name!r:.60s}  — matches subject")
+            continue
+        price = item.get("price_sgd_m") or item.get("price_psf_gfa") or ""
+        print(f"      KEEP {name!r:.55s}  price={price!r:.20s}")
+        result.append(item)
+    return result
 
 
 # ─── Stage 4: record assembly ─────────────────────────────────────────────────

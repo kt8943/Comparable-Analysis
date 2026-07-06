@@ -879,8 +879,12 @@ def run(config_path: str = "configs/deal_config.json",
             _src_label = f"pdf_{_pdf_i}" if len(input_pdf_files) > 1 else "pdf"
             _tag = f" {_pdf_i}" if len(input_pdf_files) > 1 else ""
             print(f"  [PDF{_tag}] {Path(_pdf_path).name}")
-            _pdf_records = _parse_pdf_records(
-                _pdf_path, llm_cfg, subject_name=prop_name)
+            try:
+                _pdf_records = _parse_pdf_records(
+                    _pdf_path, llm_cfg, subject_name=prop_name)
+            except Exception as _e:
+                print(f"      [PDF{_tag}] extraction failed: {_e}  — skipping this file")
+                _pdf_records = []
             for _r in _pdf_records:
                 _r["_source"] = _src_label
             records += _pdf_records
