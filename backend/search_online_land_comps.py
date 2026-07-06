@@ -503,11 +503,35 @@ def classify_land_online(records: list, subject_cfg: dict,
 # OUTPUT WORKBOOK  (online variant — adds Sources sheet + AI disclaimer)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Human-readable origin labels for each connector (source_name → label).
+_SOURCE_LABELS = {
+    "web_search":     "Web search",
+    "ura_pmi":        "URA PMI",
+    "broker_reports": "Broker report",
+    "ura_gls":        "URA GLS",
+}
+
+
+def _source_label(name: str) -> str:
+    if not name:
+        return "Web search"
+    return _SOURCE_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _record_origins(rec: dict) -> list:
+    out = []
+    for s in rec.get("sources") or []:
+        lbl = _source_label(s.get("source_name") or "")
+        if lbl not in out:
+            out.append(lbl)
+    return out or ["Web search"]
+
+
 def _build_sources_sheet(wb, records: list):
     ws = wb.create_sheet("Sources")
     ws.sheet_view.showGridLines = False
-    headers = ["#", "Site / Property", "Source Title", "URL"]
-    widths  = [4, 38, 44, 70]
+    headers = ["#", "Site / Property", "Source", "Source Title", "URL"]
+    widths  = [4, 34, 16, 40, 66]
     for col, (h, w) in enumerate(zip(headers, widths), 1):
         ws.column_dimensions[get_column_letter(col)].width = w
         c = ws.cell(row=1, column=col, value=h)
@@ -524,14 +548,16 @@ def _build_sources_sheet(wb, records: list):
         for i, s in enumerate(srcs):
             alt = (row % 2 == 0)
             bg  = _LGRAY if alt else _WHITE
-            for col in range(1, 5):
+            for col in range(1, 6):
                 ws.cell(row=row, column=col).fill = _fill(bg)
                 ws.cell(row=row, column=col).alignment = _align("left", "center", wrap=False)
             ws.cell(row=row, column=1, value=marker if i == 0 else "")
             ws.cell(row=row, column=2, value=name   if i == 0 else "")
-            ws.cell(row=row, column=3, value=s.get("title") or "")
+            sc = ws.cell(row=row, column=3, value=_source_label(s.get("source_name") or ""))
+            sc.font = _font(_NAVY, sz=9, bold=True)
+            ws.cell(row=row, column=4, value=s.get("title") or "")
             url = s.get("url") or ""
-            uc  = ws.cell(row=row, column=4, value=url)
+            uc  = ws.cell(row=row, column=5, value=url)
             if url:
                 uc.hyperlink = url
                 uc.font = _font("FF1155CC", sz=9, bold=False)
@@ -789,7 +815,8 @@ def run(config_path: str = "configs/deal_config.json",
                                                subject_asset_class=subject_cfg.get("asset_class", ""))
                 geocoded = geocode_land_records(cleaned, mapbox_tok, country_code,
                                                 country_name=country_name)
-                level_new += _merge_geocoded(geocoded, q_sources, max_km)
+                level_new += _merge_geocoded(geocoded, q_sources, max_km,
+                                             source_name="web_search")
             lbl = f"{level_label} (yrs:{yrs_used})"
             if lbl not in levels_used:
                 levels_used.append(lbl)

@@ -416,6 +416,21 @@ def record_to_rent_row(r: dict, subject_cfg: dict) -> dict:
     }
 
 
+# Human-readable origin labels for each connector (source_name → label).
+_SOURCE_LABELS = {
+    "web_search":     "Web search",
+    "ura_pmi":        "URA PMI",
+    "broker_reports": "Broker report",
+    "ura_gls":        "URA GLS",
+}
+
+
+def _source_label(name: str) -> str:
+    if not name:
+        return "Web search"
+    return _SOURCE_LABELS.get(name, name.replace("_", " ").title())
+
+
 def build_workbook_online_rent(subject_row: dict, comp_rows: list,
                                 subject_cfg: dict, output_path: str,
                                 records_with_sources: list = None):
@@ -428,11 +443,12 @@ def build_workbook_online_rent(subject_row: dict, comp_rows: list,
     wb = openpyxl.load_workbook(output_path)
     ws_src = wb.create_sheet("Sources")
     ws_src.column_dimensions["A"].width = 6
-    ws_src.column_dimensions["B"].width = 40
-    ws_src.column_dimensions["C"].width = 80
+    ws_src.column_dimensions["B"].width = 38
+    ws_src.column_dimensions["C"].width = 16
+    ws_src.column_dimensions["D"].width = 80
 
     # Header
-    for col, hdr in enumerate(["#", "Property", "Source URL"], 1):
+    for col, hdr in enumerate(["#", "Property", "Source", "Source URL"], 1):
         c = ws_src.cell(row=1, column=col, value=hdr)
         c.fill   = _fill("1A3A5C")
         c.font   = _font(bold=True)
@@ -444,7 +460,9 @@ def build_workbook_online_rent(subject_row: dict, comp_rows: list,
         for src in r.get("sources", []):
             ws_src.cell(row=row_idx, column=1, value=r.get("map_marker", ""))
             ws_src.cell(row=row_idx, column=2, value=r.get("property_name", ""))
-            url_cell = ws_src.cell(row=row_idx, column=3, value=src.get("url", ""))
+            sc = ws_src.cell(row=row_idx, column=3, value=_source_label(src.get("source_name") or ""))
+            sc.font = _font(bold=True)
+            url_cell = ws_src.cell(row=row_idx, column=4, value=src.get("url", ""))
             url_cell.hyperlink = src.get("url", "")
             url_cell.style = "Hyperlink"
             row_idx += 1
@@ -583,9 +601,10 @@ def run(config_path: str = "configs/deal_config.json",
                         existing_urls = {s["url"] for s in all_records[idx].get("sources",[])}
                         for s in q_sources:
                             if s["url"] and s["url"] not in existing_urls:
-                                all_records[idx].setdefault("sources",[]).append(s)
+                                all_records[idx].setdefault("sources",[]).append(
+                                    {**s, "source_name": "web_search"})
                         continue
-                    r["sources"] = list(q_sources)
+                    r["sources"] = [{**s, "source_name": "web_search"} for s in q_sources]
                     seen_keys[key] = len(all_records)
                     all_records.append(r)
                     level_new += 1

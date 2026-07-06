@@ -626,9 +626,34 @@ _NAVYL = "FF2E4C7E"
 _NOTE  = "FFEBF3FB"
 
 
+# Human-readable origin labels for each connector (source_name → label).
+_SOURCE_LABELS = {
+    "web_search":     "Web search",
+    "ura_pmi":        "URA PMI",
+    "broker_reports": "Broker report",
+    "ura_gls":        "URA GLS",
+}
+
+
+def _source_label(name: str) -> str:
+    if not name:
+        return "Web search"
+    return _SOURCE_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _record_origins(rec: dict) -> list:
+    """Distinct origin labels for a record (e.g. ['URA PMI'] or ['Web search', 'Broker report'])."""
+    out = []
+    for s in rec.get("sources") or []:
+        lbl = _source_label(s.get("source_name") or "")
+        if lbl not in out:
+            out.append(lbl)
+    return out or ["Web search"]
+
+
 def _build_sources_sheet(wb, classified: list):
     """
-    Add a 'Sources' sheet listing each comp's verification URLs.
+    Add a 'Sources' sheet listing each comp's verification URLs + where it came from.
     classified : the classified records list (each has a 'sources' key).
     """
     ws = wb.create_sheet("Sources")
@@ -639,8 +664,8 @@ def _build_sources_sheet(wb, classified: list):
     LGRAY = "FFF2F2F2"
 
     # Header
-    headers = ["#", "Property", "Source Title", "URL"]
-    widths  = [4, 38, 40, 70]
+    headers = ["#", "Property", "Source", "Source Title", "URL"]
+    widths  = [4, 34, 16, 38, 66]
     for col, (h, w) in enumerate(zip(headers, widths), 1):
         ws.column_dimensions[get_column_letter(col)].width = w
         c = ws.cell(row=1, column=col, value=h)
@@ -663,16 +688,18 @@ def _build_sources_sheet(wb, classified: list):
             ws.cell(row=row, column=1, value=marker if i == 0 else "").fill = _fill(bg)
             ws.cell(row=row, column=1).alignment = _align("center", "center")
             ws.cell(row=row, column=2, value=name if i == 0 else "").fill = _fill(bg)
-            title_cell = ws.cell(row=row, column=3, value=s.get("title") or "")
+            src_cell = ws.cell(row=row, column=3, value=_source_label(s.get("source_name") or ""))
+            src_cell.fill = _fill(bg); src_cell.font = _font("FF1F3864", sz=9, bold=True)
+            title_cell = ws.cell(row=row, column=4, value=s.get("title") or "")
             title_cell.fill = _fill(bg)
             url = s.get("url") or ""
-            url_cell = ws.cell(row=row, column=4, value=url)
+            url_cell = ws.cell(row=row, column=5, value=url)
             url_cell.fill = _fill(bg)
             if url:
                 url_cell.hyperlink = url
                 url_cell.font = _font("FF1155CC", sz=9, bold=False)
                 url_cell.style = "Hyperlink"
-            for col in range(1, 5):
+            for col in range(1, 6):
                 ws.cell(row=row, column=col).alignment = _align("left", "center", wrap=False)
             row += 1
 
@@ -967,7 +994,8 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                                           subject_asset_class=subject_cfg.get("asset_class", ""))
                 geocoded = geocode_records(cleaned, mapbox_tok, country_code,
                                            country_name=country_name)
-                level_new += _merge_geocoded(geocoded, q_sources, max_km)
+                level_new += _merge_geocoded(geocoded, q_sources, max_km,
+                                             source_name="web_search")
             label_str = f"{level_label} (yrs:{yrs_used})"
             if label_str not in levels_used:
                 levels_used.append(label_str)
@@ -1107,7 +1135,7 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
             if srcs:
                 mk   = r.get("map_marker", "?")
                 name = str(r.get("property_name", ""))[:38]
-                print(f"  {mk}. {name}")
+                print(f"  {mk}. {name}   [{' + '.join(_record_origins(r))}]")
                 for s in srcs:
                     title = (s.get("title") or "")[:60]
                     url   = s.get("url", "")
