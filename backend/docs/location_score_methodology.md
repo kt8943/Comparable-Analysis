@@ -38,9 +38,10 @@ Straight-line distance (km) to the **nearest** relevant node:
 - **CBD** = Raffles Place MRT `(1.28348° N, 103.85176° E)`.
 - **Retail-centre attractiveness** (retail): a 0–1 score = `tier_weight × proximity`, where
   `proximity = max(0, 1 − distance/3 km)` (distance still drives it) and `tier_weight` is
-  **1.0 for prime** centres (Orchard, CBD) and **0.7 for URA Regional Centres** (Jurong Lake
-  District, Tampines, Woodlands, Seletar). So being *at* a regional centre tops out at 0.7
-  while a prime centre reaches 1.0 — a **0.3 score penalty** for regional (higher = better).
+  **1.0 for prime** centres (Orchard, CBD) and **0.6 for URA Regional Centres** (Jurong Lake
+  District, Tampines, Woodlands, Seletar). So being *at* a regional centre tops out at 0.6
+  while a prime centre reaches 1.0 — a **0.4 score penalty** for regional (higher = better).
+  Beyond 3 km from every centre, attractiveness is 0 ("not near a retail centre").
 - **Freight nodes** (industrial): nearest of the 5 real port/airport hubs —
   **Tuas, Jurong, PSA/Keppel, Changi, Seletar** (offshore stray parcels removed).
 

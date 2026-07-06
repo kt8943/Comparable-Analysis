@@ -124,7 +124,7 @@ _CBD_NODES = [
 # prime centre reaches 1.0. Higher attractiveness = better retail location.
 _RETAIL_D0        = 3.0   # km — retail-centre influence radius (attractiveness → 0 beyond)
 _RETAIL_W_PRIME   = 1.0
-_RETAIL_W_REGION  = 0.7   # 0.3 score penalty vs a prime centre
+_RETAIL_W_REGION  = 0.6   # 0.4 score penalty vs a prime centre
 _RETAIL_CENTRES = [
     (103.85176, 1.28348, _RETAIL_W_PRIME),   # CBD / Raffles Place   (prime)
     (103.8330,  1.3040,  _RETAIL_W_PRIME),   # Orchard               (prime)
