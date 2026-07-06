@@ -36,8 +36,10 @@ coverage = (total area of parcels of that land use whose CENTRE is within 1 km) 
 **B. Distance to a landmark (a "proximity" factor).**
 Straight-line distance (km) to the **nearest** relevant node:
 - **CBD** = Raffles Place MRT `(1.28348° N, 103.85176° E)`.
-- **Regional centres** (retail): nearest of Orchard, Jurong East, Tampines, Woodlands,
-  Paya Lebar, Punggol, Bishan/AMK.
+- **Retail centres** (retail): nearest of a **tiered** set — **prime** (Orchard, CBD) count
+  fully; **URA Regional Centres** (Jurong Lake District, Tampines, Woodlands, Seletar) carry
+  a **+2 km tier penalty**, so being at a regional centre is treated as being 2 km from a
+  prime centre. Prime-centre proximity therefore scores higher.
 - **Freight nodes** (industrial): nearest of the 5 real port/airport hubs —
   **Tuas, Jurong, PSA/Keppel, Changi, Seletar** (offshore stray parcels removed).
 
@@ -49,7 +51,7 @@ Each row is one asset class. "↑ better" = more is better; "↓ better" = close
 | Subject sector | Factor 1 | Factor 2 |
 |---|---|---|
 | **Office** | Distance to **CBD** ↓ better | **Commercial** land coverage (1 km) ↑ better |
-| **Retail** | **Residential** land coverage (1 km) ↑ better *(catchment)* | Distance to nearest **regional centre** ↓ better |
+| **Retail** | **Commercial/retail** land coverage (1 km) ↑ better *(mall cluster)* | Distance to nearest **retail centre — tiered** (Orchard/CBD prime; regional centres +2 km) ↓ better |
 | **Industrial / Logistics / Data centre** | **Business** land coverage (1 km) ↑ better *(industrial cluster)* | Distance to nearest **port/airport hub** ↓ better |
 | **Hotel / Hospitality** | **Tourist attractions** within 1 km ↑ better *(count)* | **Commercial** land coverage (1 km) ↑ better |
 | **Mixed** | Distance to **CBD** ↓ better | **Residential + Commercial** coverage (1 km) ↑ better |

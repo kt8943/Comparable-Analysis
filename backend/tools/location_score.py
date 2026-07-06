@@ -116,14 +116,19 @@ _CBD_NODES = [
 
 # Regional / sub-regional centres (malls cluster here) — retail competitiveness
 # rises with closeness to one of these.
-_REGIONAL_NODES = [
-    (103.8330, 1.3040),  # Orchard
-    (103.7420, 1.3330),  # Jurong East / JLD
-    (103.9450, 1.3540),  # Tampines
-    (103.7860, 1.4370),  # Woodlands
-    (103.8920, 1.3180),  # Paya Lebar
-    (103.9010, 1.4050),  # Punggol
-    (103.8480, 1.3500),  # Bishan / Ang Mo Kio
+# Retail catchment centres: (lon, lat, tier_penalty_km).
+# TIER 1 — prime retail (Orchard, CBD): penalty 0.
+# TIER 2 — URA Regional Centres (JLD, Tampines, Woodlands, Seletar): a +penalty km so
+#          being at a regional centre is treated as being _RETAIL_TIER_PENALTY km from a
+#          prime centre — i.e. Orchard/CBD proximity scores higher than a regional centre.
+_RETAIL_TIER_PENALTY = 2.0   # km — how much "further" a regional centre counts vs prime
+_RETAIL_CENTRES = [
+    (103.85176, 1.28348, 0.0),                  # CBD / Raffles Place   (prime)
+    (103.8330,  1.3040,  0.0),                  # Orchard               (prime)
+    (103.7420,  1.3330,  _RETAIL_TIER_PENALTY), # Jurong Lake District  (regional)
+    (103.9450,  1.3540,  _RETAIL_TIER_PENALTY), # Tampines              (regional)
+    (103.7860,  1.4370,  _RETAIL_TIER_PENALTY), # Woodlands             (regional)
+    (103.8850,  1.4050,  _RETAIL_TIER_PENALTY), # Seletar (approx.)     (regional)
 ]
 
 
@@ -158,9 +163,11 @@ def _factors(lon: float, lat: float, sector: str) -> list:
         return [(cbd,                                            False, None),   # closer to CBD
                 (U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV)]  # commercial land share
     if sector == "retail":
-        reg = min(U._hav(lon, lat, n[0], n[1]) for n in _REGIONAL_NODES)
-        return [(U.coverage_within(lon, lat, "residential", 1.0), True, _K_COV),  # residential catchment
-                (reg,                                             False, None)]   # closer to regional centre
+        # Tier-penalised distance: a prime centre (Orchard/CBD) at 0 km beats a regional
+        # centre at 0 km, because the regional centre carries a +penalty km.
+        reg = min(U._hav(lon, lat, c[0], c[1]) + c[2] for c in _RETAIL_CENTRES)
+        return [(U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV),  # retail/commercial cluster
+                (reg,                                            False, None)]   # closer to a (weighted) retail centre
     if sector == "hospitality":
         return [(_tourism_within(lon, lat, 1.0),                 True, _K_COUNT), # tourist draw (count)
                 (U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV)]   # commercial land share
