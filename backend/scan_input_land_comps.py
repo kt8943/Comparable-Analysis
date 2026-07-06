@@ -288,6 +288,9 @@ _PDF_SECTION_KEYWORDS = [
     "Land Transactions", "Additional Land Transactions",
     "En Bloc Sales", "Land Acquisitions",
     "Land Sale Evidence", "Collective Sales",
+    # Broker market-report tables listing land/site deals
+    "Major Transactions", "Major Deals", "Selected Transactions",
+    "Notable Transactions", "Key Transactions",
 ]
 
 

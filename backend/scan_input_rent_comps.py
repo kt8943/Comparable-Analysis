@@ -247,6 +247,9 @@ _PDF_SECTION_KEYWORDS = [
     "Rental Comparables", "Additional Rental Comparables",
     "Comparable Leases", "Tenancy Schedule", "Rental Evidence",
     "Lease Transactions", "Recent Leasing", "Recent Leases", "Leasing Activity",
+    # Broker market-report tables listing lease deals
+    "Major Leases", "Major Lettings", "Selected Leases", "Notable Leases",
+    "Key Leases", "Major Leasing Transactions",
 ]
 
 

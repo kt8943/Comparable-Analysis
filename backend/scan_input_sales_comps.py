@@ -336,6 +336,10 @@ _PDF_SECTION_KEYWORDS = [
     "Key Transactions", "Key Sales Transactions",
     "Investment Activity", "Investment Transactions",
     "Private Transactions",
+    # Broker market-report tables (e.g. CBRE "TABLE 2: Major Transactions, Q4 2025")
+    "Major Transactions", "Major Deals", "Major Sales",
+    "Selected Transactions", "Selected Deals", "Selected Sales",
+    "Notable Deals", "Key Deals", "Significant Deals",
 ]
 
 # Full extraction schema for PDFs: same as _OUTPUT_FIELDS but with an
