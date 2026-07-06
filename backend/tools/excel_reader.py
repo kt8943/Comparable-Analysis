@@ -72,17 +72,33 @@ def split_tables(rows: list, keywords: set = None,
                      if c is not None and isinstance(c, str) and str(c).strip()]
         if len(text_vals) < min_text_cells:
             return False
+        # A header is a row of TEXT LABELS. Any cell containing a digit (a price,
+        # area, date or year) marks this as a DATA row — never a header. This is the
+        # key guard that stops a single table being split by a data row that merely
+        # happens to hit some keywords.
+        if any(re.search(r"\d", str(c)) for c in row if c not in (None, "")):
+            return False
         if not keywords:
             return True
         hits = sum(1 for v in text_vals if any(kw in v.lower() for kw in keywords))
         return hits >= 2 and hits >= len(text_vals) * min_kw_frac
 
+    def _is_separator(row) -> bool:
+        """A blank row or a lone section title (≤1 non-empty cell) — the gap that
+        normally precedes a genuinely new stacked table."""
+        return len([c for c in row if c not in (None, "")]) <= 1
+
     head_idxs = []
     for i, row in enumerate(rows):
-        if _is_header(row):
-            if head_idxs and i - head_idxs[-1] == 1:
-                continue   # multi-line header → keep the first line only
-            head_idxs.append(i)
+        if not _is_header(row):
+            continue
+        if head_idxs:
+            # A 2nd+ header only starts a NEW table when it's preceded by a separator
+            # (blank / section-title row). Without a gap it's a multi-line header or a
+            # false positive inside one table → keep the rows together (don't split).
+            if i == 0 or not _is_separator(rows[i - 1]):
+                continue
+        head_idxs.append(i)
     if not head_idxs:
         head_idxs = [find_header_row(rows)]
 
