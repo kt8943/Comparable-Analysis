@@ -72,6 +72,22 @@ def find_relevant_pages(pdf_path: str, section_keywords: list,
     except ImportError:
         raise ImportError("pdfplumber required: pip install pdfplumber")
 
+    # ── Optional embedding tier (reuse the column-mapper fastembed model) ──────
+    # Catches transaction-table pages whose heading is a SEMANTIC match but not an
+    # exact substring of any keyword (e.g. "Headline Deals" ≈ "Key Transactions").
+    # Only applied to pages that actually contain a table, to limit false positives.
+    _emb_model, _kw_vecs, _np = None, None, None
+    try:
+        from tools.column_mapper import (_EMBED_AVAILABLE, _get_embed_model,
+                                          _embed as _embed_text)
+        import numpy as _np
+        if _EMBED_AVAILABLE and section_keywords:
+            _emb_model = _get_embed_model()
+            _kw_vecs   = _np.array([_embed_text(_emb_model, kw) for kw in section_keywords])
+    except Exception as _e:   # fastembed/numpy missing → skip semantic tier
+        _emb_model = None
+    _EMB_THRESHOLD = 0.58
+
     matches = []
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages[:max_pages], 1):
@@ -79,13 +95,16 @@ def find_relevant_pages(pdf_path: str, section_keywords: list,
             if not text:
                 continue
 
-            text_lower = text.lower()
-            matched    = [kw for kw in section_keywords if kw.lower() in text_lower]
+            text_lower  = text.lower()
+            page_tables = page.extract_tables() or []
+            has_table   = any(len(t) > 1 and len(t[0]) > 1 for t in page_tables)
+
+            matched = [kw for kw in section_keywords if kw.lower() in text_lower]
 
             # Keyword not in body text — check inside table cells (some PDFs
             # embed the section title in a merged table header cell).
             if not matched:
-                for tbl in (page.extract_tables() or []):
+                for tbl in page_tables:
                     for row in tbl[:3]:
                         for cell in row:
                             cell_matched = [kw for kw in section_keywords
@@ -98,17 +117,52 @@ def find_relevant_pages(pdf_path: str, section_keywords: list,
                     if matched:
                         break
 
+            # Embedding tier — only for table-bearing pages with no exact match.
+            emb_title, emb_score = "", 0.0
+            if not matched and has_table and _emb_model is not None:
+                # Collect heading-like lines across the WHOLE page, then embed the
+                # most title-like ones first (a table title such as "TABLE 2: Major
+                # Transactions" can sit well below the top of the extracted text).
+                scored = []
+                for ln in text.splitlines():
+                    ls = ln.strip()
+                    if not (4 <= len(ls) <= 80 and len(ls.split()) >= 2):
+                        continue
+                    is_title = bool(re.match(r'(?i)^\s*(?:table|exhibit|schedule|'
+                                             r'section)\b', ls))
+                    scored.append((0 if is_title else 1, ls))
+                scored.sort(key=lambda x: x[0])          # explicit titles first
+                cand = [s for _, s in scored[:25]]
+                for ln in cand:
+                    # Strip "TABLE 2:" / "FIGURE 3 —" prefixes and trailing quarter/year
+                    # so the comparison focuses on the heading noun phrase itself.
+                    clean = re.sub(r'^\s*(?:table|figure|exhibit|chart|appendix)\s*'
+                                   r'\d*\s*[:.\-]?\s*', '', ln, flags=re.I)
+                    clean = re.sub(r'[,\-–]?\s*(?:q[1-4]\s*)?\b(?:19|20)\d{2}\b.*$', '',
+                                   clean, flags=re.I).strip()
+                    for variant in {ln, clean}:
+                        if not variant:
+                            continue
+                        try:
+                            s = float(_kw_vecs.dot(_embed_text(_emb_model, variant)).max())
+                        except Exception:
+                            continue
+                        if s > emb_score:
+                            emb_score, emb_title = s, ln
+                if emb_score >= _EMB_THRESHOLD:
+                    matched = [f"~embed({emb_score:.2f})"]
+
             if not matched:
                 continue
 
-            page_tables = page.extract_tables() or []
-            has_table   = any(len(t) > 1 and len(t[0]) > 1 for t in page_tables)
-
             section_title = ""
-            for line in text.splitlines():
-                if any(kw.lower() in line.lower() for kw in matched):
-                    section_title = line.strip()[:120]
-                    break
+            if emb_title and matched and matched[0].startswith("~embed"):
+                section_title = emb_title[:120]
+            else:
+                for line in text.splitlines():
+                    if any(kw.lower() in line.lower() for kw in matched):
+                        section_title = line.strip()[:120]
+                        break
             if not section_title:
                 section_title = matched[0]
 
