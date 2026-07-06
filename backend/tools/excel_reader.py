@@ -67,54 +67,63 @@ def split_tables(rows: list, keywords: set = None,
     Consecutive header rows collapse to the first (multi-line headers); data rows that
     themselves look like headers are dropped (secondary header lines).
     """
+    def _is_separator(row) -> bool:
+        """A blank row or a lone section title (≤1 non-empty cell). An EMPTY row is
+        the strong signal that a new table starts below it."""
+        return len([c for c in row if c not in (None, "")]) <= 1
+
     def _is_header(row) -> bool:
         text_vals = [str(c).strip() for c in row
                      if c is not None and isinstance(c, str) and str(c).strip()]
         if len(text_vals) < min_text_cells:
             return False
-        # A header is a row of TEXT LABELS. Any cell containing a digit (a price,
-        # area, date or year) marks this as a DATA row — never a header. This is the
-        # key guard that stops a single table being split by a data row that merely
-        # happens to hit some keywords.
-        if any(re.search(r"\d", str(c)) for c in row if c not in (None, "")):
+        # A header may carry a few digit-bearing labels (e.g. "31Yr Adj Price"), but a
+        # row with MANY digit cells is data (prices/areas/dates), not a header.
+        digit_cells = sum(1 for c in row
+                          if c not in (None, "") and re.search(r"\d", str(c)))
+        if digit_cells > 3:
             return False
         if not keywords:
             return True
         hits = sum(1 for v in text_vals if any(kw in v.lower() for kw in keywords))
         return hits >= 2 and hits >= len(text_vals) * min_kw_frac
 
-    def _is_separator(row) -> bool:
-        """A blank row or a lone section title (≤1 non-empty cell) — the gap that
-        normally precedes a genuinely new stacked table."""
-        return len([c for c in row if c not in (None, "")]) <= 1
-
-    head_idxs = []
+    # ── Primary signal: EMPTY / section-title rows split the sheet into blocks ──
+    blocks, cur = [], []
     for i, row in enumerate(rows):
-        if not _is_header(row):
-            continue
-        if head_idxs:
-            # A 2nd+ header only starts a NEW table when it's preceded by a separator
-            # (blank / section-title row). Without a gap it's a multi-line header or a
-            # false positive inside one table → keep the rows together (don't split).
-            if i == 0 or not _is_separator(rows[i - 1]):
-                continue
-        head_idxs.append(i)
-    if not head_idxs:
-        head_idxs = [find_header_row(rows)]
+        if _is_separator(row):
+            if cur:
+                blocks.append(cur)
+                cur = []
+        else:
+            cur.append(i)
+    if cur:
+        blocks.append(cur)
 
-    out = []
-    for j, h in enumerate(head_idxs):
-        end = head_idxs[j + 1] if j + 1 < len(head_idxs) else len(rows)
-        headers = [str(c) if c is not None else "" for c in rows[h]]
-        data = [r for r in rows[h + 1:end]
-                if any(c not in (None, "") for c in r) and not _is_header(r)]
-        if data:
-            out.append((h, headers, data))
-    if not out:   # nothing had data rows — fall back to a single best-guess table
-        h = head_idxs[0]
-        out = [(h, [str(c) if c is not None else "" for c in rows[h]],
-                [r for r in rows[h + 1:] if any(c not in (None, "") for c in r)])]
-    return out
+    # Each block is a NEW table if it contains a header row; otherwise it is a data
+    # continuation of the previous table (a stray blank inside one table won't split
+    # it). Rows above the header in a block (titles/metadata) are ignored; all rows
+    # after it are DATA — never dropped.
+    out = []   # [ [header_idx, headers, data_rows], … ]
+    for blk in blocks:
+        h_pos = next((k for k, idx in enumerate(blk) if _is_header(rows[idx])), None)
+        if h_pos is None:
+            if out:   # no header here → append to the previous table's data
+                out[-1][2].extend(rows[idx] for idx in blk
+                                  if any(c not in (None, "") for c in rows[idx]))
+            continue
+        h_idx   = blk[h_pos]
+        headers = [str(c) if c is not None else "" for c in rows[h_idx]]
+        data    = [rows[idx] for idx in blk[h_pos + 1:]
+                   if any(c not in (None, "") for c in rows[idx])]
+        out.append([h_idx, headers, data])
+
+    if not out:   # no header found anywhere — single best-guess table
+        h = find_header_row(rows)
+        out = [[h, [str(c) if c is not None else "" for c in rows[h]],
+                [r for r in rows[h + 1:] if any(c not in (None, "") for c in r)]]]
+
+    return [(h, hdr, d) for h, hdr, d in out if d]
 
 
 def sheet_keywords(output_fields: list) -> set:
