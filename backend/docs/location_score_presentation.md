@@ -1,217 +1,166 @@
-# Location Competitiveness Score — Presentation Deck (Singapore)
+# Location Competitiveness Score — Explanatory Write-up (Singapore)
 
-A slide-by-slide script. Each slide has **on-slide bullets** and **speaker notes** (the
-detail you say out loud). Reflects the current production logic.
+## 1. What it is and why
+Every comparable-transactions table needs a consistent read on **how good each comp's
+location is relative to the subject property**. Historically that was an analyst's manual
+judgement — slow, subjective, and inconsistent between people and deals. This model replaces
+that with a **repeatable, data-grounded signal**: it labels each comp **Superior**,
+**Comparable**, or **Inferior** on location, adjusted for the **asset class** (what counts as
+"prime" for an office is different from retail, logistics, or a hotel). It is deliberately a
+**directional 3-way label, not a valuation input** — a quick, defensible, auditable read.
 
----
+## 2. The data behind it
+The model is built on the **URA Master Plan** — the official land-use map covering every
+zoned plot in Singapore. Because the full map is large (181 MB), it is pre-processed once into
+a small (~3 MB) cache that keeps, for each parcel, only its **centre point and its area
+(km²)**, sorted into five land-use groups: **residential, commercial, business, hotel, and
+port/airport**. Hotels additionally use OneMap's **"Tourist Attractions"** layer. This cache
+is enough to answer the only two questions the model asks — *"how much of the surroundings is
+a given land use?"* and *"how far is the nearest relevant centre or hub?"* — and it is small
+enough to run anywhere, including the cloud, with no live network calls.
 
-## Slide 1 — Title
-**Location Competitiveness Score**
-*How each comparable is labelled Superior / Comparable / Inferior by location*
+## 3. How the score is built (three steps)
+For the **subject** and for **each comp**, the model measures **two location factors** chosen
+for that asset class. It then **compares each comp to the subject**, factor by factor, turning
+each into a sub-score between **−1 and +1** (0 means the comp matches the subject). Finally it
+**averages the two sub-scores** into the location score and maps it to a label. The subject is
+always the benchmark (score 0); a comp scores **positive** when its surroundings are *better*
+than the subject's and **negative** when they are *worse*.
 
-**Speaker notes.** Every comp table needs a consistent, objective read on *location quality*
-relative to the subject. This model produces that in one word — Superior, Comparable, or
-Inferior — using Singapore's official land-use map, so it's repeatable and defensible rather
-than a manual judgement call.
+## 4. The two kinds of factor
+Every sector's score combines one factor of each type below.
 
----
-
-## Slide 2 — The problem we're solving
-- Analysts previously judged each comp's location **by hand** — slow, subjective, inconsistent.
-- We need a **repeatable, data-grounded** signal that adjusts for **asset class**
-  (what's "prime" for an office differs from retail or logistics).
-- Output must be **simple** (a 3-way label) and **auditable**.
-
-**Speaker notes.** The score isn't trying to be a valuation — it's a *directional* location
-read that's consistent across deals and analysts, and that respects the fact that "good
-location" means different things for an office vs a warehouse vs a mall.
-
----
-
-## Slide 3 — Data foundation
-- **URA Master Plan** land-use parcels — every zoned plot in Singapore.
-- Pre-processed into a lightweight cache: each parcel's **centre point + area (km²)**,
-  bucketed into 5 uses — **residential, commercial, business, hotel, port/airport**.
-- Hotels also use **OneMap "Tourist Attractions."**
-- **No live network** at runtime; **181 MB map → ~3 MB cache** (deploys to the cloud).
-
-**Speaker notes.** We shrink the full 181 MB Master Plan to a ~3 MB cache by keeping each
-parcel's centre and area and dropping the polygon shape. That's enough for "how much of the
-surroundings is X" and "how far to the nearest Y," and it's small enough to run anywhere,
-including the cloud. The trade-off is a small approximation we'll flag later.
-
----
-
-## Slide 4 — The method in three steps
-1. **Measure 2 location factors** for the subject and for each comp — factors chosen for the
-   asset class.
-2. **Compare** each comp to the subject, factor by factor → a sub-score in **−1…+1**.
-3. **Average** the two sub-scores → the location score, then map to a label.
-
-**Speaker notes.** Subject is always the benchmark (score 0). A comp scores positive when its
-surroundings are better than the subject's, negative when worse. Two factors per sector keeps
-it interpretable — one "density of the right land use nearby" and one "proximity to the right
-kind of centre/node."
-
----
-
-## Slide 5 — Two kinds of factor
-**A. Land-use coverage (density).**
+**Land-use coverage (a "density" factor).** This measures what share of the **1 km circle**
+around a property is covered by a given land use:
 ```
-coverage = (area of parcels of a land use whose CENTRE is within 1 km) ÷ (area of the 1 km circle)
+coverage = (total area of parcels of that use whose CENTRE is within 1 km) ÷ (area of the 1 km circle)
 ```
-- Share of the 1 km circle covered by that use. Bigger estates weigh more than tiny lots.
+Because it is area-weighted, large estates count for more than tiny lots. It is an
+approximation — a whole parcel is counted if its *centre* falls inside the circle — but it is
+used **relatively** (comp vs subject), so it never needs to be a capped percentage.
 
-**B. Proximity to a node (distance or attractiveness).**
-- Distance (km) to the nearest relevant node (CBD, freight hub), **or**
-- A tier-weighted **attractiveness** score (retail centres).
+**Proximity to a node (a "distance" or "attractiveness" factor).** This measures how close a
+property is to the right kind of centre: either the straight-line distance (km) to the nearest
+node (the CBD, or a freight hub), or — for retail — a tier-weighted **attractiveness** score
+that blends distance with how *prime* the nearest centre is.
 
-**Speaker notes.** Coverage answers "how much of the neighbourhood is the *right* kind of land
-for this asset." Proximity answers "how close is it to the *right* kind of centre." Every
-sector combines one of each.
-
----
-
-## Slide 6 — Factors by sector  *(the core slide)*
+## 5. Which factors each sector uses
+The two factors are tailored to what drives location value for each asset class.
 
 | Sector | Factor 1 | Factor 2 |
 |---|---|---|
-| **Office** | Distance to **CBD** (Raffles Place) ↓ | **Commercial** coverage (1 km) ↑ |
-| **Retail** | **Commercial/retail** coverage (1 km) ↑ | **Retail-centre attractiveness** (tiered) ↑ |
-| **Industrial / Logistics / Data centre** | **Business** coverage (1 km) ↑ | Distance to nearest **freight hub** ↓ |
-| **Hotel** | **Tourist attractions** within 1 km ↑ | **Commercial** coverage (1 km) ↑ |
-| **Mixed** | Distance to **CBD** ↓ | **Residential + Commercial** coverage ↑ |
+| **Office** | Distance to the **CBD** (Raffles Place) — closer is better | **Commercial** land coverage within 1 km — more is better |
+| **Retail** | **Commercial / retail** land coverage within 1 km — more is better | **Retail-centre attractiveness** (tiered; prime vs regional) — higher is better |
+| **Industrial / Logistics / Data centre** | **Business** land coverage within 1 km — more is better | Distance to the nearest **freight hub** — closer is better |
+| **Hotel** | **Tourist attractions** within 1 km (count) — more is better | **Commercial** land coverage within 1 km — more is better |
+| **Mixed** | Distance to the **CBD** — closer is better | **Residential + Commercial** coverage within 1 km — more is better |
 
-**Speaker notes.** Read across each row: office value = CBD proximity + surrounding commercial
-density; retail = retail-cluster density + being near a *prime* shopping centre; industrial =
-industrial-land cluster + freight access; hotel = tourist draw + a lively commercial area;
-mixed = CBD + combined residential/commercial vibrancy.
+In words: office value tracks CBD proximity and the surrounding commercial density; retail
+tracks its retail-cluster density and being near a *prime* shopping centre; industrial tracks
+the surrounding industrial-land cluster and access to a major sea/air freight node; a hotel
+tracks its tourist draw and how lively the surrounding commercial area is; and a mixed-use
+asset blends CBD proximity with combined residential-plus-commercial vibrancy.
 
----
+## 6. How a comp is compared to the subject
+Each factor produces a sub-score in **[−1, +1]**, equal to 0 when the comp and subject are
+equal. There are two formulas, one per factor type.
 
-## Slide 7 — Comparing a comp to the subject (the math)
-Each factor → a sub-score in **[−1, +1]** (0 when comp = subject).
-
-**Coverage / count (higher = better):**
+**Coverage or count factors (higher is better)** use a smoothed relative difference:
 ```
-sub_score = (comp − subject) ÷ (comp + subject + k)
+sub_score = (comp_value − subject_value) ÷ (comp_value + subject_value + k)
 ```
-- `k` dampens small-number noise: **0.3** for coverage, **10** for the tourist count.
+The constant `k` dampens noise when the numbers are small — it is **0.3** for coverage
+fractions and **10** for the tourist-attraction count.
 
-**Distance (lower = better):**
+**Distance factors (lower is better)** scale the difference by a fixed 5 km reference and clamp
+to ±1:
 ```
 sub_score = clamp( (subject_distance − comp_distance) ÷ 5 km , −1, +1 )
 ```
-- Comp closer than subject → positive; a **5 km** gap = the full ±1.
+A comp that is **closer** than the subject scores **positive**, and a 5 km gap corresponds to
+the full ±1. The 5 km reference matters: it scales the *difference* rather than the raw
+distance, so a subject that sits right on a landmark (distance ≈ 0) does not force every comp
+to −1.
 
-**Speaker notes.** The smoothing `k` stops tiny differences from producing big swings. The 5 km
-reference on distances stops a subject that sits *on* a landmark (distance ≈ 0) from forcing
-every comp to −1 — it scales the *difference*, not the raw distance.
+## 7. Final score and label
+The location score is simply the **average of the two factor sub-scores**, ranging from −1 to
++1, mapped to three labels:
 
----
-
-## Slide 8 — Final score & label
-```
-location_score = average(factor1_subscore, factor2_subscore)     # −1 … +1
-```
-| Score | Label |
+| Location score | Label |
 |---|---|
-| **> +0.3** | **Superior** |
-| **−0.3 … +0.3** | **Comparable** |
-| **< −0.3** | **Inferior** |
+| **greater than +0.3** | **Superior** |
+| **−0.3 to +0.3** | **Comparable** |
+| **less than −0.3** | **Inferior** |
 
-**Speaker notes.** Three buckets on purpose — this is a directional read, not a decimal
-valuation input. The ±0.3 dead-band means a comp has to be *clearly* better or worse to move
-off "Comparable."
+The ±0.3 dead-band is intentional: a comp must be *clearly* better or worse to move off
+"Comparable," which keeps the label stable and honest about the model's coarseness.
 
----
+## 8. Worked example — office
+Take a subject office at **Raffles Place** and a comp at **CapitaSpring**, about 300 m away.
+The subject is at the CBD (distance 0.0 km) with commercial coverage 0.20; the comp is 0.3 km
+from the CBD with commercial coverage 0.19. Factor 1 (CBD distance) gives
+`(0.0 − 0.3) / 5 = −0.06`; factor 2 (commercial coverage) gives
+`(0.19 − 0.20) / (0.19 + 0.20 + 0.3) = −0.01`. The average is **−0.04 → Comparable**. By
+contrast, a far suburban office — a large CBD distance and low commercial coverage — would
+score around **−0.7 → Inferior**.
 
-## Slide 9 — Worked example: OFFICE
-Subject = Raffles Place office. Comp = CapitaSpring (≈300 m away).
-
-| | Subject | Comp |
-|---|---|---|
-| Distance to CBD | 0.0 km | 0.3 km |
-| Commercial coverage (1 km) | 0.20 | 0.19 |
-
-- Factor 1 (CBD distance ↓): `(0.0 − 0.3)/5 = −0.06`
-- Factor 2 (commercial coverage ↑): `(0.19 − 0.20)/(0.19+0.20+0.3) = −0.01`
-- **Score = −0.04 → Comparable.** A far suburban office ≈ **−0.7 → Inferior.**
-
----
-
-## Slide 10 — Deep dive: RETAIL centre tiering
-- Retail-centre proximity is a **0–1 attractiveness** score, not a raw distance:
+## 9. Deep dive — retail centre tiering
+Retail is the one sector where *which* centre you are near matters, not just how close. So its
+second factor is a **0–1 attractiveness score** rather than a raw distance:
 ```
-proximity      = max(0, 1 − distance / 3 km)          # distance still drives it
-attractiveness = tier_weight × proximity              # the tier is a SCORE penalty
+proximity      = max(0, 1 − distance ÷ 3 km)        # distance still drives this
+attractiveness = tier_weight × proximity            # the tier is a SCORE penalty
 ```
-- **Prime centres = 1.0:** Orchard, CBD (Raffles Place).
-- **URA Regional Centres = 0.6:** Jurong Lake District, Tampines, Woodlands, Seletar.
-- At a regional centre you top out at **0.6**; at a prime centre you reach **1.0** — a **0.4
-  score penalty**. Beyond **3 km** from every centre → **0** ("not near a retail centre").
+Distance still counts — being closer to a centre raises the score, and beyond **3 km** from
+every centre the score is **0** ("not near a retail centre"). What the tier adds is a **score
+penalty** for less-prime centres:
 
-**Worked comparison (both 2 km from their nearest centre):**
-| | proximity | × tier | attractiveness |
+| Tier | Centres | Weight | Meaning |
 |---|---|---|---|
-| Subject — 2 km from **Orchard** (prime) | 0.33 | ×1.0 | 0.33 |
-| Comp — 2 km from **Jurong** (regional) | 0.33 | ×0.6 | 0.20 |
+| **Prime** | Orchard, CBD (Raffles Place) | **1.0** | Reaches 1.0 at the centre |
+| **Regional** | Jurong Lake District, Tampines, Woodlands, Seletar | **0.6** | Tops out at 0.6 — a 0.4 penalty |
 
-Retail-centre factor = `(0.20 − 0.33)/(0.20 + 0.33 + 0.3) = −0.16` → comp is **inferior** on
-this factor because it's near a *regional*, not *prime*, centre.
+So a property *at* a regional centre can only reach 0.6, while one *at* a prime centre reaches
+1.0. Example: two properties each 2 km from their nearest centre have the same proximity
+(`1 − 2/3 = 0.33`), but the subject near **Orchard** gets `1.0 × 0.33 = 0.33` and the comp
+near **Jurong** gets `0.6 × 0.33 = 0.20`; the factor is
+`(0.20 − 0.33) / (0.20 + 0.33 + 0.3) = −0.16`, correctly marking the comp inferior *because it
+is near a regional rather than a prime centre.* The 0.6 weight was chosen as a balance — 0.7
+made a regional centre look almost as good as prime, while 0.5 let the tier dominate the
+label; 0.6 makes prime clearly better while staying balanced against the coverage factor.
 
-**Speaker notes.** We deliberately put the penalty on the *score*, not the distance — so
-distance still matters (closer = better) but a suburban centre can never look as good as
-Orchard/CBD. The "why 0.6": 0.7 was too soft (regional ≈ prime), 0.5 let the tier dominate;
-0.6 makes prime clearly better while staying balanced against the coverage factor.
+## 10. Deep dive — industrial freight access
+For industrial, logistics, and data-centre subjects, the second factor is the distance to the
+nearest **freight hub**, with **equal treatment** — being near *any* major sea or air hub is
+good, and the model does not try to rank them. The hubs were **derived from the URA
+port/airport parcels** (with offshore stray parcels removed), giving five: **Tuas, Jurong,
+PSA/Keppel, Changi, and Seletar**. Distance is measured to the **nearest parcel** of a hub, so
+a sprawling port like Tuas is measured to its nearest edge rather than a distant centre point.
+The first factor (business-land coverage) then differentiates comps that are all "near a hub."
 
----
+## 11. Guardrails
+- **Same sector only.** A comp is scored only against a same-class subject (a Mixed subject
+  matches anything); otherwise its Location is left blank.
+- **Singapore-only.** Both the subject and the comp must sit inside Singapore, since the model
+  is built on Singapore geography; overseas comps are left blank.
+- **Analyst override.** If the input file already provides a Superior/Comparable/Inferior
+  label, that label is **kept** and never overwritten by the computed one.
+- **Coordinates.** The score uses the same latitude/longitude plotted on the map
+  (Google/Mapbox), falling back to a OneMap geocode only when coordinates are missing.
 
-## Slide 11 — Deep dive: INDUSTRIAL freight access
-- Factor 2 = distance to the **nearest freight hub**, **equal treatment** (near any hub is good).
-- **5 hubs**, data-derived from the URA port/airport parcels (offshore strays removed):
-  **Tuas, Jurong, PSA/Keppel, Changi, Seletar.**
-- Measured to the **nearest parcel** of a hub (so a sprawling port is measured to its nearest
-  edge, not a far centre).
+## 12. Limitations (state these plainly)
+- **Approximation, not valuation.** Coverage counts a whole parcel if its centre is in the
+  circle, and the CBD, retail centres, and freight hubs are fixed reference points. The output
+  is a **coarse, directional** three-bucket signal, not a precise valuation input.
+- **Some nodes are hand-set.** The CBD point, the retail-centre coordinates, and the tier
+  weights are modelling choices — defensible but subjective; only the freight hubs are
+  data-derived.
+- **Tunable.** The key knobs are all adjustable: retail tier weight (0.6), retail influence
+  radius (3 km), coverage smoothing (0.3), the 5 km distance reference, and the ±0.3 label
+  thresholds.
 
-**Speaker notes.** We chose equal treatment — a coarse label shouldn't try to rank Tuas vs
-Changi vs Seletar. Being near *a* major sea/air freight node is the signal. Factor 1 (business-
-land coverage) then differentiates comps that are all "near a hub."
-
----
-
-## Slide 12 — Guardrails
-- **Same sector only.** A comp is scored only against a same-class subject (Mixed matches any);
-  otherwise Location is blank.
-- **Singapore-only.** Both subject and comp must be inside Singapore; the model is built on SG
-  geography, so overseas comps are blank.
-- **Analyst override.** An input file's own Superior/Comparable/Inferior label is **kept** —
-  never overwritten by the computed one.
-- **Coordinates.** Uses the same lat/long plotted on the map (Google/Mapbox), else a OneMap
-  geocode.
-
----
-
-## Slide 13 — Limitations (be upfront)
-- **Approximation, not valuation.** Coverage counts a whole parcel if its *centre* is in the
-  circle; nodes (CBD, retail centres, hubs) are fixed reference points. Output is a coarse,
-  **directional** 3-bucket signal.
-- **Hand-set nodes.** CBD and retail-centre coordinates + tier weights are modelling choices
-  (defensible, but subjective). Freight hubs *are* data-derived.
-- **Cloud vs local.** SG location computes on the cloud (via the cache); overseas markets need
-  their own equivalents.
-
----
-
-## Slide 14 — Roadmap / possible extensions
-- **Other markets** (e.g. Seoul/Tokyo) with their own CBD/centre/hub definitions.
-- **True area intersection** (polygon-clipped coverage) if we run locally with the full map.
-- **Tunable knobs** already exposed: retail tier weight (0.6), influence radius (3 km),
-  smoothing (0.3), distance reference (5 km), label thresholds (±0.3).
-
----
-
-## Slide 15 — One-line summary
-> For each comp we measure **two location factors** tailored to the asset class, compare them
-> to the subject, average into a **−1…+1 score**, and label it **Superior / Comparable /
-> Inferior** — grounded in URA's Master Plan, adjusted per sector, and fully repeatable.
+## 13. One-line summary
+For each comp the model measures **two asset-class-tailored location factors**, compares them
+to the subject, **averages** them into a **−1…+1 score**, and labels it **Superior /
+Comparable / Inferior** — grounded in URA's Master Plan, adjusted per sector, and fully
+repeatable.
