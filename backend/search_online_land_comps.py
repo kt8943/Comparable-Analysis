@@ -408,6 +408,11 @@ def geocode_land_records(records: list, mapbox_token: str,
     suffix = f", {country_name}" if country_name else ""
     out = []
     for r in records:
+        # Preserve coordinates a connector already resolved (e.g. URA GLS polygon
+        # centroid) — those are more precise than re-geocoding the street name.
+        if r.get("lon") is not None and r.get("lat") is not None:
+            out.append(r)
+            continue
         name  = str(r.get("property_name") or "").strip()
         addr  = str(r.get("address") or "").strip()
         if not addr:
@@ -878,7 +883,8 @@ def run(config_path: str = "configs/deal_config.json",
                                            subject_asset_class=subject_cfg.get("asset_class", ""))
             # ── Comparability rules on grounded records ──────────────────────
             from sources.base import months_ago as _months_ago
-            _rec_m = int(sc_cfg.get("recency_months", 12) or 12)
+            # Land/GLS awards are infrequent → default to a wider recency window (36mo).
+            _rec_m = int(sc_cfg.get("recency_months", 36) or 36)
             _before = len(_cleaned)
             _cleaned = [r for r in _cleaned
                         if (_months_ago(str(r.get("launch_date") or r.get("sale_date") or "")) or 0) <= _rec_m]
