@@ -223,6 +223,20 @@ def _coords(r: dict):
     return _onemap_geocode(name, r.get("address"))
 
 
+def _in_sg(lonlat) -> bool:
+    """True if (lon, lat) falls inside Singapore's bounding box. The proximity
+    factors (CBD/regional nodes, URA polygons) are ALL Singapore-specific, so the
+    score is only meaningful for SG coordinates — scoring e.g. Seoul comps against
+    Singapore's CBD produces garbage (~±0.5). Non-SG coords → Location left blank."""
+    if not lonlat or lonlat[0] is None or lonlat[1] is None:
+        return False
+    try:
+        lon, lat = float(lonlat[0]), float(lonlat[1])
+    except (TypeError, ValueError):
+        return False
+    return 103.55 <= lon <= 104.15 and 1.13 <= lat <= 1.50
+
+
 def apply_location(records: list, subject_name: str, subject_addr: str,
                    asset_class: str, subj_lonlat: tuple = None) -> list:
     """Set each record's 'location' to the proximity label.
@@ -249,6 +263,12 @@ def apply_location(records: list, subject_name: str, subject_addr: str,
             r["location"] = ""
         return records
     _LABELS = {"superior", "comparable", "inferior"}
+    # SG-only: the proximity model is built on Singapore geography. For a non-SG
+    # subject (e.g. Seoul), skip computation — keep any input-provided label, else blank.
+    _subj_sg = _in_sg(subj)
+    if not _subj_sg:
+        print("  [location] subject outside Singapore — computed Location skipped "
+              "(SG-only model); keeping any input-provided labels.")
     subj_sector = _sector_key(asset_class)
     print(f"  [location] competitiveness vs subject (sector={subj_sector}, subject=0.000):")
     for r in records:
@@ -261,6 +281,10 @@ def apply_location(records: list, subject_name: str, subject_addr: str,
             r["location"] = _provided.capitalize()
             print(f"      {name:<46}   —      (kept input label: {r['location']})")
             continue
+        # Non-SG subject → don't compute (SG-only model).
+        if not _subj_sg:
+            r["location"] = ""
+            continue
         comp_sector = _sector_key(str(r.get("land_zoning") or r.get("asset_type")
                                       or r.get("sale_type") or asset_class))
         if not _sector_match(subj_sector, comp_sector):
@@ -271,6 +295,11 @@ def apply_location(records: list, subject_name: str, subject_addr: str,
         if c is None or c[0] is None:
             r["location"] = ""
             print(f"      {name:<46}   —      (blank: not geolocatable)")
+            continue
+        # Comp outside Singapore → SG proximity score is meaningless → blank.
+        if not _in_sg(c):
+            r["location"] = ""
+            print(f"      {name:<46}   —      (blank: outside Singapore)")
             continue
         s = score(c, subj, asset_class)
         r["location"] = label(s)
