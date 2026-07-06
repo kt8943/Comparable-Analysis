@@ -94,6 +94,22 @@ _KIND = {"sales": "named investment / sale transactions of buildings",
          "land":  "government land sale / land tender transactions",
          "rent":  "named lease / rental transactions with rent figures"}
 
+# What report TYPES actually list the named deals we want (vs. macro commentary).
+# Used to steer the relevance picker toward transaction-bearing reports.
+_PREFER = {
+    "sales": ("Strongly PREFER 'Capital Markets', 'Investment', 'Investment Sales', "
+              "'Transactions' or 'Deals' reports — those list named building sales with "
+              "prices. AVOID pure market-outlook / forecast / vacancy / rent-index / "
+              "leasing / occupier reports (they only give aggregate statistics, no named "
+              "deals)."),
+    "land":  ("Strongly PREFER 'Government Land Sales', 'GLS', 'land tender', "
+              "'development site' or 'Capital Markets' reports. AVOID generic outlook / "
+              "occupier / leasing reports."),
+    "rent":  ("Strongly PREFER 'Leasing', 'Occupier', 'Office/Retail Leasing' reports "
+              "that cite named lease deals. AVOID capital-markets / investment-sale and "
+              "pure rent-index outlook reports."),
+}
+
 
 def _llm_pick_relevant(items, subject_cfg, comp_type, client, model, max_n):
     asset = subject_cfg.get("asset_class", "office")
@@ -106,13 +122,17 @@ def _llm_pick_relevant(items, subject_cfg, comp_type, client, model, max_n):
             messages=[
                 {"role": "system", "content":
                  f"You pick {country} {asset} market reports most likely to contain "
-                 f"{_KIND.get(comp_type, '')}. Prefer the most RECENT quarterly reports. "
+                 f"{_KIND.get(comp_type, '')}. {_PREFER.get(comp_type, '')} "
+                 f"REJECT reports for a different asset type than '{asset}' (e.g. skip "
+                 f"residential/hotel/industrial reports when the subject is {asset}). "
+                 "Prefer the most RECENT quarterly reports. "
                  f"Return JSON {{\"relevant\": [indices]}} — at most {max_n} indices, "
-                 "most relevant first. Judge from the title AND snippet."},
+                 "most relevant first. If NONE look like they contain named deals, return "
+                 "an empty list. Judge from the title AND snippet."},
                 {"role": "user", "content": f"Reports:\n{listing}"}])
         idxs = json.loads(resp.choices[0].message.content).get("relevant", [])
         picked = [items[i] for i in idxs if isinstance(i, int) and 0 <= i < len(items)]
-        return picked[:max_n] or items[:max_n]
+        return picked[:max_n]   # honour an empty pick — don't fall back to noise
     except Exception as e:
         print(f"    [broker] relevance pick failed ({e}); using first {max_n}")
         return items[:max_n]
@@ -189,10 +209,14 @@ class BrokerReportsSGConnector(SourceConnector):
             return [], []
         picked = _llm_pick_relevant(items, subject_cfg, comp_type, client, model, max_reports)
         print(f"    [broker] {len(items)} candidate reports → {len(picked)} selected")
+        if not picked:
+            print("      (none looked like they contain named deals — nothing to open)")
+            return [], []
 
         records, sources = [], []
         for it in picked:
             txt = _fetch_text(it["url"])
+            n_chars = len(txt.strip())
             recs = _llm_extract(txt, client, model, comp_type)
             for r in recs:
                 r.setdefault("country", "Singapore")
@@ -201,7 +225,14 @@ class BrokerReportsSGConnector(SourceConnector):
             records.extend(recs)
             if recs:
                 sources.append({"title": it["title"], "url": it["url"]})
-            print(f"      · {it['title'][:52]}: {len(recs)} txn(s)")
+            # Diagnostic: distinguish "couldn't fetch/gated" from "read it, no named deals".
+            if n_chars < 200:
+                _why = "  (no text — fetch failed / gated / not a PDF)"
+            elif not recs:
+                _why = "  (text read, no named deals)"
+            else:
+                _why = ""
+            print(f"      · {it['title'][:52]}: {n_chars:,} chars → {len(recs)} txn(s){_why}")
         return records, sources
 
 
