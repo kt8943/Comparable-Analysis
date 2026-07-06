@@ -633,6 +633,19 @@ def run(config_path: str = "configs/deal_config.json",
     classified = classify_rent_records(records, subject_cfg, client, extract_model)
     print(f"      → {len(classified)} records classified")
 
+    # ── Location competitiveness (SG, URA proximity vs subject) ───────────────
+    # Same Superior/Comparable/Inferior logic as the internal pipeline, reusing the
+    # map-resolved lon/lat on each comp + the subject. SG-only; others left blank.
+    try:
+        from tools.location_score import apply_location as _apply_loc
+        classified = _apply_loc(classified,
+                                subject_cfg.get("property_name", ""),
+                                subject_cfg.get("address", ""),
+                                subject_cfg.get("asset_class", ""),
+                                subj_lonlat=(s_lon, s_lat))
+    except Exception as _le:
+        print(f"  [location] skipped: {_le}")
+
     # Compute effective rent
     print(f"\n[3/5] CALCULATE  (effective rent from rent-free)")
     classified = compute_eff_rent(classified)

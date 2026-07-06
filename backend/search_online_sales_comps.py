@@ -1068,6 +1068,20 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     classified = classify_records(records, subject_cfg, client, extract_model)
     print(f"      → {len(classified)} records classified")
 
+    # ── Location competitiveness (SG, URA proximity vs subject) ───────────────
+    # Overrides the LLM free-text location with Superior/Comparable/Inferior using
+    # the SAME logic as the internal pipeline (tools.location_score), reusing the
+    # map-resolved lon/lat already on each comp + the subject. SG-only; others blank.
+    try:
+        from tools.location_score import apply_location as _apply_loc
+        classified = _apply_loc(classified,
+                                subject_cfg.get("property_name", ""),
+                                subject_cfg.get("address", ""),
+                                subject_cfg.get("asset_class", ""),
+                                subj_lonlat=(s_lon, s_lat))
+    except Exception as _le:
+        print(f"  [location] skipped: {_le}")
+
     # ── Compute metrics ───────────────────────────────────────────────────────
     print(f"\n[3/5] CALCULATE  (Bala y = {bala_yield*100:.1f}%)")
     subj_row  = subject_to_row(subject_cfg)
