@@ -53,7 +53,7 @@ Each row is one asset class. "↑ better" = more is better; "↓ better" = close
 | Subject sector | Factor 1 | Factor 2 |
 |---|---|---|
 | **Office** | Distance to **CBD** ↓ better | **Commercial** land coverage (1 km) ↑ better |
-| **Retail** | **Commercial/retail** land coverage (1 km) ↑ better *(mall cluster)* | Distance to nearest **retail centre — tiered** (Orchard/CBD prime; regional centres +2 km) ↓ better |
+| **Retail** | **Commercial/retail** land coverage (1 km) ↑ better *(mall cluster)* | **Retail-centre attractiveness** — tier-weighted proximity (prime Orchard/CBD ×1.0, regional ×0.6) ↑ better |
 | **Industrial / Logistics / Data centre** | **Business** land coverage (1 km) ↑ better *(industrial cluster)* | Distance to nearest **port/airport hub** ↓ better |
 | **Hotel / Hospitality** | **Tourist attractions** within 1 km ↑ better *(count)* | **Commercial** land coverage (1 km) ↑ better |
 | **Mixed** | Distance to **CBD** ↓ better | **Residential + Commercial** coverage (1 km) ↑ better |
