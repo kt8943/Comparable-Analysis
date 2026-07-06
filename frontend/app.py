@@ -2315,6 +2315,19 @@ def render_new_deal_form():
 
     st.caption("Fill in the essentials. "
                "Optionally upload a deal brief — the LLM will extract and pre-fill the fields.")
+    if llm_cfg["provider"] == "openai":
+        st.warning(
+            "**Cloud LLM selected — data-privacy note.** Config generation sends the "
+            "**address & asset class** (and any **uploaded deal-brief text**) to the cloud "
+            "model (OpenAI) to infer the remaining fields. Don't upload confidential briefs "
+            "under a cloud model — switch the sidebar to a **local model (Ollama)** to keep "
+            "everything on-prem."
+        )
+    else:
+        st.info(
+            "Local model selected — config generation runs on-prem (Ollama); "
+            "no deal data leaves your machine."
+        )
     st.divider()
 
     # ── Step 1 ─────────────────────────────────────────────────────────────
