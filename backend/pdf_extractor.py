@@ -86,7 +86,7 @@ def find_relevant_pages(pdf_path: str, section_keywords: list,
             _kw_vecs   = _np.array([_embed_text(_emb_model, kw) for kw in section_keywords])
     except Exception as _e:   # fastembed/numpy missing → skip semantic tier
         _emb_model = None
-    _EMB_THRESHOLD = 0.58
+    _EMB_THRESHOLD = 0.60
 
     matches = []
     with pdfplumber.open(pdf_path) as pdf:
