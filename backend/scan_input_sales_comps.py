@@ -771,6 +771,18 @@ Return ONLY: {{"comparables": [{{"index":<int>,"asset_type":"...","relevance_sco
 """
 
 
+_LOC_LABELS = {"superior", "comparable", "inferior"}
+
+
+def _provided_location(rc: dict) -> str:
+    """Return the input-provided location-competitiveness label
+    (Superior/Comparable/Inferior) if the source file supplied one, else "".
+    Used so a user-provided Location column survives classification/validation
+    instead of being blanked (Location is otherwise never inferred for sales)."""
+    v = str(rc.get("location") or "").strip()
+    return v.capitalize() if v.lower() in _LOC_LABELS else ""
+
+
 def _parse_classify_response(text: str, raw_comps: list) -> list:
     text   = re.sub(r"^```[a-z]*\n?", "", text.strip())
     text   = re.sub(r"\n?```$", "", text)
@@ -796,7 +808,7 @@ def _parse_classify_response(text: str, raw_comps: list) -> list:
         cls = by_idx.get(i, {})
         c = dict(rc)
         c.update({
-            "location":        cls.get("location", ""),
+            "location":        _provided_location(rc) or cls.get("location", ""),
             "quality":         cls.get("quality", ""),
             "asset_type":      cls.get("asset_type", ""),
             "relevance_score": int(cls.get("relevance_score") or 5),
@@ -859,7 +871,8 @@ def _classify_rules(raw_comps: list, subject_cfg: dict = None) -> list:
             asset_type = ""
 
         d = dict(c)
-        d.update(location="", quality="", asset_type=asset_type, relevance_score=5)
+        d.update(location=_provided_location(c), quality="",
+                 asset_type=asset_type, relevance_score=5)
         augmented.append(d)
 
     for i, c in enumerate(augmented, 1):
@@ -1276,7 +1289,9 @@ def run(config_path: str = "configs/deal_config.json",
     # assigned came from world knowledge, not the user's file.
     # Asset Type is only meaningful when sale_type was explicitly in the source.
     for c in classified:
-        c["location"] = ""
+        # Keep a user-provided Superior/Comparable/Inferior label; otherwise Location
+        # is not inferred from sales input data (apply_location computes it from coords).
+        c["location"] = _provided_location(c)
         c["quality"]  = ""
         # Asset Type: only keep when sale_type was explicitly in the source record.
         # The LLM builds asset_type as "<sale_type> (<use>)"; without a sale_type
