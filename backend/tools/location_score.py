@@ -111,8 +111,7 @@ def _tourism_within(lon: float, lat: float, radius_km: float = 1.0) -> int:
 
 # CBD nodes — office competitiveness rises with closeness to a CBD.
 _CBD_NODES = [
-    (103.8519, 1.2830),  # CBD — Raffles Place / Marina Bay
-    (103.7220, 1.3330),  # Jurong Lake District (2nd CBD)
+    (103.8515, 1.2836),  # CBD — Raffles Place MRT (sole CBD centre)
 ]
 
 # Regional / sub-regional centres (malls cluster here) — retail competitiveness
