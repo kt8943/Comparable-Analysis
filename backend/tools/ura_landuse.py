@@ -55,17 +55,50 @@ def _centroid(geom: dict):
         return None
 
 
+def _poly_area_km2(geom: dict, ref_lat: float = None) -> float:
+    """Approx polygon area in km² (exterior rings only; holes ignored).
+    Shoelace on lon/lat degrees → km² via a local equirectangular scale."""
+    t = geom.get("type"); c = geom.get("coordinates")
+    try:
+        if t == "Polygon":
+            rings = [c[0]]
+        elif t == "MultiPolygon":
+            rings = [poly[0] for poly in c]
+        else:
+            return 0.0
+    except Exception:
+        return 0.0
+    area_deg2 = 0.0
+    for ring in rings:
+        if not ring or len(ring) < 3:
+            continue
+        s = 0.0
+        n = len(ring)
+        for i in range(n):
+            x1, y1 = ring[i][0], ring[i][1]
+            x2, y2 = ring[(i + 1) % n][0], ring[(i + 1) % n][1]
+            s += x1 * y2 - x2 * y1
+        area_deg2 += abs(s) / 2.0
+        if ref_lat is None:
+            ref_lat = sum(p[1] for p in ring) / n
+    km_lat = 110.574
+    km_lon = 111.320 * math.cos(math.radians(ref_lat if ref_lat is not None else 1.35))
+    return area_deg2 * km_lat * km_lon
+
+
 def _build() -> dict:
     data = json.loads(_GEOJSON.read_text(encoding="utf-8"))
     buckets = {k: [] for k in _BUCKETS}
     for f in data.get("features", []):
-        lu  = str(f.get("properties", {}).get("LU_DESC", "")).strip().upper()
-        cen = _centroid(f.get("geometry", {}))
+        lu   = str(f.get("properties", {}).get("LU_DESC", "")).strip().upper()
+        geom = f.get("geometry", {})
+        cen  = _centroid(geom)
         if not cen:
             continue
+        area = _poly_area_km2(geom, cen[1])            # km² (for coverage weighting)
         for b, descs in _BUCKETS.items():
             if lu in descs:
-                buckets[b].append(cen)
+                buckets[b].append((cen[0], cen[1], area))
     try:
         with open(_CACHE, "wb") as fh:
             pickle.dump(buckets, fh)
@@ -98,15 +131,33 @@ def _hav(lon1, lat1, lon2, lat2) -> float:
 
 
 def count_within(lon: float, lat: float, bucket: str, radius_km: float = 1.0) -> int:
-    return sum(1 for (lo, la) in _get().get(bucket, [])
-               if _hav(lon, lat, lo, la) <= radius_km)
+    return sum(1 for p in _get().get(bucket, [])
+               if _hav(lon, lat, p[0], p[1]) <= radius_km)
+
+
+def coverage_within(lon: float, lat: float, bucket: str, radius_km: float = 1.0) -> float:
+    """Approx fraction of the ``radius_km`` circle covered by this land-use.
+
+    Sums the AREA (km²) of every parcel whose CENTROID is within the circle, divided
+    by the circle's area. Approximation (a whole parcel counts if its centre is inside),
+    so it can exceed 1.0 — that's fine: the Location score uses it relatively (comp vs
+    subject), not as a literal capped percentage. Needs the area-enriched cache; if the
+    cache has no areas it returns 0.0 (callers fall back gracefully)."""
+    circle = math.pi * radius_km * radius_km
+    if not circle:
+        return 0.0
+    total = 0.0
+    for p in _get().get(bucket, []):
+        if len(p) > 2 and _hav(lon, lat, p[0], p[1]) <= radius_km:
+            total += p[2]
+    return total / circle
 
 
 def nearest_km(lon: float, lat: float, bucket: str) -> float:
     pts = _get().get(bucket, [])
     if not pts:
         return 99.0
-    return min(_hav(lon, lat, lo, la) for (lo, la) in pts)
+    return min(_hav(lon, lat, p[0], p[1]) for p in pts)
 
 
 # ── Land-use AT a point (point-in-polygon over the raw parcels) ───────────────

@@ -111,7 +111,7 @@ def _tourism_within(lon: float, lat: float, radius_km: float = 1.0) -> int:
 
 # CBD nodes — office competitiveness rises with closeness to a CBD.
 _CBD_NODES = [
-    (103.8515, 1.2836),  # CBD — Raffles Place MRT (sole CBD centre)
+    (103.85176, 1.28348),  # CBD — Raffles Place MRT (sole CBD centre)
 ]
 
 # Regional / sub-regional centres (malls cluster here) — retail competitiveness
@@ -145,42 +145,48 @@ def _sector_key(asset_class: str) -> str:
 
 
 def _factors(lon: float, lat: float, sector: str) -> list:
-    """Return [(value, higher_is_better), ...] for the sector."""
+    """Return [(value, higher_is_better, smoothing_k), ...] for the sector.
+
+    Land-use "density" factors are now AREA-coverage fractions (share of the 1 km
+    circle covered by that land use) rather than raw parcel counts — big estates
+    weigh more than tiny lots. Distance factors use the fixed 5 km reference (k=None)."""
     if sector in ("industrial", "data_centre"):
-        return [(U.count_within(lon, lat, "business", 1.0), True),     # industrial network
-                (U.nearest_km(lon, lat, "port_airport"),    False)]    # transport access
+        return [(U.coverage_within(lon, lat, "business", 1.0), True, _K_COV),   # business land share
+                (U.nearest_km(lon, lat, "port_airport"),       False, None)]    # transport access
     if sector == "office":
         cbd = min(U._hav(lon, lat, n[0], n[1]) for n in _CBD_NODES)
-        return [(cbd,                                          False),  # closer to CBD
-                (U.count_within(lon, lat, "commercial", 1.0),  True)]   # commercial cluster
+        return [(cbd,                                            False, None),   # closer to CBD
+                (U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV)]  # commercial land share
     if sector == "retail":
         reg = min(U._hav(lon, lat, n[0], n[1]) for n in _REGIONAL_NODES)
-        return [(U.count_within(lon, lat, "residential", 1.0), True),   # residential catchment
-                (reg,                                          False)]  # closer to regional centre
+        return [(U.coverage_within(lon, lat, "residential", 1.0), True, _K_COV),  # residential catchment
+                (reg,                                             False, None)]   # closer to regional centre
     if sector == "hospitality":
-        return [(_tourism_within(lon, lat, 1.0),               True),   # tourist draw
-                (U.count_within(lon, lat, "commercial", 1.0),  True)]   # commercial cluster
+        return [(_tourism_within(lon, lat, 1.0),                 True, _K_COUNT), # tourist draw (count)
+                (U.coverage_within(lon, lat, "commercial", 1.0), True, _K_COV)]   # commercial land share
     if sector == "mixed":
         cbd = min(U._hav(lon, lat, n[0], n[1]) for n in _CBD_NODES)
-        combined = (U.count_within(lon, lat, "residential", 1.0)
-                    + U.count_within(lon, lat, "commercial", 1.0))
-        return [(cbd, False), (combined, True)]
+        combined = (U.coverage_within(lon, lat, "residential", 1.0)
+                    + U.coverage_within(lon, lat, "commercial", 1.0))
+        return [(cbd, False, None), (combined, True, _K_COV)]
     return []
 
 
-_D_REF = 5.0   # km — reference scale for distance factors
-_K     = 10    # smoothing for count factors (dampens small-number noise)
+_D_REF   = 5.0   # km — reference scale for distance factors
+_K_COV   = 0.3   # smoothing for AREA-coverage fraction factors (values ~0..0.5)
+_K_COUNT = 10    # smoothing for point-count factors (e.g. tourism attractions)
 
 
-def _pair(comp_v: float, subj_v: float, higher_better: bool) -> float:
+def _pair(comp_v: float, subj_v: float, higher_better: bool, k: float = _K_COUNT) -> float:
     """Fixed comp-vs-subject score in [-1, 1]; 0 when equal.
 
-    Counts (higher-better): smoothed relative difference. Distances
-    (lower-better): difference scaled by a fixed 5km reference (so a subject that
-    sits ~on a landmark, distance~0, doesn't force every comp to -1).
+    Higher-better (coverage/counts): smoothed relative difference with per-factor k.
+    Distances (lower-better): difference scaled by a fixed 5km reference (so a subject
+    that sits ~on a landmark, distance~0, doesn't force every comp to -1).
     """
     if higher_better:
-        return (comp_v - subj_v) / (comp_v + subj_v + _K)
+        denom = comp_v + subj_v + (k if k is not None else _K_COUNT)
+        return (comp_v - subj_v) / denom if denom else 0.0
     return max(-1.0, min(1.0, (subj_v - comp_v) / _D_REF))
 
 
@@ -193,7 +199,7 @@ def score(comp_lonlat: tuple, subj_lonlat: tuple, asset_class: str):
     sf = _factors(subj_lonlat[0], subj_lonlat[1], sector)
     if not cf or not sf:
         return None
-    pairs = [_pair(c[0], s[0], c[1]) for c, s in zip(cf, sf)]
+    pairs = [_pair(c[0], s[0], c[1], c[2]) for c, s in zip(cf, sf)]
     return round(sum(pairs) / len(pairs), 3)
 
 
