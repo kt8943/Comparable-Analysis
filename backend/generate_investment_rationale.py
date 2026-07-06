@@ -1209,14 +1209,18 @@ def _build_input_summary(extracted_reports: list) -> str:
         "for this investment — the evidence base for the rationale that follows._\n",
     ]
     for r in reports:
-        src     = r.get("source_file", "report")
-        sectors = r.get("sectors_covered")
+        src = r.get("source_file", "report")
+        # The extracted market facts live under the "insights" sub-dict; fall back to
+        # the top level for older/flat caches.
+        ins = r.get("insights") if isinstance(r.get("insights"), dict) else r
+        sectors = ins.get("sectors_covered")
         sectors = ", ".join(sectors) if isinstance(sectors, list) else (sectors or "")
-        meta    = " · ".join(x for x in (r.get("country_region") or "", sectors,
-                                         r.get("report_period") or "") if x)
+        meta    = " · ".join(x for x in (ins.get("country_region") or "", sectors,
+                                         ins.get("report_period") or "") if x)
         out.append(f"### {src}" + (f"  \n_{meta}_" if meta else ""))
 
-        overview = (r.get("market_overview") or "").strip()
+        _before = len(out)
+        overview = (ins.get("market_overview") or "").strip()
         if overview:
             out.append(overview)
 
@@ -1229,14 +1233,19 @@ def _build_input_summary(extracted_reports: list) -> str:
             ("Development pipeline",       "supply_pipeline"),
             ("Outlook & risks",           "market_outlook"),
         ):
-            val = (r.get(key) or "").strip()
+            val = (ins.get(key) or "").strip()
             if val:
                 out.append(f"- **{label}:** {val}")
 
-        stats = [s.strip() for s in (r.get("key_statistics") or [])
+        stats = [s.strip() for s in (ins.get("key_statistics") or [])
                  if isinstance(s, str) and s.strip()][:3]
         if stats:
             out.append("- **Notable figures:** " + "; ".join(stats))
+
+        if len(out) == _before:   # nothing extracted → tell the user why
+            _why = ("extraction error" if ins.get("extraction_error")
+                    else "no text extracted — likely a scanned / image-only PDF")
+            out.append(f"- _No summary available ({_why}). Verify the source PDF._")
         out.append("")   # blank line between reports
 
     out.append("---\n")
