@@ -1,207 +1,120 @@
-# Location Competitiveness Score — Methodology & Justification
+# Location Competitiveness Score — Methodology (Singapore)
 
-How the **Location** column (Superior / Comparable / Inferior) is calculated for
-each comparable, and why the formula is built the way it is.
+**Purpose.** Give each comparable a location label — **Superior / Comparable / Inferior** —
+relative to the subject property, based on how well its immediate surroundings suit its
+asset class. Singapore-only; foreign comps are left blank.
 
-Source code: `backend/tools/location_score.py`
-
----
-
-## 1. The idea in one sentence
-
-For each comp we ask: **"Is this comp's location better or worse than the subject
-property's location?"** — measured on the things that actually drive value for that
-asset type, and expressed as a single number where the subject is always **zero**.
-
-- Score **> 0**  → comp location is **better** than the subject
-- Score **= 0**  → comp location is **the same** as the subject
-- Score **< 0**  → comp location is **worse** than the subject
-
-The score runs from **−1 to +1**, then gets a plain-English label.
+**Data source.** URA Master Plan land-use parcels (every zoned plot in Singapore),
+pre-processed into a lightweight cache of each parcel's **centre point + area (km²)**,
+bucketed into five land uses: **residential, commercial, business, hotel, port/airport**.
+Hotel/tourist draw also uses OneMap "Tourist Attractions". No live network calls at runtime.
 
 ---
 
-## 2. The four steps
+## 1. The idea in one line
+> For the subject and each comp we measure **2 location factors** chosen for that asset
+> class, compare each comp to the subject, average the two into a score from **−1 to +1**,
+> and label it.
 
-### Step 1 — Pick the location "factors" for the asset type
-
-Each sector is judged on **two** location drivers. Some are *"more is better"*
-(counts of nearby parcels), some are *"closer is better"* (distances).
-
-| Asset type            | Factor 1                          | Factor 2                              |
-|-----------------------|-----------------------------------|---------------------------------------|
-| **Office**            | Closer to the CBD                 | More commercial parcels within 1 km   |
-| **Industrial / Data centre** | More business parcels within 1 km | Closer to a port / airport      |
-| **Retail**            | More residential parcels within 1 km | Closer to a regional centre / mall hub |
-| **Hospitality**       | More tourist attractions within 1 km | More commercial parcels within 1 km |
-| **Mixed use**         | Closer to the CBD                 | More residential + commercial within 1 km |
-
-The exact same two factors are measured for **both** the subject and the comp,
-using the local URA Master Plan land use + OneMap data.
-
-> **Why these factors?** They reflect what a real-estate team already knows drives
-> rent/value: offices trade on CBD access and business clustering; industrial on
-> logistics connectivity; retail on catchment population and mall gravity;
-> hotels on tourist draw and amenities.
+Subject is always the benchmark (score = 0). A comp scores **positive** when its
+surroundings are *better* than the subject's, **negative** when *worse*.
 
 ---
 
-### Step 2 — Score each factor, comp vs subject
+## 2. The two kinds of factor
+Every sector's score is built from two factors, each of one of two types:
 
-Each factor is turned into a number between **−1 and +1**. There are two simple
-recipes depending on whether the factor is a *count* or a *distance*.
-
-#### Recipe A — "More is better" factors (counts)
-
-> Example: number of commercial parcels within 1 km.
-
+**A. Land-use coverage (a "density" factor).**
+What share of the **1 km circle** around the property is covered by a given land use.
 ```
-                  comp_count − subject_count
-factor score  =  ──────────────────────────────
-                  comp_count + subject_count + 10
+coverage = (total area of parcels of that land use whose CENTRE is within 1 km) ÷ (area of the 1 km circle)
 ```
+- Approximation: a whole parcel is counted if its **centre** falls inside the circle.
+- Bigger estates therefore weigh more than tiny lots (an improvement over a raw count).
+- Because it is used **relatively** (comp vs subject), it doesn't need to be a capped %.
 
-Plain English:
-- If the comp has **more** than the subject → **positive**.
-- If the comp has **fewer** → **negative**.
-- If they're equal → **zero**.
-- The **"+ 10"** stops tiny numbers from looking dramatic.
-
-| Subject | Comp | Raw difference | Factor score | Reading |
-|--------:|-----:|---------------:|-------------:|---------|
-| 1       | 2    | "double!"      | +0.08        | barely different (correct) |
-| 45      | 30   | −15            | −0.18        | meaningfully fewer |
-| 20      | 20   | 0              | 0.00         | identical |
-
-> **Why "+ 10"?** Without it, going from 1 to 2 parcels would score +0.33 — treating
-> a one-parcel difference as huge. That's noise, not signal. Adding 10 keeps small
-> counts calm while still letting large, real differences show through. (As the
-> numbers get big, the "+ 10" becomes irrelevant.)
-
-#### Recipe B — "Closer is better" factors (distances)
-
-> Example: distance to the CBD, in km.
-
-```
-                  subject_distance − comp_distance
-factor score  =  ────────────────────────────────── , then capped to the −1…+1 range
-                            5 km
-```
-
-Plain English:
-- If the comp is **closer** than the subject → **positive**.
-- If the comp is **farther** → **negative**.
-- Being **5 km** closer/farther than the subject reaches the ±1 edge.
-
-| Subject dist | Comp dist | Factor score | Reading |
-|-------------:|----------:|-------------:|---------|
-| 0.2 km       | 1.5 km    | −0.26        | comp is a bit farther |
-| 3.0 km       | 1.0 km    | +0.40        | comp is notably closer |
-| 6.0 km       | 0.5 km    | +1.00 (capped) | comp much closer |
-
-> **Why divide by a fixed 5 km (not by the subject's distance)?** If a subject sits
-> right on top of the CBD (distance ≈ 0), dividing by its distance would blow up and
-> unfairly push **every** comp to −1. A fixed 5 km scale keeps things sensible: "5 km
-> difference" is treated as a large but not extreme gap for Singapore. The cap stops
-> a far-away outlier from dominating.
+**B. Distance to a landmark (a "proximity" factor).**
+Straight-line distance (km) to the **nearest** relevant node:
+- **CBD** = Raffles Place MRT `(1.28348° N, 103.85176° E)`.
+- **Regional centres** (retail): nearest of Orchard, Jurong East, Tampines, Woodlands,
+  Paya Lebar, Punggol, Bishan/AMK.
+- **Freight nodes** (industrial): nearest of the 5 real port/airport hubs —
+  **Tuas, Jurong, PSA/Keppel, Changi, Seletar** (offshore stray parcels removed).
 
 ---
 
-### Step 3 — Average the two factors
+## 3. Factors by sector
+Each row is one asset class. "↑ better" = more is better; "↓ better" = closer/less is better.
 
-```
-location score = (factor 1 score + factor 2 score) / 2
-```
+| Subject sector | Factor 1 | Factor 2 |
+|---|---|---|
+| **Office** | Distance to **CBD** ↓ better | **Commercial** land coverage (1 km) ↑ better |
+| **Retail** | **Residential** land coverage (1 km) ↑ better *(catchment)* | Distance to nearest **regional centre** ↓ better |
+| **Industrial / Logistics / Data centre** | **Business** land coverage (1 km) ↑ better *(industrial cluster)* | Distance to nearest **port/airport hub** ↓ better |
+| **Hotel / Hospitality** | **Tourist attractions** within 1 km ↑ better *(count)* | **Commercial** land coverage (1 km) ↑ better |
+| **Mixed** | Distance to **CBD** ↓ better | **Residential + Commercial** coverage (1 km) ↑ better |
 
-Both factors get **equal weight**.
-
-> **Why equal weight?** Each sector's two drivers are roughly co-equal (an office
-> needs *both* CBD access *and* a business cluster). Without a large labelled dataset
-> to calibrate custom weights, equal weighting is the honest, transparent choice — and
-> both factors are already on the same −1…+1 scale, so averaging is meaningful.
-
----
-
-### Step 4 — Turn the number into a label
-
-```
-score > +0.3   →  Superior
-score < −0.3   →  Inferior
-otherwise      →  Comparable   (i.e. between −0.3 and +0.3)
-```
-
-> **Why the ±0.3 bands?** Analysts want a clear 3-way verdict, not a raw decimal.
-> ±0.3 is a deliberately **conservative materiality threshold**: within that band the
-> two locations are close enough to call "Comparable"; only a clear advantage or
-> disadvantage gets flagged Superior or Inferior.
+*Rationale.* Office value tracks CBD proximity + surrounding commercial density; retail
+tracks its residential catchment + being near a mall precinct; industrial tracks the
+industrial cluster + freight access; hotels track tourist draw + a lively commercial area.
 
 ---
 
-## 3. Full worked example
+## 4. Comparing a comp to the subject (per factor)
+Each factor produces a sub-score in **[−1, +1]** (0 when comp equals subject):
 
-**Subject:** CapitaSpring (office, CBD). **Comp:** South Beach.
-
-Office factors = (distance to CBD ↓, commercial parcels within 1 km ↑).
-
-Suppose:
-
-| Measure                       | Subject | Comp (South Beach) |
-|-------------------------------|--------:|-------------------:|
-| Distance to CBD               | 0.2 km  | 1.5 km             |
-| Commercial parcels within 1 km| 45      | 30                 |
-
-**Factor 1 (distance, closer is better):**
+**Coverage / count factors (↑ better):** smoothed relative difference
 ```
-(0.2 − 1.5) / 5  =  −0.26
+sub_score = (comp_value − subject_value) ÷ (comp_value + subject_value + k)
 ```
+- `k` = smoothing constant that dampens noise when values are small.
+  `k = 0.3` for coverage fractions, `k = 10` for the tourist-attraction count.
 
-**Factor 2 (count, more is better):**
+**Distance factors (↓ better):** difference scaled by a fixed 5 km reference, clamped to ±1
 ```
-(30 − 45) / (30 + 45 + 10)  =  −0.18
+sub_score = clamp( (subject_distance − comp_distance) ÷ 5 km , −1, +1 )
 ```
-
-**Average:**
-```
-(−0.26 + −0.18) / 2  =  −0.22   →  |−0.22| ≤ 0.3  →  Comparable (slightly weaker)
-```
-
-*(The live run used exact coordinates and returned −0.317 → **Inferior**, just past
-the band — showing how the label reacts near the boundary.)*
+- Comp **closer** than the subject → **positive**. A 5 km gap = the full ±1.
+- The 5 km reference stops a subject that sits *on* a landmark (distance ≈ 0) from forcing
+  every comp to −1.
 
 ---
 
-## 4. Where the numbers come from (data & precision)
-
-- **Coordinates**: the same map-resolved latitude/longitude used to plot the pin
-  (Google / Mapbox), so the score is consistent with what you see on the map.
-  OneMap is used only as a fallback when coordinates are missing.
-- **Land-use counts & distances**: the **local URA Master Plan** GeoJSON
-  (`backend/data/MasterPlan2025.geojson`) — fully on-premise, no network needed.
-- **Tourist attractions**: OneMap "Tourist Attractions" theme, cached locally.
-- A comp is scored **only** if (a) it resolves to coordinates and (b) it is the
-  **same sector** as the subject (mixed matches anything). Otherwise its Location is
-  left **blank** — we never guess across different asset types.
+## 5. Final score & label
+```
+location_score = average(sub_score_factor1, sub_score_factor2)      # range −1 … +1
+```
+| Score | Label |
+|---|---|
+| **> +0.3** | **Superior** |
+| **−0.3 … +0.3** | **Comparable** |
+| **< −0.3** | **Inferior** |
 
 ---
 
-## 5. The tunable "knobs" (all one-line changes)
+## 6. Worked example (office comp vs a Raffles Place subject)
+| | Subject (Raffles Place) | Comp (CapitaSpring) |
+|---|---|---|
+| Distance to CBD | 0.0 km | 0.3 km |
+| Commercial coverage (1 km) | 0.20 | 0.19 |
 
-Every judgement call is a single constant, so the model can be tuned against real
-deals without touching the logic:
+- Factor 1 (CBD distance, ↓): `(0.0 − 0.3) / 5 = −0.06`
+- Factor 2 (commercial coverage, ↑): `(0.19 − 0.20) / (0.19 + 0.20 + 0.3) = −0.014`
+- **Score** = average(−0.06, −0.014) = **−0.04 → Comparable**
 
-| Knob            | Current | Controls |
-|-----------------|--------:|----------|
-| Count smoothing | `10`    | How much small counts are damped |
-| Distance scale  | `5 km`  | What counts as a "large" distance gap |
-| Label bands     | `±0.3`  | How different before Superior / Inferior |
-| Factor weights  | `50/50` | Relative importance of the two factors |
+A far suburban office (large CBD distance, low commercial coverage) would score near −0.7 → **Inferior**.
 
 ---
 
-### Summary
-
-> **raw geography → sector-specific factors → each factor scored −1…+1 against the
-> subject (subject = 0) → average the two → apply ±0.3 bands →
-> Superior / Comparable / Inferior.**
-
-Every step is deterministic, explainable, and on-premise — no black box, no cloud model.
+## 7. Guardrails & caveats (state these on the slide)
+- **Same sector only.** A comp is scored only if it's the **same asset class** as the
+  subject (Mixed matches anything); otherwise Location is blank.
+- **Singapore-only.** Both subject and comp must sit inside Singapore; the model is built
+  on Singapore geography, so non-SG comps are left blank.
+- **Analyst override.** If the input file already provides a Superior/Comparable/Inferior
+  label, that is **kept** — never overwritten by the computed one.
+- **Approximation, not valuation.** Coverage counts a whole parcel when its centre is in
+  the circle; nodes (CBD, regional centres, freight hubs) are fixed reference points. The
+  output is a **coarse, directional** 3-bucket signal — not a precise valuation input.
+- **Coordinates.** Uses the same map-resolved lat/long plotted on the map (Google/Mapbox),
+  falling back to a OneMap geocode when coordinates are missing.
