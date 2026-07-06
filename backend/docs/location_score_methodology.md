@@ -164,3 +164,99 @@ For each comp the model measures **two asset-class-tailored location factors**, 
 to the subject, **averages** them into a **−1…+1 score**, and labels it **Superior /
 Comparable / Inferior** — grounded in URA's Master Plan, adjusted per sector, and fully
 repeatable.
+
+---
+
+## Appendix A — Exact reference points, definitions & sources
+This is what every term in the model concretely resolves to.
+
+**CBD (used by Office & Mixed).** A single **hand-set** point at **Raffles Place MRT —
+1.28348° N, 103.85176° E**. "Distance to CBD" is the straight-line distance to this one point.
+A second node (e.g. Jurong Lake District) is deliberately *not* used, so "CBD" means the
+central core only.
+
+**Retail centres (used by Retail).** Six fixed points in two tiers:
+
+| Centre | Lat, Lon | Tier | Weight |
+|---|---|---|---|
+| CBD (Raffles Place) | 1.28348, 103.85176 | Prime | 1.0 |
+| Orchard | 1.3040, 103.8330 | Prime | 1.0 |
+| Jurong Lake District | 1.3330, 103.7420 | Regional | 0.6 |
+| Tampines | 1.3540, 103.9450 | Regional | 0.6 |
+| Woodlands | 1.4370, 103.7860 | Regional | 0.6 |
+| Seletar | 1.4050, 103.8850 | Regional | 0.6 |
+
+The four regional centres are **URA's designated Regional Centres**; Orchard and the CBD are
+the prime retail belts layered on top. Coordinates are **hand-set** approximations (Seletar is
+a *future* centre, so its point is approximate).
+
+**Freight hubs (used by Industrial / Logistics / Data centre).** Five hubs — **Tuas, Jurong,
+PSA/Keppel, Changi, Seletar** — which are **not** hand-typed: they are the **47 URA
+"PORT / AIRPORT"-zoned parcels**, after removing 2 offshore stray parcels outside mainland
+Singapore. "Distance to freight hub" is the distance to the **nearest such parcel** (so a
+sprawling port is measured to its nearest edge).
+
+**Tourist attractions (used by Hotel).** From OneMap's official **"Tourist Attractions" theme**
+(`retrieveTheme`, `queryName=tourism`), cached locally. "Attractions within 1 km" counts these
+points.
+
+**Land-use buckets (used by every coverage factor).** Each URA parcel's `LU_DESC` maps to:
+
+| Bucket | URA `LU_DESC` values |
+|---|---|
+| **Residential** | RESIDENTIAL · RESIDENTIAL / INSTITUTION · RESIDENTIAL WITH COMMERCIAL AT 1ST STOREY · COMMERCIAL & RESIDENTIAL |
+| **Commercial** | COMMERCIAL · COMMERCIAL / INSTITUTION · COMMERCIAL & RESIDENTIAL · RESIDENTIAL WITH COMMERCIAL AT 1ST STOREY |
+| **Business** | BUSINESS 1 · BUSINESS 2 · BUSINESS PARK (incl. their "- WHITE" variants) |
+| **Hotel** | HOTEL |
+| **Port / Airport** | PORT / AIRPORT |
+
+A parcel with a dual use (e.g. "COMMERCIAL & RESIDENTIAL") is counted in **both** relevant
+buckets.
+
+**Fixed constants.** Coverage radius **1 km**; retail-centre influence radius **3 km**;
+distance reference **5 km**; smoothing **k = 0.3** (coverage) / **10** (attraction count);
+label thresholds **±0.3**. All are tunable in one place.
+
+## Appendix B — Anticipated Q&A
+**Q. Why only Raffles Place as the CBD — not Marina Bay or a second CBD like JLD?**
+The CBD is defined as the single heart at Raffles Place MRT (deal-team preference). Marina Bay
+is ~0.5 km away, so it still reads as CBD-adjacent; a second node was dropped so "CBD" means
+the central core.
+
+**Q. Where did the retail-centre list come from?**
+URA's four official Regional Centres (JLD, Tampines, Woodlands, Seletar) plus the two prime
+retail belts (Orchard, CBD). Coordinates are hand-set; Seletar is approximate (a future centre).
+
+**Q. Why treat all ports/airports equally — isn't Tuas bigger than Seletar?**
+For a coarse 3-bucket label we reward proximity to *any* major freight node; ranking them adds
+subjectivity for little benefit. The business-land coverage factor then separates comps that
+are all "near a hub."
+
+**Q. Why 1 km / 3 km / 5 km?**
+1 km = the immediate catchment for land-use density; 3 km = how far a retail centre's pull
+reaches before fading to 0; 5 km = the scale over which a distance *difference* between comp
+and subject maps to the full ±1. All tunable.
+
+**Q. Why 0.6 for regional retail centres?**
+It's a 0.4 score penalty that puts a regional centre clearly below prime. 0.7 was too soft
+(≈ prime), 0.5 too dominant; 0.6 balances against the coverage factor.
+
+**Q. How accurate is the "parcel centre in circle" approximation?**
+Tested: moving a comp ±100 m barely changes the score and never flips the label (the data is
+granular — ~84k residential, ~10k commercial parcels). It's a coarse label, so the
+approximation is immaterial; it is not a precise valuation input.
+
+**Q. What about a comp outside Singapore, or far from any centre?**
+Non-SG comps are left blank (SG-only model). A retail comp more than 3 km from every centre
+gets 0 on the centre factor ("not near a retail centre").
+
+**Q. Why area coverage instead of a simple parcel count?**
+Area-weighting lets a large estate count more than a tiny lot — a better density proxy than
+treating every parcel equally.
+
+**Q. Can an analyst override the label?**
+Yes — if the input file already has a Superior/Comparable/Inferior label, it is kept and never
+overwritten.
+
+**Q. Does it work on the cloud?**
+Yes for Singapore — the ~3 MB cache is deployed; the full 181 MB map isn't needed at runtime.
