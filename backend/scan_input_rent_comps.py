@@ -56,7 +56,7 @@ from generate_rent_comps_table import (
 )
 from generate_rent_comps_map import render_map
 import generate_global_rent_comps_table as _global_rent_tbl
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid
 from tools.calculations import haversine_km as _haversine_km, parse_num as _num
 from tools.json_utils import fix_json as _fix_json, split_json_arrays as _split_json_arrays
 from tools.llm_client import ollama_post as _ollama_post, apply_refinement as _apply_refinement
@@ -563,7 +563,12 @@ def _geocode_comps(records: list, mapbox_tok: str,
             r["_geo_provider"] = geo_note
             r["_geo_note"]     = geo_note
             tag = " (by name)" if source == "name" else ""
-            print(f"      {name[:46]:<46}  {r['distance_km']:>5.2f} km{tag}")
+            if _near_country_centroid(lon, lat, country_code):
+                r["_geo_suspect"] = True
+                print(f"      {name[:46]:<46}  {r['distance_km']:>5.2f} km{tag}  "
+                      f"⚠ ON COUNTRY CENTROID — likely invalid, VERIFY (flagged for review)")
+            else:
+                print(f"      {name[:46]:<46}  {r['distance_km']:>5.2f} km{tag}")
         except Exception as exc:
             r["lon"], r["lat"], r["distance_km"] = None, None, 9999.0
             r["_geo_provider"] = "failed"

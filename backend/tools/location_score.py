@@ -248,11 +248,19 @@ def apply_location(records: list, subject_name: str, subject_addr: str,
         for r in records:
             r["location"] = ""
         return records
+    _LABELS = {"superior", "comparable", "inferior"}
     subj_sector = _sector_key(asset_class)
     print(f"  [location] competitiveness vs subject (sector={subj_sector}, subject=0.000):")
     for r in records:
         name = str(r.get("property_name") or r.get("property")
                    or str(r.get("raw_description", "")).split("\n")[0])[:46]
+        # Respect a label the input already provided (user's own assessment) — don't
+        # overwrite it with a computed one.
+        _provided = str(r.get("location") or "").strip()
+        if _provided.lower() in _LABELS:
+            r["location"] = _provided.capitalize()
+            print(f"      {name:<46}   —      (kept input label: {r['location']})")
+            continue
         comp_sector = _sector_key(str(r.get("land_zoning") or r.get("asset_type")
                                       or r.get("sale_type") or asset_class))
         if not _sector_match(subj_sector, comp_sector):

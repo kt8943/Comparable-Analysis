@@ -56,7 +56,7 @@ from generate_sales_comps_table import (
 )
 from generate_sales_comps_map import render_map
 import generate_global_sales_comps_table as _global_sales_tbl
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid
 from tools.calculations import (
     haversine_km as _haversine_km,
     parse_num as _num,
@@ -112,7 +112,10 @@ _OUTPUT_FIELDS = [
 # Address is an internal helper field (not a standalone output column)
 # — used to enrich the Property field with a full address line.
 _EXTRA_FIELDS = [
-    ("address", "Street address of the property — e.g. 'Address', 'Street', 'Location'"),
+    ("address", "Street address of the property — e.g. 'Address', 'Street'"),
+    ("location", "Location-competitiveness label already provided in the input — values "
+                 "are 'Superior', 'Comparable' or 'Inferior'. NOT a street address or "
+                 "building name; do not use for geocoding."),
 ]
 _OUTPUT_COL_TO_KEY = {col: key for col, key, _ in _OUTPUT_FIELDS}
 
@@ -282,6 +285,9 @@ def parse_input_excel(input_file: str, base_url: str, model: str,
             "sale_type":       sale_type,
             "buyer":           str(_get(row, "buyer") or "").strip(),
             "land_zoning":     str(_get(row, "land_zoning") or "").strip(),
+            # Location-competitiveness label if the input already supplies one
+            # (Superior/Comparable/Inferior). Respected by apply_location.
+            "location":        str(_get(row, "location") or "").strip(),
             "sale_date":       sale_date,
             "stake_pct":       stake_pct,
             "_source":         "excel",
@@ -981,7 +987,13 @@ def _geocode_comps(records: list, mapbox_tok: str,
             r["_geo_provider"] = geo_note
             r["_geo_note"]     = geo_note
             tag = " (by name)" if source == "name" else ""
-            print(f"      {name[:50]:<50}  {dist:>5.2f} km{tag}")
+            # Flag likely-invalid geocodes that landed on the country centroid.
+            if _near_country_centroid(lon, lat, country_code):
+                r["_geo_suspect"] = True
+                print(f"      {name[:50]:<50}  {dist:>5.2f} km{tag}  "
+                      f"⚠ ON COUNTRY CENTROID — likely invalid, VERIFY (flagged for review)")
+            else:
+                print(f"      {name[:50]:<50}  {dist:>5.2f} km{tag}")
         except Exception as exc:
             r["lon"], r["lat"], r["distance_km"] = None, None, 9999.0
             r["_geo_provider"] = "failed"

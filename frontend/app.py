@@ -434,6 +434,14 @@ def _run_script(script: str, config_path: str, flags: list = None,
     _live.empty()   # replace the live tail with the full expander below
     out, returncode = "\n".join(_lines), proc.returncode
 
+    # Human flag: comps that geocoded to the country centroid are almost certainly
+    # mislocated — surface a prominent warning above the run log.
+    _n_suspect = out.count("ON COUNTRY CENTROID")
+    if _n_suspect:
+        st.warning(f"⚠ {_n_suspect} comparable(s) geocoded to the **country centroid** — "
+                   "likely invalid coordinates (they'll pile up at one point on the map). "
+                   "Check the run log and verify/correct those addresses before using.")
+
     if tmp_path:
         try: os.unlink(tmp_path)
         except: pass

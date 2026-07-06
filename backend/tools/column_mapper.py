@@ -449,6 +449,33 @@ def map_columns(
     # "price s million" even though the raw synonym has no special chars.
     syns_norm = {fk: {_norm(s) for s in _SYNONYMS.get(fk, [])} for fk in all_keys}
 
+    # ── Tier 0: value-based disambiguation (runs before header matching) ───────
+    # A "Location" header is ambiguous: in GLS/land tables it's the SITE identifier,
+    # but in sales/rent comp tables users often put the location-competitiveness
+    # LABEL (Superior / Comparable / Inferior) there. Decide by the column's VALUES:
+    # if they are competitiveness labels it is the Location label — never a property
+    # name or street address (mapping it there geocodes every comp to the country
+    # centroid). Map it to the "location" field if the schema has one, else claim it
+    # so it is simply excluded from geocoding.
+    _COMPET = ("superior", "comparable", "inferior")
+    _label_key = ("location" if "location" in col_map
+                  else "district" if "district" in col_map else None)
+    for i in range(n):
+        if i in claimed:
+            continue
+        vals = [str(r[i]).strip().lower() for r in (sample_rows or [])
+                if i < len(r) and r[i] not in (None, "")]
+        if not vals:
+            continue
+        hits = sum(1 for v in vals if any(w in v for w in _COMPET))
+        if hits >= max(1, (len(vals) + 1) // 2):
+            if _label_key:
+                _assign(_label_key, i, "value:location-label")
+            else:
+                claimed[i] = "_location_label"
+                print(f"    location(label)        → col {i} ({headers[i]!r})  "
+                      f"[value:competitiveness — excluded from geocoding]")
+
     for field_key in all_keys:
         for i, hn in enumerate(headers_norm):
             if i in claimed or not hn:

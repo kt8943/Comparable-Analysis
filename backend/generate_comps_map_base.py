@@ -405,6 +405,31 @@ def geocode_any(queries: list, mapbox_token: str, country_code: str = "",
     return lon, lat, note
 
 
+# Approximate geographic centroids of supported markets. When a geocoder can't find
+# a specific place it often falls back to the country centroid — a strong signal the
+# coordinate is INVALID (the comp shouldn't be trusted / plotted there).
+_COUNTRY_CENTROIDS = {
+    "sg": (103.8198, 1.3521),
+    "kr": (127.7669, 35.9078),
+    "jp": (138.2529, 36.2048),
+    "hk": (114.1095, 22.3964),
+    "cn": (104.1954, 35.8617),
+    "au": (133.7751, -25.2744),
+}
+
+
+def near_country_centroid(lon, lat, country_code: str, tol_km: float = 1.5) -> bool:
+    """True if (lon,lat) sits ~on the country centroid → a likely failed geocode."""
+    if lon is None or lat is None:
+        return False
+    c = _COUNTRY_CENTROIDS.get((country_code or "").lower())
+    if not c:
+        return False
+    dlon = math.radians(lon - c[0]) * math.cos(math.radians(lat))
+    dlat = math.radians(lat - c[1])
+    return math.hypot(dlon, dlat) * 6371.0 <= tol_km
+
+
 # Connector phrases that signal "[descriptor] <connector> [Property]" naming.
 # Longer alternatives must appear before shorter ones (forming part of > forming).
 _CONNECTORS = re.compile(
