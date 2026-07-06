@@ -3049,33 +3049,97 @@ def render_comparable_analysis():
         st.write("")
 
         if not online:
-            input_dir = ROOT / "Input_files"
-            file_opts = ({f.name: str(f.relative_to(ROOT))
-                          for f in sorted(input_dir.glob("*.xlsx"))}
-                         if input_dir.exists() else {})
-            if file_opts:
-                chosen_name = st.selectbox("Reference file", list(file_opts.keys()),
-                                           key="db_file")
-                chosen_path = file_opts[chosen_name]
-            else:
-                st.warning("No Excel files in `Input_files/`.")
-                chosen_path = None
+            # ── Folder to browse — your comp database (searched recursively) ──────
+            # Defaults to the last-used folder (persisted in shared_settings), else
+            # Input_files. Point it at your network comp DB, e.g.
+            #   K:\Transactions\_Comp Database\IC Comps Inbox
+            _ssp = ROOT / "configs" / "shared_settings.json"
+            def _ss_read():
+                try:    return json.loads(_ssp.read_text(encoding="utf-8"))
+                except Exception: return {}
+            _default_db = _ss_read().get("comp_db_dir", "") or str(ROOT / "Input_files")
+            db_dir_str = st.text_input(
+                "📁  Comp database folder",
+                value=st.session_state.get("db_dir", _default_db), key="db_dir",
+                help=r"Folder searched recursively for Excel/PDF comps. "
+                     r"e.g. K:\Transactions\_Comp Database\IC Comps Inbox  "
+                     "(local only — the cloud can't see network drives).")
+            db_base = Path(db_dir_str.strip().strip('"'))
 
-            # Determine script/prefix before the button so _show_results
-            # can be called unconditionally outside the button block.
-            if is_asset_sales:
-                db_cfg_key, db_script, db_flags, db_prefix = (
-                    "input_file", "scan_input_sales_comps.py", [], "Transaction_Comparables")
-            elif is_land_sales:
-                db_cfg_key, db_script, db_flags, db_prefix = (
-                    "land_input_file", "scan_input_land_comps.py", ["--map"], "Land_Sale_Comps")
+            _c1, _c2 = st.columns([4, 1])
+            _query = _c1.text_input("🔎  Search files", key="db_search",
+                                    placeholder="part of a file name or subfolder…",
+                                    label_visibility="collapsed")
+
+            @st.cache_data(show_spinner="Scanning folder…")
+            def _list_comp_files(base_str: str):
+                base = Path(base_str)
+                if not base.exists():
+                    return None
+                exts = {".xlsx", ".xls", ".pdf"}
+                out = []
+                try:
+                    for p in base.rglob("*"):
+                        if (p.is_file() and p.suffix.lower() in exts
+                                and not p.name.startswith(("~$", "."))):
+                            out.append(p)
+                        if len(out) >= 8000:
+                            break
+                except Exception:
+                    return None
+                return sorted(out, key=lambda p: str(p).lower())
+
+            if _c2.button("🔄  Rescan", key="db_rescan"):
+                _list_comp_files.clear()
+
+            all_files = _list_comp_files(str(db_base))
+            chosen_path = None
+            if all_files is None:
+                st.warning(f"Folder not found or unreadable: `{db_base}`  "
+                           "(on the cloud, use `Input_files`).")
+            elif not all_files:
+                st.info("No Excel/PDF files found in that folder.")
             else:
-                db_cfg_key, db_script, db_flags, db_prefix = (
-                    "rent_input_file", "scan_input_rent_comps.py", ["--map"], "Rent_Comps")
+                q = _query.strip().lower()
+                shown = [p for p in all_files if q in str(p).lower()] if q else all_files
+                def _label(p):
+                    try:    return str(p.relative_to(db_base))
+                    except ValueError: return p.name
+                opts = {_label(p): p for p in shown[:1000]}
+                st.caption(f"{len(shown)} file(s)"
+                           + (f" matching '{_query}'" if q else "")
+                           + (" — showing first 1000" if len(shown) > 1000 else ""))
+                if opts:
+                    chosen_name = st.selectbox("Reference file", list(opts.keys()),
+                                               key="db_file")
+                    chosen_path = str(opts[chosen_name])
+                else:
+                    st.info("No files match your search.")
+
+            # Determine script/prefix + config keys (Excel vs PDF) before the button.
+            if is_asset_sales:
+                _xl_key, _pdf_key, db_script, db_flags, db_prefix = (
+                    "input_file", "input_pdf_file", "scan_input_sales_comps.py",
+                    [], "Transaction_Comparables")
+            elif is_land_sales:
+                _xl_key, _pdf_key, db_script, db_flags, db_prefix = (
+                    "land_input_file", "land_input_pdf_file", "scan_input_land_comps.py",
+                    ["--map"], "Land_Sale_Comps")
+            else:
+                _xl_key, _pdf_key, db_script, db_flags, db_prefix = (
+                    "rent_input_file", "rent_input_pdf_file", "scan_input_rent_comps.py",
+                    ["--map"], "Rent_Comps")
 
             if st.button("▶  Search Database", key="run_db", type="primary",
                          disabled=(chosen_path is None)):
-                patched = {**cfg, db_cfg_key: chosen_path}
+                # Remember the folder for next time (best-effort; on-prem only).
+                try:
+                    _ss = _ss_read(); _ss["comp_db_dir"] = str(db_base)
+                    _ssp.write_text(json.dumps(_ss, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+                _is_pdf = chosen_path.lower().endswith(".pdf")
+                patched = {**cfg, (_pdf_key if _is_pdf else _xl_key): chosen_path}
                 tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json",
                                                   dir=ROOT/"configs", delete=False,
                                                   encoding="utf-8")
