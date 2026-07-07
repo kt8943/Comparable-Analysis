@@ -3456,7 +3456,10 @@ def render_investment_rationale():
                     pass
 
         rationale_text = rationale_file.read_text(encoding="utf-8")
-        st.markdown(rationale_text)
+        # Escape '$' so Streamlit doesn't render "S$353 … S$1.83" as LaTeX math
+        # (it treats text between two '$' as a formula). The downloaded .md keeps
+        # the raw '$'.
+        st.markdown(rationale_text.replace("$", "\\$"))
 
         st.write("")
         dl1, dl2, dl3, _ = st.columns([1, 1, 1, 2])
