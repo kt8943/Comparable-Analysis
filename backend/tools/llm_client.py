@@ -8,16 +8,17 @@ Public API
 ollama_post(base_url, model, messages, timeout=90) -> str
     Returns the content string from the LLM response.
 
-apply_refinement(records, instructions, base_url, model) -> list
+apply_refinement(records, instructions, llm_cfg, base_url=None, model=None) -> list
     Apply analyst free-text instructions to a list of comparable records.
-    Uses run_agent_loop internally.
+    Routes to run_agent_loop_gpt (OpenAI) or run_agent_loop (Ollama) based on
+    llm_cfg["provider"].
+
+run_agent_loop_gpt(instruction, records, llm_cfg) -> list
+    GPT-4o function-calling agent: sees all records, decides in one call.
+    Supports filter, keep/reorder, and no-change.
 
 run_agent_loop(instruction, context, tools, base_url, model, max_turns=5) -> dict
-    General multi-turn agent loop:
-      1. LLM sees instruction + tool catalog + context
-      2. LLM may call query tools to inspect data (loop continues)
-      3. LLM calls action tools when ready (loop ends)
-    Returns {"action": <tool_name>, "result": <python_result>}
+    Ollama multi-turn agent loop (query → inspect → action).
 """
 
 import json
@@ -417,12 +418,207 @@ def run_agent_loop(
     return records
 
 
-# ── apply_refinement (thin wrapper used by scan pipeline) ─────────────────────
+# ── GPT-4o function-calling refinement agent ──────────────────────────────────
+
+_GPT_REFINE_SYSTEM = """You are an analyst assistant helping filter and reorder real estate comparable transaction records.
+
+You will receive a numbered list of records and an instruction from the analyst.
+Interpret the instruction carefully and call exactly ONE of the available tools.
+
+You can:
+- Remove records that don't meet the stated criteria (filter_records)
+- Keep only specific records in a specified order — use this for "sort by", "top N", or "most recent" (keep_records)
+- Do nothing if the instruction is unclear or no change is needed (no_change)
+
+Be conservative: if a record's data is missing or ambiguous, keep it rather than removing it.
+For date comparisons, parse dates from any format (e.g. "Jan 2026", "2026-01-15", "Q1 2026").
+Always provide a clear reason explaining what was done and why."""
+
+_GPT_REFINE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "filter_records",
+            "description": (
+                "Remove records that don't meet the analyst's criteria. "
+                "Use when you want to exclude specific records based on any field value, "
+                "date range, price threshold, distance, tenure type, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "indices_to_remove": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "1-based position numbers of records to REMOVE"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Explain which records were removed and the criteria applied"
+                    }
+                },
+                "required": ["indices_to_remove", "reason"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keep_records",
+            "description": (
+                "Keep only specific records, in the given order. "
+                "Use for 'top N', 'most recent', 'sort by price', or any instruction "
+                "that selects a subset and/or changes the order."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "indices_to_keep": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "1-based position numbers of records to KEEP, "
+                            "in the desired output order"
+                        )
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Explain what was selected and the ordering applied"
+                    }
+                },
+                "required": ["indices_to_keep", "reason"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "no_change",
+            "description": "Keep all records unchanged when no filtering or reordering is needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Explain why no change was made"
+                    }
+                },
+                "required": ["reason"]
+            }
+        }
+    }
+]
+
+
+def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
+    """
+    GPT-4o function-calling refinement agent.
+
+    Sends all records + analyst instruction to GPT in a single call.
+    GPT decides whether to filter (remove), keep/reorder (select subset in order),
+    or leave unchanged — using native function calling for reliable structured output.
+    """
+    try:
+        import openai as _openai
+    except ImportError:
+        raise ImportError("pip install openai")
+
+    api_key = (
+        llm_cfg.get("openai_api_key")
+        or __import__("os").environ.get("OPENAI_API_KEY", "")
+    )
+    if not api_key:
+        raise ValueError("OpenAI API key not found in llm_cfg or OPENAI_API_KEY env var")
+
+    gpt_model = llm_cfg.get("openai_model", "gpt-4o")
+    client = _openai.OpenAI(api_key=api_key)
+
+    _SKIP = {"_map_marker", "_source", "raw_description"}
+
+    # Build compact numbered record list for GPT
+    rows = []
+    for i, r in enumerate(records, 1):
+        parts: list[str] = [f"#{i}"]
+        name = r.get("property_name") or r.get("site_name") or ""
+        if name:
+            parts.append(f'"{name}"')
+        for k, v in r.items():
+            if k in _SKIP or k in {"property_name", "site_name"}:
+                continue
+            if v is None or v == "":
+                continue
+            parts.append(f"{k}={v!r}")
+        rows.append("  " + " | ".join(parts))
+
+    records_text = "\n".join(rows)
+    user_msg = (
+        f"Records ({len(records)} total):\n{records_text}\n\n"
+        f"Analyst instruction: {instruction}"
+    )
+
+    print(f"  [GPT Refine] Sending {len(records)} records to {gpt_model} ...")
+    resp = client.chat.completions.create(
+        model=gpt_model,
+        messages=[
+            {"role": "system", "content": _GPT_REFINE_SYSTEM},
+            {"role": "user",   "content": user_msg},
+        ],
+        tools=_GPT_REFINE_TOOLS,
+        tool_choice="required",
+        temperature=0,
+    )
+
+    tool_calls = resp.choices[0].message.tool_calls
+    if not tool_calls:
+        print("  [GPT Refine] No tool call returned — keeping all records")
+        return records
+
+    tc      = tool_calls[0]
+    fn_name = tc.function.name
+    fn_args = json.loads(tc.function.arguments)
+    reason  = fn_args.get("reason", "")
+
+    if fn_name == "filter_records":
+        to_remove = {int(x) for x in fn_args.get("indices_to_remove", [])}
+        removed_names = [
+            str(records[i - 1].get("property_name")
+                or records[i - 1].get("site_name") or "?")
+            for i in sorted(to_remove) if 1 <= i <= len(records)
+        ]
+        result = [r for i, r in enumerate(records, 1) if i not in to_remove]
+        print(f"  [GPT Refine] Removed {len(to_remove)}: {removed_names}")
+        print(f"  [GPT Refine] {reason}")
+        print(f"  [GPT Refine] {len(records)} → {len(result)} records")
+        return result
+
+    if fn_name == "keep_records":
+        to_keep = [int(x) for x in fn_args.get("indices_to_keep", [])]
+        result  = [records[i - 1] for i in to_keep if 1 <= i <= len(records)]
+        print(f"  [GPT Refine] Kept {len(result)} records in specified order")
+        print(f"  [GPT Refine] {reason}")
+        print(f"  [GPT Refine] {len(records)} → {len(result)} records")
+        return result
+
+    # no_change
+    print(f"  [GPT Refine] No change. {reason}")
+    return records
+
+
+# ── apply_refinement (router used by scan pipeline) ───────────────────────────
 
 def apply_refinement(records: list, instructions: str,
-                     base_url: str, model: str) -> list:
+                     llm_cfg: dict,
+                     base_url: str = None, model: str = None) -> list:
     """
-    Apply analyst free-text instructions to filter comparable records.
-    Delegates to run_agent_loop.
+    Apply analyst free-text instructions to filter/reorder comparable records.
+
+    Routes to GPT function-calling agent when llm_cfg["provider"] == "openai",
+    otherwise falls back to the Ollama multi-turn agent loop.
     """
-    return run_agent_loop(instructions, records, base_url, model)
+    provider = (llm_cfg or {}).get("provider", "ollama")
+    if provider == "openai":
+        return run_agent_loop_gpt(instructions, records, llm_cfg)
+    # Ollama path
+    _base  = base_url  or (llm_cfg or {}).get("ollama", {}).get("base_url", "http://localhost:11434")
+    _model = model     or (llm_cfg or {}).get("ollama", {}).get("model",    "qwen2.5:3b")
+    return run_agent_loop(instructions, records, _base, _model)

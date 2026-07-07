@@ -942,7 +942,7 @@ def run(config_path: str = "configs/deal_config.json",
                         rec["_map_marker"] = _marker_by_prop[pn]
             except Exception:
                 pass
-        records = _apply_refinement(records, instructions, base_url, model)
+        records = _apply_refinement(records, instructions, llm_cfg)
         for rec in records:
             rec.pop("_map_marker", None)
         if not records:
