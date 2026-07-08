@@ -495,12 +495,53 @@ def _exec_remove_by_name(records, names):
                        for sub in lowered)]
 
 
+def _exec_select_by_judgement(records, action, items):
+    """Keep or remove the records the model picked by qualitative judgement.
+
+    `items` is a list of {"name","reason"}. Matching is case-insensitive substring
+    on property_name / site_name. Returns (result_records, unmatched_names) so the
+    caller can warn when a supplied name matched nothing.
+    """
+    lowered = [str(it.get("name", "")).strip().lower()
+               for it in (items or []) if str(it.get("name", "")).strip()]
+    _nm = lambda r: str(r.get("property_name") or r.get("site_name") or "").lower()
+    matched: set = set()
+
+    def _hit(r):
+        rn = _nm(r)
+        found = False
+        for sub in lowered:
+            if sub and sub in rn:
+                matched.add(sub)
+                found = True
+        return found
+
+    if str(action).lower() == "remove":
+        result = [r for r in records if not _hit(r)]
+    else:  # "keep" — keep ONLY the listed records
+        result = [r for r in records if _hit(r)]
+    unmatched = [n for n in lowered if n not in matched]
+    return result, unmatched
+
+
 _GPT_REFINE_SYSTEM = """You are an analyst assistant for filtering and sorting real estate comparable records.
 
 Tools:
 1. QUERY (get_field_values, compute_stats) — inspect actual field values before deciding.
-2. ACTION (filter_by_criterion, keep_top_n, sort_records, remove_by_name, no_change) —
-   Python executes them reliably; you never count indices yourself.
+2. ACTION (filter_by_criterion, keep_top_n, sort_records, remove_by_name,
+   select_by_judgement, no_change) — Python executes them reliably; you never count
+   indices yourself.
+
+CHOOSING THE RIGHT TOOL:
+- If the criterion maps to a NUMERIC or DATE field (year/date, distance_km, price,
+  size, cap rate, years), use the exact filters (filter_by_criterion / keep_top_n).
+- If the criterion is QUALITATIVE and has NO such field — location or area ("CBD",
+  "prime", "city fringe", "Orchard", "east region"), asset quality, "most comparable
+  to the subject", "similar to X" — do NOT force a field filter and do NOT ask the user
+  for a list. Use select_by_judgement: judge each record yourself from its
+  property_name and address using your own knowledge, and give a short reason for each
+  pick. (E.g. "only CBD comps" → keep Shenton Way / Collyer Quay / Cecil St / Raffles
+  Place / Marina Bay; drop Woodlands / Hougang / Loyang.) Always justify your choices.
 
 CRITICAL — filter_by_criterion REMOVES every record where (field OP value) is TRUE, and
 KEEPS all the rest. So to express a "keep only ..." rule you must remove its COMPLEMENT:
@@ -641,6 +682,45 @@ _GPT_ACTION_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "select_by_judgement",
+            "description": (
+                "Use YOUR OWN knowledge to satisfy a QUALITATIVE criterion that is NOT a "
+                "numeric or date field — e.g. location / area ('CBD', 'prime', 'city "
+                "fringe', 'Orchard'), asset quality, or 'most comparable to the subject'. "
+                "Read each record's property_name and address, decide which qualify, and "
+                "list them here with a short reason for EACH. Python keeps/removes exactly "
+                "those, so you never count indices. Choose whichever list is shorter."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string", "enum": ["keep", "remove"],
+                        "description": "keep = keep ONLY the listed records; remove = drop the listed records",
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": "The records to act on, each justified",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string",
+                                         "description": "Property name (or a distinctive part of it) exactly as shown"},
+                                "reason": {"type": "string",
+                                           "description": "Why this record qualifies (or not)"},
+                            },
+                            "required": ["name", "reason"],
+                        },
+                    },
+                    "summary": {"type": "string", "description": "Overall rationale for the selection"},
+                },
+                "required": ["action", "items", "summary"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "no_change",
             "description": "Keep all records unchanged.",
             "parameters": {
@@ -653,7 +733,8 @@ _GPT_ACTION_TOOLS = [
 ]
 
 _ACTION_TOOL_NAMES = {
-    "filter_by_criterion", "keep_top_n", "sort_records", "remove_by_name", "no_change"
+    "filter_by_criterion", "keep_top_n", "sort_records", "remove_by_name",
+    "select_by_judgement", "no_change",
 }
 
 
@@ -798,6 +879,27 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
                                "remaining": len(records)}
                 print(f"  [GPT Refine] Turn {turn}: remove_by_name {args.get('names')} "
                       f"— {_before} → {len(records)}")
+
+            elif fn == "select_by_judgement":
+                _before  = len(records)
+                _action  = args.get("action", "keep")
+                _items   = args.get("items", []) or []
+                records, _unmatched = _exec_select_by_judgement(records, _action, _items)
+                result_data = {"status": "applied",
+                               "action": f"{_action} by judgement",
+                               "summary": args.get("summary", ""),
+                               "decisions": [{"name": it.get("name"), "reason": it.get("reason")}
+                                             for it in _items],
+                               "unmatched": _unmatched,
+                               "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: judgement {_action} "
+                      f"— {_before} → {len(records)}")
+                if args.get("summary"):
+                    print(f"      rationale: {args.get('summary')}")
+                for it in _items:
+                    print(f"        • {it.get('name')}: {it.get('reason')}")
+                if _unmatched:
+                    print(f"      [warn] matched no record: {_unmatched}")
 
             elif fn == "no_change":
                 result_data = {"status": "done", "remaining": len(records)}
