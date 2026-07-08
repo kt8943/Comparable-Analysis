@@ -322,6 +322,14 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
         pdf_path, _PDF_SECTION_KEYWORDS, _OUTPUT_FIELDS,
         llm_cfg, subject_name=subject_name,
         reject_table_headers=_ASSET_TABLE_MARKERS,
+        extra_exclusion_note=(
+            "Use the table's title or section heading to decide whether to extract from it. "
+            "If the heading conveys that the table is about LAND SALES, GOVERNMENT "
+            "LAND TENDERS, GLS, or DEVELOPMENT SITE TRANSACTIONS, extract from it. "
+            "If the heading conveys that the table is about the sale of completed "
+            "buildings / investment assets, LEASING / RENTAL activity, or any topic "
+            "that is not raw land or development sites, SKIP the entire table."
+        ),
     )
     if not raw_records:
         return []
@@ -422,13 +430,15 @@ Rules:
 - Do not invent or estimate values — only extract what is visible in the image.
 - Skip header rows and average/total rows.
 - Price ranges like "600-630" should be returned as the string "600-630" (not split).
-- SCOPE — this is a LAND SALES / GLS / SITE TENDER analysis. Extract ONLY land / site /
-  government-land-tender transactions. Do NOT extract:
-    * ASSET / INVESTMENT SALES of standing buildings (e.g. columns Buyer, Vendor,
-      Purchaser, NPI/Cap Rate, NLA, Tenant), and
-    * RENTAL / LEASING tables (e.g. columns Rent, $ psf/month, Lease, Tenant, Occupancy).
-  If a table is an asset-sales or leasing table, ignore it entirely. If the image has no
-  land / GLS table, return an empty array [].
+- SCOPE — this is a LAND SALES / GLS / SITE TENDER analysis. Use the table's title,
+  section heading, or the overall meaning of its content to decide whether to extract
+  from it. If the table is about LAND SALES, GLS, GOVERNMENT LAND TENDERS, or
+  DEVELOPMENT SITE TRANSACTIONS, extract from it. If the table is about the sale of
+  completed buildings / investment assets, LEASING / RENTAL activity, or any other
+  topic that is not raw land or development sites, SKIP the entire table and return
+  an empty array [].
+- Extract raw numeric values exactly as shown — do NOT convert units. Python handles
+  all unit conversion (sqm to sqft, SGD million to billion) after extraction.
 """
 
 

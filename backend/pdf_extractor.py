@@ -1111,6 +1111,7 @@ def _gpt_extract_full_pdf(
     max_pages: int = 60,
     batch_size: int = 5,
     reject_table_headers: list = None,
+    extra_exclusion_note: str = "",
 ) -> list:
     """
     GPT-4o vision path — replaces Stages 1-4 entirely for OpenAI provider.
@@ -1138,14 +1139,13 @@ def _gpt_extract_full_pdf(
 
     exclude_note = ""
     if reject_table_headers:
-        kw_str = ", ".join(f'"{k}"' for k in reject_table_headers)
         exclude_note = (
-            "\n- EXCLUDE entire tables whose column headers contain any of these "
-            f"keywords (they belong to a different comp type): {kw_str}. "
-            "For example, skip GLS / government land tender tables that have columns "
-            "like 'Type of Development Allowed', 'Successful Tender Price', 'PSF PPR', "
-            "or 'Tenderer' — those are land sales, not building/asset sales."
+            "\n- SKIP tables that belong to a different analysis type. "
+            "Use the table's heading, title, or the overall context of its content "
+            "to judge what the table is about — do not just match column names against a list."
         )
+    if extra_exclusion_note:
+        exclude_note += "\n- " + extra_exclusion_note.strip().lstrip("- ")
 
     system = (
         "You are a real estate data extraction specialist. "
@@ -1156,7 +1156,10 @@ def _gpt_extract_full_pdf(
         "- Extract ALL rows from ALL relevant tables found.\n"
         "- Output ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
         "- One JSON object per transaction row.\n"
-        "- Copy property names exactly as printed — do not paraphrase or abbreviate."
+        "- Copy property names exactly as printed — do not paraphrase or abbreviate.\n"
+        "- Extract raw numeric values exactly as shown in the table. "
+        "Do NOT convert units — Python handles all unit conversion (e.g. sqm to sqft, "
+        "SGD million to billion) after extraction."
         + exclude_note
     )
 
@@ -1590,6 +1593,7 @@ def extract_pdf_records(
     max_pages: int = 60,
     reject_table_headers: list = None,
     dedup: bool = True,
+    extra_exclusion_note: str = "",
 ) -> list:
     """
     Full 4-stage PDF extraction pipeline.  Public API unchanged.
@@ -1625,6 +1629,7 @@ def extract_pdf_records(
             pdf_path, section_keywords, field_schema,
             subj_tokens, llm_cfg, max_pages,
             reject_table_headers=reject_table_headers,
+            extra_exclusion_note=extra_exclusion_note,
         )
         records = _dedup(records) if dedup else records
         print(f"  [PDF] {len(records)} record(s) extracted")

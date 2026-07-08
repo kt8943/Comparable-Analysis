@@ -285,6 +285,14 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
         llm_cfg, subject_name=subject_name,
         reject_table_headers=_NON_RENT_TABLE_MARKERS,
         dedup=False,
+        extra_exclusion_note=(
+            "Use the table's title or section heading to decide whether to extract from it. "
+            "If the heading conveys that the table is about LEASING or RENTAL "
+            "TRANSACTIONS (individual lease deals, tenancy agreements), extract from it. "
+            "If the heading conveys that the table is about SALES, INVESTMENT "
+            "TRANSACTIONS, LAND TENDERS, or aggregate market statistics (vacancy, "
+            "pipeline, average rents by zone), SKIP the entire table."
+        ),
     )
     if not raw_records:
         return []
@@ -373,14 +381,14 @@ Rules:
 - Do not invent or estimate values — only extract what is visible in the image.
 - Skip header rows and average/total rows.
 - Rent ranges like "12-14" should be returned as the string "12-14" (not split).
-- SCOPE — this is a LEASING / RENT analysis. Extract ONLY lease / rental transactions
-  (a tenant leasing space at a rent). Do NOT extract:
-    * ASSET / INVESTMENT SALES tables (e.g. columns Buyer, Vendor, Sale Price, Cap Rate,
-      $ psf capital value), and
-    * GLS / land tender tables (e.g. columns Tender, Tenderer, psf ppr, Site Area).
-  Also ignore market-statistics tables (island-wide rent indices, vacancy, supply). If a
-  table is a sales/land/statistics table, ignore it. If the image has no leasing table,
-  return an empty array [].
+- SCOPE — this is a LEASING / RENT analysis. Use the table's title, section heading,
+  or the overall meaning of its content to decide whether to extract from it. If the
+  table is about LEASING or RENTAL TRANSACTIONS (a tenant leasing space at a rent),
+  extract from it. If the table is about SALES, INVESTMENT TRANSACTIONS, LAND
+  TENDERS, or aggregate market statistics (island-wide indices, vacancy rates, supply
+  pipeline), SKIP the entire table and return an empty array [].
+- Extract raw numeric values exactly as shown — do NOT convert units. Python handles
+  all unit conversion (sqm to sqft, SGD million to billion) after extraction.
 """
 
 
