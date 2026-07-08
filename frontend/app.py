@@ -1783,6 +1783,23 @@ def _show_results(config_path: str, prefix: str, context: str = "",
                     ),
                     key=f"comp_refinement_{context}_{latest.stem}",
                 )
+                _refine_engine_label = st.radio(
+                    "Engine",
+                    ["Standard", "Advanced (sandbox)"],
+                    horizontal=True,
+                    key=f"comp_refine_engine_{context}_{latest.stem}",
+                    help=(
+                        "Standard: fast, safe rule engine — best for filters on price, "
+                        "date, distance, category, top-N. Runs on our server.\n\n"
+                        "Advanced (sandbox): OpenAI Code Interpreter for complex logic "
+                        "(e.g. 'within 20% of the subject's size', 'office OR retail "
+                        "except keep anything over S$1bn'). Slower; the comp data is sent "
+                        "to OpenAI's sandbox — use for non-confidential deals."
+                    ),
+                )
+                if _refine_engine_label.startswith("Advanced"):
+                    st.caption("⚠️  Advanced sends the comp list to OpenAI's sandbox — "
+                               "avoid for confidential deals.")
                 if st.button(
                     "🔄  Apply Changes & Re-run",
                     type="primary",
@@ -1798,10 +1815,13 @@ def _show_results(config_path: str, prefix: str, context: str = "",
                     )
                     _rf.write(_refine_feedback.strip())
                     _rf.close()
+                    _refine_flags = ["--map", "--from-records", str(_records_path),
+                                     "--refinement-file", _rf.name]
+                    if _refine_engine_label.startswith("Advanced"):
+                        _refine_flags += ["--refine-engine", "code_interpreter"]
                     _ok = _run_script(
                         script, config_path,
-                        ["--map", "--from-records", str(_records_path),
-                         "--refinement-file", _rf.name],
+                        _refine_flags,
                         expand_log=True,
                         log_state_key=_refine_log_key,
                     )

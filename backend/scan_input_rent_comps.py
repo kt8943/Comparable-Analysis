@@ -653,7 +653,8 @@ def run(config_path: str = "configs/deal_config.json",
         generate_map: bool = False,
         from_records: str = None,
         refinement_file: str = None,
-        name_only: bool = False):
+        name_only: bool = False,
+        refine_engine: str = None):
 
     global _NAME_ONLY
     _NAME_ONLY = name_only
@@ -667,6 +668,9 @@ def run(config_path: str = "configs/deal_config.json",
     llm_cfg      = cfg.get("llm", {"provider": "ollama",
                                     "ollama": {"base_url": "http://localhost:11434",
                                                "model": "qwen2.5:3b"}})
+    # Per-run refinement engine override (from the frontend radio / CLI).
+    if refine_engine:
+        llm_cfg = {**llm_cfg, "refine_engine": refine_engine}
     ollama_cfg   = llm_cfg.get("ollama", {})
     base_url     = ollama_cfg.get("base_url", "http://localhost:11434")
     model        = ollama_cfg.get("model",    "qwen2.5:3b")
@@ -1015,8 +1019,13 @@ if __name__ == "__main__":
     parser.add_argument("--refinement-file", metavar="TXT", default=None,
                         help="Path to a text file with analyst instructions for "
                              "refining the records list (used with --from-records).")
+    parser.add_argument("--refine-engine", choices=["tools", "code_interpreter"],
+                        default=None,
+                        help="Refinement engine: 'tools' (default) or 'code_interpreter' "
+                             "(OpenAI hosted sandbox).")
     args = parser.parse_args()
     run(args.config, generate_map=args.map,
         from_records=args.from_records,
         refinement_file=args.refinement_file,
-        name_only=args.name_only)
+        name_only=args.name_only,
+        refine_engine=args.refine_engine)
