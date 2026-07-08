@@ -1186,7 +1186,9 @@ def _gpt_extract_full_pdf(
         messages = [{"role": "system", "content": system},
                     {"role": "user",   "content": user_content}]
 
-        # Retry up to 3 times; on 429 rate-limit wait 65s for the TPM window to clear
+        # Retry up to 3 times; on 429 parse the suggested wait from the error
+        # (e.g. "try again in 756ms" or "try again in 5s") + 3s buffer.
+        # Cap at 30s — enough for a rolling TPM window to free up tokens.
         for attempt in range(3):
             try:
                 print(f"  [GPT-4o] batch {b + 1}/{n_batches} — pages {start + 1}-{end} …"
@@ -1205,8 +1207,17 @@ def _gpt_extract_full_pdf(
             except Exception as e:
                 err = str(e)
                 if "429" in err and attempt < 2:
-                    wait = 65
-                    print(f"  [GPT-4o] Rate limit hit — waiting {wait}s before retry ...")
+                    # Parse suggested wait: "try again in 756ms" → 0.756s, "in 5s" → 5s
+                    ms = re.search(r"try again in (\d+)ms", err)
+                    ss = re.search(r"try again in (\d+)s",  err)
+                    if ms:
+                        suggested = int(ms.group(1)) / 1000
+                    elif ss:
+                        suggested = int(ss.group(1))
+                    else:
+                        suggested = 10  # fallback if not parseable
+                    wait = min(suggested + 3, 30)  # add 3s buffer, cap at 30s
+                    print(f"  [GPT-4o] Rate limit — waiting {wait:.1f}s before retry ...")
                     _time.sleep(wait)
                 else:
                     print(f"  [GPT-4o] batch {b + 1} failed: {e}")
