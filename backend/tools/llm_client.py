@@ -524,42 +524,144 @@ def _exec_select_by_judgement(records, action, items):
     return result, unmatched
 
 
-_GPT_REFINE_SYSTEM = """You are an analyst assistant for filtering and sorting real estate comparable records.
+# ── Six composable primitives ────────────────────────────────────────────────
+# Every filtering request decomposes into these. All are KEEP-oriented or
+# direction-explicit so the model cannot invert a comparison, and each returns
+# an effect summary so a no-op becomes a retry signal instead of a silent pass.
 
-Tools:
-1. QUERY (get_field_values, compute_stats) — inspect actual field values before deciding.
-2. ACTION (filter_by_criterion, keep_top_n, sort_records, remove_by_name,
-   select_by_judgement, no_change) — Python executes them reliably; you never count
-   indices yourself.
+def _field_present(records, field):
+    """True if any record carries a non-empty value for `field`."""
+    return any(r.get(field) not in (None, "", 9999.0) for r in records)
 
-CHOOSING THE RIGHT TOOL:
-- If the criterion maps to a NUMERIC or DATE field (year/date, distance_km, price,
-  size, cap rate, years), use the exact filters (filter_by_criterion / keep_top_n).
-- If the criterion is QUALITATIVE and has NO such field — location or area ("CBD",
-  "prime", "city fringe", "Orchard", "east region"), asset quality, "most comparable
-  to the subject", "similar to X" — do NOT force a field filter and do NOT ask the user
-  for a list. Use select_by_judgement: judge each record yourself from its
-  property_name and address using your own knowledge, and give a short reason for each
-  pick. (E.g. "only CBD comps" → keep Shenton Way / Collyer Quay / Cecil St / Raffles
-  Place / Marina Bay; drop Woodlands / Hougang / Loyang.) Always justify your choices.
 
-CRITICAL — filter_by_criterion REMOVES every record where (field OP value) is TRUE, and
-KEEPS all the rest. So to express a "keep only ..." rule you must remove its COMPLEMENT:
-- "remove comps before 2025"      → filter_by_criterion field="sale_date"  op="<"  value="2025-01-01"
-- "keep only comps from 2025 on"  → filter_by_criterion field="sale_date"  op="<"  value="2025-01-01"   (remove the older ones)
-- "keep only within 10 km"        → filter_by_criterion field="distance_km" op=">" value=10             (remove the far ones)
-- "remove anything above S$500m"  → filter_by_criterion field="price_sgd_m" op=">" value=500
-Double-check the direction: after the filter, the records that SURVIVE must be the ones the user wants to keep.
+def _exec_filter_range(records, field, keep_min=None, keep_max=None):
+    """PRIMITIVE 1 (numeric/date). Keep records whose `field` is within the KEEP
+    window [keep_min, keep_max] (either bound may be None = open). Values may be
+    numbers or ISO dates. Missing/unparseable values are kept (conservative)."""
+    def _num(x):
+        sk = _sort_key(x)
+        return sk[1] if sk[0] < 2 else None
+    lo = _num(keep_min) if keep_min not in (None, "") else None
+    hi = _num(keep_max) if keep_max not in (None, "") else None
+    kept, removed, unparsed = [], [], 0
+    for r in records:
+        v = r.get(field)
+        if v in (None, ""):
+            kept.append(r); continue
+        x = _num(v)
+        if x is None:
+            kept.append(r); unparsed += 1; continue
+        if (lo is not None and x < lo) or (hi is not None and x > hi):
+            removed.append(r)
+        else:
+            kept.append(r)
+    return kept, removed, unparsed
 
-Applying MULTIPLE rules: an instruction may contain several rules (e.g. "remove X, keep Y").
-Emit ONE tool call for EACH rule — ideally all in the SAME response. Each is applied in
-sequence to the shrinking record set. When every rule has been applied, call no_change to finish.
 
-Other rules:
-- Use the EXACT field names shown in "Available fields"; do not invent field names. If unsure a
-  field exists (e.g. distance_km), call get_field_values first.
-- For date fields use ISO format for value: "2025-01-01" for "from 2025 onward".
-- Be conservative: if a record's data for the tested field is missing, it is left in place (kept)."""
+def _exec_filter_category(records, field, keep=None, remove=None):
+    """PRIMITIVE 2 (categorical/text). keep = whitelist substrings (drop rows that
+    match none); remove = blacklist substrings (drop rows that match any). Matching
+    is case-insensitive substring on `field`. Blank values survive a blacklist and
+    survive a whitelist (unknown category is kept, not silently dropped)."""
+    keep_l   = [str(k).lower() for k in (keep or []) if str(k).strip()]
+    remove_l = [str(k).lower() for k in (remove or []) if str(k).strip()]
+    kept, removed, blank_kept = [], [], 0
+    for r in records:
+        val = str(r.get(field) or "").lower()
+        if val and remove_l and any(sub in val for sub in remove_l):
+            removed.append(r); continue
+        if keep_l:
+            if val == "":
+                kept.append(r); blank_kept += 1
+            elif any(sub in val for sub in keep_l):
+                kept.append(r)
+            else:
+                removed.append(r)
+        else:
+            kept.append(r)
+    return kept, removed, blank_kept
+
+
+def _exec_filter_presence(records, field, keep="present"):
+    """PRIMITIVE 3 (existence). keep='present' keeps rows that HAVE a value for
+    `field` (drops the empties); keep='missing' keeps only the empty ones."""
+    kept, removed = [], []
+    for r in records:
+        has = r.get(field) not in (None, "", 9999.0)
+        if (keep == "present" and has) or (keep == "missing" and not has):
+            kept.append(r)
+        else:
+            removed.append(r)
+    return kept, removed
+
+
+def _exec_select_by_name(records, action, names):
+    """PRIMITIVE 5 (identity). Keep or remove records whose property_name/site_name
+    contains any of the given substrings (case-insensitive)."""
+    lowered = [str(n).lower() for n in (names or []) if str(n).strip()]
+    _nm = lambda r: str(r.get("property_name") or r.get("site_name") or "").lower()
+    matched: set = set()
+
+    def _hit(r):
+        rn = _nm(r); found = False
+        for sub in lowered:
+            if sub and sub in rn:
+                matched.add(sub); found = True
+        return found
+
+    if str(action).lower() == "keep":
+        result = [r for r in records if _hit(r)]
+    else:
+        result = [r for r in records if not _hit(r)]
+    unmatched = [n for n in lowered if n not in matched]
+    return result, unmatched
+
+
+_GPT_REFINE_SYSTEM = """You are an analyst assistant that refines a list of real estate comparable records.
+Every request decomposes into SIX composable primitives. Pick the primitive that fits each
+rule; Python executes it exactly, so you never count indices and never invert a comparison.
+
+QUERY first if unsure (get_field_values, compute_stats) — inspect real values before acting.
+
+THE SIX PRIMITIVES:
+1. filter_range      — numeric/date fields. Give the KEEP window [keep_min, keep_max].
+                       "remove below S$100m" → price_sgd_m, keep_min=100.
+                       "between 100 and 500" → keep_min=100, keep_max=500.
+                       "within 5 km"         → distance_km, keep_max=5.
+                       "2025 onward"         → sale_date, keep_min="2025-01-01".
+                       "only 2026"           → sale_date, keep_min="2026-01-01", keep_max="2026-12-31".
+2. filter_category   — text fields (sale_type, asset_type, land_zoning, location).
+                       keep=[...] whitelist and/or remove=[...] blacklist (substring).
+                       "office only"            → asset_type, keep=["office"].
+                       "exclude GLS / partial stake / strata" → sale_type, remove=["GLS","Partial Stake","Strata"].
+3. filter_presence   — keep only rows that HAVE (or are MISSING) a value.
+                       "remove comps with no cap rate" → npi_yield, keep="present".
+4. keep_top_n        — ranking. "8 most recent" → sale_date, descending=true, n=8.
+                       "closest 5" → distance_km, descending=false, n=5.
+5. select_by_name    — the user named SPECIFIC comps. "remove NEX" → action="remove", names=["NEX"].
+6. select_by_judgement — QUALITATIVE, no matching field: area ("CBD","prime","Orchard"),
+                       quality, "most comparable". Judge each from name/address with your
+                       own knowledge; give a reason for each pick.
+
+CHOOSING: if the rule maps to a field → use primitives 1–5. If it is a fuzzy concept with
+no field (CBD, prime, quality, "like the subject") → use primitive 6 and justify each pick.
+Prefer a field primitive when a suitable field exists; use judgement only for the fuzzy tail.
+Asset USE (office / hotel / serviced residence / industrial / retail): if asset_type or
+land_zoning carries it, use filter_category on that field. But the use is usually NOT in the
+property name — e.g. "Capri by Fraser" and "Citadines" are serviced residences, "Oakwood" is
+serviced apartments — so do NOT filter_category on property_name for asset use; if the type
+field is empty, use select_by_judgement with your brand/use knowledge.
+
+MULTIPLE rules: an instruction may hold several rules ("remove X, keep only Y, drop Z"). Emit
+ONE primitive call per rule — ideally all in the SAME response. Each is applied in sequence to
+the shrinking set. When every rule is applied, call no_change to finish.
+
+RULES:
+- Use the EXACT field names + types shown in "Available fields". Do not invent fields.
+- The tool result reports its effect (how many removed / matched). If a call removed 0 or
+  reports the field was not found, you chose the wrong field or primitive — try another.
+- Missing values are kept by the range/category primitives (conservative). To drop rows that
+  lack a value, use filter_presence. Do NOT try to filter_range on an empty field."""
 
 _GPT_QUERY_TOOLS = [
     {
@@ -596,31 +698,75 @@ _GPT_ACTION_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "filter_by_criterion",
+            "name": "filter_range",
             "description": (
-                "REMOVE every record where (field OP value) is TRUE; KEEP all others. "
-                "To express a 'keep only ...' rule, remove its complement — e.g. keep "
-                "only comps within 10km => field='distance_km', op='>', value=10 (removes "
-                "the far ones); keep only 2025 onward => field='sale_date', op='<', "
-                "value='2025-01-01' (removes the older ones). "
-                "Python executes the comparison reliably — do NOT guess indices. "
-                "Works on numeric fields (price, area, distance_km, years) and dates."
+                "PRIMITIVE 1 — numeric or date fields. KEEP records whose field falls "
+                "inside the window [keep_min, keep_max]; records outside are removed. "
+                "Give the window you want to KEEP — there is no operator to invert. "
+                "Either bound may be omitted for an open side. Values are numbers, or "
+                "ISO dates for date fields. Examples: 'remove below S$100m' → field="
+                "'price_sgd_m', keep_min=100. 'between 100 and 500' → keep_min=100, "
+                "keep_max=500. 'within 5 km' → field='distance_km', keep_max=5. '2025 "
+                "onward' → field='sale_date', keep_min='2025-01-01'. 'only 2026' → "
+                "keep_min='2026-01-01', keep_max='2026-12-31'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "field": {"type": "string"},
-                    "op": {
-                        "type": "string",
-                        "enum": [">", ">=", "<", "<=", "==", "!=", "contains", "not_contains"],
-                        "description": "Use contains/not_contains for string fields; others for numeric/date.",
-                    },
-                    "value": {
-                        "description": "Threshold value. Use ISO date '2024-01-01' for dates.",
-                    },
+                    "keep_min": {"description": "Lower bound to KEEP (number or ISO date); omit for open"},
+                    "keep_max": {"description": "Upper bound to KEEP (number or ISO date); omit for open"},
                     "reason": {"type": "string"},
                 },
-                "required": ["field", "op", "value", "reason"],
+                "required": ["field", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "filter_category",
+            "description": (
+                "PRIMITIVE 2 — text / categorical fields (sale_type, asset_type, "
+                "land_zoning, location). Provide keep (whitelist: drop rows matching "
+                "NONE) and/or remove (blacklist: drop rows matching ANY). Case-insensitive "
+                "substring. Examples: 'office only' → field='asset_type', keep=['office']. "
+                "'exclude GLS and partial-stake' → field='sale_type', remove=['GLS','Partial "
+                "Stake','Strata']. Blank values are kept, never silently dropped."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "keep":   {"type": "array", "items": {"type": "string"},
+                               "description": "Substrings to KEEP (whitelist)"},
+                    "remove": {"type": "array", "items": {"type": "string"},
+                               "description": "Substrings to REMOVE (blacklist)"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["field", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "filter_presence",
+            "description": (
+                "PRIMITIVE 3 — existence. keep='present' keeps only records that HAVE a "
+                "value for the field (drops the blanks); keep='missing' keeps only the "
+                "blanks. Use for 'remove comps with no cap rate' → field='npi_yield', "
+                "keep='present'; 'only comps that were geocoded' → field='distance_km', "
+                "keep='present'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "keep":  {"type": "string", "enum": ["present", "missing"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["field", "keep", "reason"],
             },
         },
     },
@@ -628,7 +774,12 @@ _GPT_ACTION_TOOLS = [
         "type": "function",
         "function": {
             "name": "keep_top_n",
-            "description": "Keep only the N records with the highest (or lowest) value of a field. Python sorts — perfect for 'most recent 5', 'top 8 by price', etc.",
+            "description": (
+                "PRIMITIVE 4 — ranking. Keep only the N records with the highest (or "
+                "lowest) value of a field. Use for 'most recent 8' (field='sale_date', "
+                "descending=true, n=8), 'top 10 by price', 'closest 5' (field='distance_km', "
+                "descending=false)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -636,7 +787,7 @@ _GPT_ACTION_TOOLS = [
                     "n": {"type": "integer", "description": "Number of records to keep"},
                     "descending": {
                         "type": "boolean",
-                        "description": "True = keep highest values (newest dates, highest price). False = keep lowest.",
+                        "description": "True = keep highest (newest dates / highest price). False = keep lowest / closest.",
                     },
                     "reason": {"type": "string"},
                 },
@@ -647,35 +798,22 @@ _GPT_ACTION_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "sort_records",
-            "description": "Reorder all records by a field, keeping every record.",
+            "name": "select_by_name",
+            "description": (
+                "PRIMITIVE 5 — identity. Keep or remove SPECIFIC records the user named. "
+                "action='remove' drops rows whose name contains any substring; "
+                "action='keep' keeps only those. Use for 'remove NEX and the IPO portfolio' "
+                "or 'keep only 78 Shenton Way and 20 Collyer Quay'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "field": {"type": "string"},
-                    "descending": {"type": "boolean"},
+                    "action": {"type": "string", "enum": ["keep", "remove"]},
+                    "names": {"type": "array", "items": {"type": "string"},
+                              "description": "Property-name substrings"},
                     "reason": {"type": "string"},
                 },
-                "required": ["field", "descending", "reason"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remove_by_name",
-            "description": "Remove records whose property name contains any of the given substrings (case-insensitive).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "names": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Name substrings to match",
-                    },
-                    "reason": {"type": "string"},
-                },
-                "required": ["names", "reason"],
+                "required": ["action", "names", "reason"],
             },
         },
     },
@@ -684,12 +822,12 @@ _GPT_ACTION_TOOLS = [
         "function": {
             "name": "select_by_judgement",
             "description": (
-                "Use YOUR OWN knowledge to satisfy a QUALITATIVE criterion that is NOT a "
-                "numeric or date field — e.g. location / area ('CBD', 'prime', 'city "
-                "fringe', 'Orchard'), asset quality, or 'most comparable to the subject'. "
-                "Read each record's property_name and address, decide which qualify, and "
-                "list them here with a short reason for EACH. Python keeps/removes exactly "
-                "those, so you never count indices. Choose whichever list is shorter."
+                "PRIMITIVE 6 — judgement (the catch-all). Use YOUR OWN knowledge for a "
+                "QUALITATIVE criterion that maps to NO field — location / area ('CBD', "
+                "'prime', 'city fringe', 'Orchard'), asset quality, or 'most comparable to "
+                "the subject'. Read each record's property_name and address, decide which "
+                "qualify, and list them with a short reason for EACH. Python keeps/removes "
+                "exactly those. Choose whichever list is shorter."
             ),
             "parameters": {
                 "type": "object",
@@ -733,8 +871,8 @@ _GPT_ACTION_TOOLS = [
 ]
 
 _ACTION_TOOL_NAMES = {
-    "filter_by_criterion", "keep_top_n", "sort_records", "remove_by_name",
-    "select_by_judgement", "no_change",
+    "filter_range", "filter_category", "filter_presence", "keep_top_n",
+    "select_by_name", "select_by_judgement", "no_change",
 }
 
 
@@ -763,7 +901,8 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
     client    = _openai.OpenAI(api_key=api_key, max_retries=2)
     all_tools = _GPT_QUERY_TOOLS + _GPT_ACTION_TOOLS
 
-    _SKIP = {"_map_marker", "_source", "raw_description"}
+    _SKIP = {"_map_marker", "_source", "raw_description", "lon", "lat",
+             "map_marker", "_geo_provider", "_geo_note", "raw_description"}
 
     # Collect available field names for the header line
     all_fields: set[str] = set()
@@ -771,6 +910,27 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
         for k, v in r.items():
             if k not in _SKIP and v is not None and v != "":
                 all_fields.add(k)
+
+    # Infer a coarse type per field (numeric / date / text) so the model can pick
+    # the right primitive (filter_range vs filter_category) without guessing.
+    def _ftype(field):
+        seen = [r.get(field) for r in records if r.get(field) not in (None, "")]
+        if not seen:
+            return "empty"
+        nums = dates = 0
+        for v in seen:
+            sk = _sort_key(v)
+            if sk[0] == 0:
+                nums += 1
+            elif sk[0] == 1:
+                dates += 1
+        if nums >= max(1, len(seen) // 2):
+            return "numeric"
+        if dates >= max(1, len(seen) // 2):
+            return "date"
+        return "text"
+    field_types = {f: _ftype(f) for f in all_fields}
+    fields_desc = ", ".join(f"{f} ({field_types[f]})" for f in sorted(all_fields))
 
     # Compact record index
     rows = []
@@ -788,11 +948,14 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
     messages = [
         {"role": "system", "content": _GPT_REFINE_SYSTEM},
         {"role": "user", "content": (
-            f"Available fields: {sorted(all_fields)}\n\n"
+            f"Available fields (with type): {fields_desc}\n\n"
             f"Records ({len(records)} total):\n" + "\n".join(rows) + "\n\n"
             f"Instruction: {instruction}"
         )},
     ]
+
+    def _field_exists(field):
+        return field in all_fields or _field_present(records, field)
 
     print(f"  [GPT Refine] {len(records)} records → {gpt_model} ...")
 
@@ -835,50 +998,84 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
             except Exception:
                 args = {}
 
-            if fn == "filter_by_criterion":
-                to_rm = _exec_filter_by_criterion(
-                    records, args.get("field"), args.get("op"), args.get("value"))
-                removed = [
-                    str(records[i - 1].get("property_name")
-                        or records[i - 1].get("site_name") or "?")
-                    for i in sorted(to_rm) if 1 <= i <= len(records)
-                ]
-                records = [r for i, r in enumerate(records, 1) if i not in to_rm]
-                result_data = {"status": "applied",
-                               "action": f"removed rows where {args.get('field')} "
-                                         f"{args.get('op')} {args.get('value')}",
-                               "removed_count": len(to_rm), "removed": removed,
+            _field = args.get("field")
+            # Effect-feedback guard: a field primitive on a nonexistent field is a
+            # wrong-tool signal — tell the model so it retries instead of no-oping.
+            if fn in ("filter_range", "filter_category", "filter_presence",
+                      "keep_top_n") and _field and not _field_exists(_field):
+                result_data = {"status": "no_effect",
+                               "error": f"field '{_field}' not found",
+                               "available_fields": sorted(all_fields),
                                "remaining": len(records)}
-                print(f"  [GPT Refine] Turn {turn}: filter {args.get('field')} "
-                      f"{args.get('op')} {args.get('value')!r} — removed {len(to_rm)}: {removed}")
+                print(f"  [GPT Refine] Turn {turn}: {fn}({_field}) — FIELD NOT FOUND")
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "content": json.dumps(result_data, default=str)})
+                continue
+
+            if fn == "filter_range":
+                _before = len(records)
+                records, removed, unparsed = _exec_filter_range(
+                    records, _field, args.get("keep_min"), args.get("keep_max"))
+                rm_names = [str(r.get("property_name") or r.get("site_name") or "?")
+                            for r in removed]
+                result_data = {"status": "applied",
+                               "action": f"kept {_field} in [{args.get('keep_min')},{args.get('keep_max')}]",
+                               "removed_count": len(removed), "removed": rm_names,
+                               "kept_unparsed": unparsed, "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: filter_range {_field} "
+                      f"[{args.get('keep_min')},{args.get('keep_max')}] — removed "
+                      f"{len(removed)}: {rm_names}")
+
+            elif fn == "filter_category":
+                _before = len(records)
+                records, removed, blank_kept = _exec_filter_category(
+                    records, _field, args.get("keep"), args.get("remove"))
+                rm_names = [str(r.get("property_name") or r.get("site_name") or "?")
+                            for r in removed]
+                result_data = {"status": "applied",
+                               "action": f"category {_field} keep={args.get('keep')} remove={args.get('remove')}",
+                               "removed_count": len(removed), "removed": rm_names,
+                               "blank_kept": blank_kept, "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: filter_category {_field} "
+                      f"keep={args.get('keep')} remove={args.get('remove')} — removed "
+                      f"{len(removed)}: {rm_names}")
+
+            elif fn == "filter_presence":
+                _before = len(records)
+                records, removed = _exec_filter_presence(
+                    records, _field, args.get("keep", "present"))
+                rm_names = [str(r.get("property_name") or r.get("site_name") or "?")
+                            for r in removed]
+                result_data = {"status": "applied",
+                               "action": f"kept {_field} {args.get('keep','present')}",
+                               "removed_count": len(removed), "removed": rm_names,
+                               "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: filter_presence {_field} "
+                      f"keep={args.get('keep','present')} — removed {len(removed)}: {rm_names}")
 
             elif fn == "keep_top_n":
                 _before = len(records)
                 records = _exec_keep_top_n(
-                    records, args.get("field"), int(args.get("n", len(records))),
+                    records, _field, int(args.get("n", len(records))),
                     args.get("descending", True))
                 result_data = {"status": "applied",
-                               "action": f"kept top {args.get('n')} by {args.get('field')}",
+                               "action": f"kept top {args.get('n')} by {_field}",
                                "remaining": len(records)}
                 print(f"  [GPT Refine] Turn {turn}: keep_top_n {args.get('n')} by "
-                      f"{args.get('field')} — {_before} → {len(records)}")
+                      f"{_field} — {_before} → {len(records)}")
 
-            elif fn == "sort_records":
-                records = _exec_sort_records(
-                    records, args.get("field"), args.get("descending", True))
-                result_data = {"status": "applied",
-                               "action": f"sorted by {args.get('field')}",
-                               "remaining": len(records)}
-                print(f"  [GPT Refine] Turn {turn}: sorted by {args.get('field')}")
-
-            elif fn == "remove_by_name":
+            elif fn == "select_by_name":
                 _before = len(records)
-                records = _exec_remove_by_name(records, args.get("names", []))
+                _action = args.get("action", "remove")
+                records, _unmatched = _exec_select_by_name(
+                    records, _action, args.get("names", []))
                 result_data = {"status": "applied",
-                               "action": f"removed names {args.get('names')}",
-                               "remaining": len(records)}
-                print(f"  [GPT Refine] Turn {turn}: remove_by_name {args.get('names')} "
-                      f"— {_before} → {len(records)}")
+                               "action": f"{_action} names {args.get('names')}",
+                               "unmatched": _unmatched, "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: select_by_name {_action} "
+                      f"{args.get('names')} — {_before} → {len(records)}")
+                if _unmatched:
+                    print(f"      [warn] matched no record: {_unmatched}")
 
             elif fn == "select_by_judgement":
                 _before  = len(records)
