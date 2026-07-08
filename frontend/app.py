@@ -2653,25 +2653,25 @@ def render_comparable_analysis():
                                     "hospitality", "residential", "mixed"],
                                    key="adhoc_class")
         _ah_country = c4.text_input("Country", value="Singapore", key="adhoc_country")
-        if not (_ah_name.strip() or _ah_addr.strip()):
-            st.info("Enter a subject property **name or location** to begin.")
-            return
-        config_path = _ensure_adhoc_config(_ah_name.strip(), _ah_addr.strip(),
-                                           _ah_class, _ah_country.strip())
-        cfg  = load_config(config_path)
-        subj = cfg["subject_property"]
-
-    # Inline subject info strip
-    i1, i2, i3, i4 = st.columns(4)
-    i1.markdown(f"**📍** {subj.get('address') or '—'}")
-    i2.markdown(f"**Class:** {(subj.get('asset_class') or '—').title()}")
-    i3.markdown(f"**GFA:** {int(subj.get('gfa_sf', 0) or 0):,} {subj.get('gfa_unit', 'sf').upper()}")
-    i4.markdown(f"**Quality:** {subj.get('quality') or '—'}")
+        if _ah_name.strip() or _ah_addr.strip():
+            config_path = _ensure_adhoc_config(_ah_name.strip(), _ah_addr.strip(),
+                                               _ah_class, _ah_country.strip())
+            cfg  = load_config(config_path)
+            subj = cfg["subject_property"]
+        else:
+            # No subject typed yet — leave config unset but still fall through so
+            # the Import panel below renders (a first-time visitor with zero deals
+            # must be able to restore a saved deal from a JSON file).
+            config_path = None
+            cfg = subj = None
 
     # ── Export / Import deal (portable per-user storage; no server DB needed) ──
     # On the cloud the filesystem is wiped on restart, so users keep their own deal
     # as a JSON file on their machine: Export downloads it, Import restores it.
-    with st.expander("📤 Export / 📥 Import deal (save or restore as a file)"):
+    # Rendered BEFORE the "enter a subject" gate so Import is reachable on first
+    # entry (no deals, no subject typed). Auto-expanded in that empty state.
+    with st.expander("📤 Export / 📥 Import deal (save or restore as a file)",
+                     expanded=(subj is None)):
         import base64 as _b64
         _ec, _ic = st.columns(2)
         with _ec:
@@ -2683,6 +2683,8 @@ def render_comparable_analysis():
                      "import). 'Subject + results' also bundles the generated comps, "
                      "Excel and map so importing restores the finished analysis.")
             try:
+                if config_path is None:
+                    raise ValueError("no subject yet")
                 _cfg_data = load_config(config_path)
                 _full = _scope.startswith("Subject +")
                 if _full:
@@ -2742,6 +2744,19 @@ def render_comparable_analysis():
                 st.rerun()
             except Exception as _e:
                 st.error(f"Not a valid deal JSON: {_e}")
+
+    # Subject gate — must come AFTER the Import panel so importing is always reachable.
+    if subj is None:
+        st.info("Enter a subject property **name or location** to begin, "
+                "or import a saved deal above.")
+        return
+
+    # Inline subject info strip
+    i1, i2, i3, i4 = st.columns(4)
+    i1.markdown(f"**📍** {subj.get('address') or '—'}")
+    i2.markdown(f"**Class:** {(subj.get('asset_class') or '—').title()}")
+    i3.markdown(f"**GFA:** {int(subj.get('gfa_sf', 0) or 0):,} {subj.get('gfa_unit', 'sf').upper()}")
+    i4.markdown(f"**Quality:** {subj.get('quality') or '—'}")
 
     st.divider()
 
