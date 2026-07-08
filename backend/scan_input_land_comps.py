@@ -970,7 +970,11 @@ def run(config_path: str = "configs/deal_config.json",
                             float(_rec["lon"]), float(_rec["lat"]), s_lon, s_lat), 2)
                     except Exception:
                         pass
-        records = _apply_refinement(records, instructions, llm_cfg)
+        _ci_subject = {k: subject_cfg.get(k) for k in
+                       ("property_name", "deal_name", "asset_class", "address",
+                        "gfa_sf", "price_sgd_m", "land_zoning", "country_name")
+                       if subject_cfg.get(k) not in (None, "")}
+        records = _apply_refinement(records, instructions, llm_cfg, subject=_ci_subject)
         for rec in records:
             rec.pop("_map_marker", None)
         if not records:

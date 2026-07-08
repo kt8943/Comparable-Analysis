@@ -1127,19 +1127,125 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
     return records
 
 
+# ── Hosted-sandbox refinement (OpenAI Code Interpreter) ───────────────────────
+
+_CI_REFINE_PROMPT = """You are refining a list of real estate comparable transactions for an acquisition team.
+Use the code_interpreter tool — WRITE AND RUN Python (pandas). Do NOT answer from memory.
+
+Records (JSON list; each row has a stable "_rid"):
+{records}
+
+Subject property (the deal these comps support):
+{subject}
+
+Instruction to apply — decide which records to KEEP:
+"{instruction}"
+
+Rules for your code:
+- Parse `sale_date` robustly — values look like 'Mar 2025', 'Feb 2024', 'Q1 2026'. Write a helper; never string-compare dates.
+- Numeric fields (price_sgd_m in S$ million, distance_km, gfa_sf, remaining_yrs, npi_yield = cap rate %) may be null.
+- Relative phrases ("similar size", "like the subject", "most comparable") are relative to the subject's fields.
+- If a record lacks the data a rule needs, KEEP it (conservative).
+- Only ever SELECT rows; never fabricate rows or values.
+
+After filtering, print EXACTLY one final line, nothing after it:
+RESULT: <a JSON array of the _rid strings to KEEP>"""
+
+
+def run_code_interpreter_refine(instruction: str, records: list, llm_cfg: dict,
+                                subject: dict = None) -> list:
+    """Refine via OpenAI's HOSTED code_interpreter sandbox.
+
+    Python runs in OpenAI's container — never in this process, so no arbitrary code
+    executes on our (cloud) host. We stamp each record with a stable `_rid`, let the
+    sandbox compute which rows to keep, and apply the returned id list LOCALLY. We
+    never exec code and never trust the model's echo of the data — only the id list.
+    Any failure falls back to returning the records unchanged (safe no-op).
+
+    NOTE: the comp data is sent to OpenAI's sandbox — keep this opt-in for
+    non-confidential / demo use.
+    """
+    import os as _os, re as _re
+    try:
+        import openai as _openai
+    except ImportError:
+        raise ImportError("pip install openai")
+    api_key = llm_cfg.get("openai_api_key") or _os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise ValueError("OpenAI API key not found in llm_cfg or OPENAI_API_KEY env var")
+    model  = llm_cfg.get("openai_model", "gpt-4o")
+    client = _openai.OpenAI(api_key=api_key, max_retries=2)
+
+    _SKIP = {"_map_marker", "_source", "raw_description", "lon", "lat",
+             "map_marker", "_geo_provider", "_geo_note"}
+    view = []
+    for i, r in enumerate(records):
+        r["_rid"] = str(i)
+        view.append({k: v for k, v in r.items() if k not in _SKIP})
+
+    prompt = _CI_REFINE_PROMPT.format(
+        records=json.dumps(view, default=str),
+        subject=json.dumps(subject or {}, default=str),
+        instruction=instruction,
+    )
+    print(f"  [CI Refine] {len(records)} records → {model} hosted sandbox ...")
+    try:
+        resp = client.responses.create(
+            model=model,
+            tools=[{"type": "code_interpreter", "container": {"type": "auto"}}],
+            input=prompt, timeout=180,
+        )
+        text = resp.output_text or ""
+    except Exception as e:
+        print(f"  [CI Refine] API error: {e} — keeping all records")
+        for r in records:
+            r.pop("_rid", None)
+        return records
+
+    matches = _re.findall(r"RESULT:\s*(\[[^\]]*\])", text)
+    if not matches:
+        print("  [CI Refine] no RESULT line returned — keeping all records")
+        for r in records:
+            r.pop("_rid", None)
+        return records
+    raw = matches[-1]
+    ids = None
+    for attempt in (raw, raw.replace("'", '"')):   # tolerate single-quoted arrays
+        try:
+            ids = json.loads(attempt)
+            break
+        except Exception:
+            continue
+    if ids is None:                                 # last resort: pull the integers
+        ids = _re.findall(r"\d+", raw)
+    keep_ids = {str(x) for x in ids}                # normalise ints/strings to str
+
+    kept = [r for r in records if r.get("_rid") in keep_ids]
+    for r in records:
+        r.pop("_rid", None)
+    print(f"  [CI Refine] {len(records)} → {len(kept)} records (hosted sandbox)")
+    return kept
+
+
 # ── apply_refinement (router used by scan pipeline) ───────────────────────────
 
 def apply_refinement(records: list, instructions: str,
                      llm_cfg: dict,
-                     base_url: str = None, model: str = None) -> list:
+                     base_url: str = None, model: str = None,
+                     subject: dict = None) -> list:
     """
     Apply analyst free-text instructions to filter/reorder comparable records.
 
-    Routes to GPT function-calling agent when llm_cfg["provider"] == "openai",
-    otherwise falls back to the Ollama multi-turn agent loop.
+    Routing (all opt-in via llm_cfg):
+      provider=="openai" + refine_engine=="code_interpreter" → hosted OpenAI sandbox
+      provider=="openai"                                      → tool-calling agent (default, safe)
+      otherwise                                               → Ollama agent loop
     """
     provider = (llm_cfg or {}).get("provider", "ollama")
+    engine   = (llm_cfg or {}).get("refine_engine", "tools")
     if provider == "openai":
+        if engine == "code_interpreter":
+            return run_code_interpreter_refine(instructions, records, llm_cfg, subject=subject)
         return run_agent_loop_gpt(instructions, records, llm_cfg)
     # Ollama path
     _base  = base_url  or (llm_cfg or {}).get("ollama", {}).get("base_url", "http://localhost:11434")
