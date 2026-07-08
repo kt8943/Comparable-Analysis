@@ -497,20 +497,28 @@ def _exec_remove_by_name(records, names):
 
 _GPT_REFINE_SYSTEM = """You are an analyst assistant for filtering and sorting real estate comparable records.
 
-You have two types of tools:
-1. QUERY tools (get_field_values, compute_stats) — call these to inspect actual field values before deciding.
-   After calling a query tool you will receive results, then call another tool.
-2. ACTION tools (filter_by_criterion, keep_top_n, sort_records, remove_by_name, no_change) — call ONE of
-   these when ready. Python will execute it reliably; you do NOT need to count indices yourself.
+Tools:
+1. QUERY (get_field_values, compute_stats) — inspect actual field values before deciding.
+2. ACTION (filter_by_criterion, keep_top_n, sort_records, remove_by_name, no_change) —
+   Python executes them reliably; you never count indices yourself.
 
-Workflow:
-- If you need to see field values or statistics to make a decision, call a query tool FIRST.
-- Then call ONE action tool.
+CRITICAL — filter_by_criterion REMOVES every record where (field OP value) is TRUE, and
+KEEPS all the rest. So to express a "keep only ..." rule you must remove its COMPLEMENT:
+- "remove comps before 2025"      → filter_by_criterion field="sale_date"  op="<"  value="2025-01-01"
+- "keep only comps from 2025 on"  → filter_by_criterion field="sale_date"  op="<"  value="2025-01-01"   (remove the older ones)
+- "keep only within 10 km"        → filter_by_criterion field="distance_km" op=">" value=10             (remove the far ones)
+- "remove anything above S$500m"  → filter_by_criterion field="price_sgd_m" op=">" value=500
+Double-check the direction: after the filter, the records that SURVIVE must be the ones the user wants to keep.
 
-Rules:
-- Prefer action tools that Python executes (filter_by_criterion, keep_top_n, sort_records) over guessing.
-- For date fields use ISO format for value: e.g. "2024-01-01" for "from 2024 onward".
-- Be conservative: if a record's data is missing or ambiguous, keep it."""
+Applying MULTIPLE rules: an instruction may contain several rules (e.g. "remove X, keep Y").
+Emit ONE tool call for EACH rule — ideally all in the SAME response. Each is applied in
+sequence to the shrinking record set. When every rule has been applied, call no_change to finish.
+
+Other rules:
+- Use the EXACT field names shown in "Available fields"; do not invent field names. If unsure a
+  field exists (e.g. distance_km), call get_field_values first.
+- For date fields use ISO format for value: "2025-01-01" for "from 2025 onward".
+- Be conservative: if a record's data for the tested field is missing, it is left in place (kept)."""
 
 _GPT_QUERY_TOOLS = [
     {
@@ -549,9 +557,13 @@ _GPT_ACTION_TOOLS = [
         "function": {
             "name": "filter_by_criterion",
             "description": (
-                "Remove records where a field meets a criterion. "
+                "REMOVE every record where (field OP value) is TRUE; KEEP all others. "
+                "To express a 'keep only ...' rule, remove its complement — e.g. keep "
+                "only comps within 10km => field='distance_km', op='>', value=10 (removes "
+                "the far ones); keep only 2025 onward => field='sale_date', op='<', "
+                "value='2025-01-01' (removes the older ones). "
                 "Python executes the comparison reliably — do NOT guess indices. "
-                "Works on numeric fields (price, area, distance, years) and dates."
+                "Works on numeric fields (price, area, distance_km, years) and dates."
             ),
             "parameters": {
                 "type": "object",
@@ -703,7 +715,12 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
 
     print(f"  [GPT Refine] {len(records)} records → {gpt_model} ...")
 
-    for turn in range(1, 6):
+    # Multi-rule instructions ("remove X, keep Y") require applying SEVERAL filters.
+    # Execute EVERY action tool call in a turn (not just the first), threading the
+    # shrinking record set, and continue the loop until the model calls no_change
+    # (or emits no tool call). This lets the model apply one rule per tool call —
+    # in the same response or across turns — instead of silently dropping rule 2.
+    for turn in range(1, 7):
         resp      = client.chat.completions.create(
             model=gpt_model, messages=messages,
             tools=all_tools, tool_choice="required",
@@ -716,46 +733,7 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
             print(f"  [GPT Refine] Turn {turn}: no tool call — keeping all")
             return records
 
-        # If an action tool is present, execute it and return immediately
-        action = next((tc for tc in tool_calls if tc.function.name in _ACTION_TOOL_NAMES), None)
-        if action:
-            fn   = action.function.name
-            args = json.loads(action.function.arguments)
-            rsn  = args.get("reason", "")
-            print(f"  [GPT Refine] Turn {turn}: {fn} — {rsn}")
-
-            if fn == "filter_by_criterion":
-                to_rm = _exec_filter_by_criterion(
-                    records, args["field"], args["op"], args["value"])
-                removed = [
-                    str(records[i - 1].get("property_name")
-                        or records[i - 1].get("site_name") or "?")
-                    for i in sorted(to_rm) if 1 <= i <= len(records)
-                ]
-                result = [r for i, r in enumerate(records, 1) if i not in to_rm]
-                print(f"  [GPT Refine] Removed {len(to_rm)}: {removed}")
-
-            elif fn == "keep_top_n":
-                result = _exec_keep_top_n(
-                    records, args["field"], args["n"], args.get("descending", True))
-
-            elif fn == "sort_records":
-                result = _exec_sort_records(
-                    records, args["field"], args.get("descending", True))
-                print(f"  [GPT Refine] Sorted {len(result)} records by {args['field']}")
-
-            elif fn == "remove_by_name":
-                result = _exec_remove_by_name(records, args["names"])
-
-            else:  # no_change
-                print(f"  [GPT Refine] No change.")
-                return records
-
-            print(f"  [GPT Refine] {len(records)} → {len(result)} records")
-            return result
-
-        # Only query tools — execute them and continue the loop
-        # Rebuild assistant message as a plain dict (SDK objects aren't JSON-serialisable)
+        # Record the assistant turn (all its tool calls) before answering each one.
         messages.append({
             "role": "assistant",
             "content": msg.content,
@@ -767,23 +745,86 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
                 for tc in tool_calls
             ],
         })
+
+        stop = False
         for tc in tool_calls:
-            fn   = tc.function.name
-            args = json.loads(tc.function.arguments)
-            print(f"  [GPT Refine] Turn {turn}: query {fn}({args.get('field', '')})")
-            if fn == "get_field_values":
-                result_data = _qt_get_values(records, args["field"])
+            fn = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+
+            if fn == "filter_by_criterion":
+                to_rm = _exec_filter_by_criterion(
+                    records, args.get("field"), args.get("op"), args.get("value"))
+                removed = [
+                    str(records[i - 1].get("property_name")
+                        or records[i - 1].get("site_name") or "?")
+                    for i in sorted(to_rm) if 1 <= i <= len(records)
+                ]
+                records = [r for i, r in enumerate(records, 1) if i not in to_rm]
+                result_data = {"status": "applied",
+                               "action": f"removed rows where {args.get('field')} "
+                                         f"{args.get('op')} {args.get('value')}",
+                               "removed_count": len(to_rm), "removed": removed,
+                               "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: filter {args.get('field')} "
+                      f"{args.get('op')} {args.get('value')!r} — removed {len(to_rm)}: {removed}")
+
+            elif fn == "keep_top_n":
+                _before = len(records)
+                records = _exec_keep_top_n(
+                    records, args.get("field"), int(args.get("n", len(records))),
+                    args.get("descending", True))
+                result_data = {"status": "applied",
+                               "action": f"kept top {args.get('n')} by {args.get('field')}",
+                               "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: keep_top_n {args.get('n')} by "
+                      f"{args.get('field')} — {_before} → {len(records)}")
+
+            elif fn == "sort_records":
+                records = _exec_sort_records(
+                    records, args.get("field"), args.get("descending", True))
+                result_data = {"status": "applied",
+                               "action": f"sorted by {args.get('field')}",
+                               "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: sorted by {args.get('field')}")
+
+            elif fn == "remove_by_name":
+                _before = len(records)
+                records = _exec_remove_by_name(records, args.get("names", []))
+                result_data = {"status": "applied",
+                               "action": f"removed names {args.get('names')}",
+                               "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: remove_by_name {args.get('names')} "
+                      f"— {_before} → {len(records)}")
+
+            elif fn == "no_change":
+                result_data = {"status": "done", "remaining": len(records)}
+                print(f"  [GPT Refine] Turn {turn}: no_change — {args.get('reason','')}")
+                stop = True
+
+            elif fn == "get_field_values":
+                result_data = _qt_get_values(records, args.get("field"))
+                print(f"  [GPT Refine] Turn {turn}: query get_field_values({args.get('field','')})")
+
             elif fn == "compute_stats":
-                result_data = _qt_compute_stats(records, args["field"])
+                result_data = _qt_compute_stats(records, args.get("field"))
+                print(f"  [GPT Refine] Turn {turn}: query compute_stats({args.get('field','')})")
+
             else:
-                result_data = {"error": f"Unknown query tool: {fn}"}
+                result_data = {"error": f"Unknown tool: {fn}"}
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": json.dumps(result_data),
+                "content": json.dumps(result_data, default=str),
             })
 
-    print("  [GPT Refine] Max turns reached — keeping all records")
+        if stop:
+            break
+
+    print(f"  [GPT Refine] Final: {len(records)} record(s)")
     return records
 
 

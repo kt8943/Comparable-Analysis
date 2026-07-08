@@ -837,6 +837,19 @@ def run(config_path: str = "configs/deal_config.json",
                         rec["_map_marker"] = _marker_by_prop[pn]
             except Exception:
                 pass
+        # Ensure distance_km exists so "within X km" instructions can be applied.
+        # Refinement runs before geocoding, and --from-records rows carry lon/lat
+        # but not a persisted distance_km — so recompute it from the subject coords.
+        if s_lon is not None and s_lat is not None:
+            for _rec in records:
+                if (_rec.get("distance_km") in (None, "", 9999.0)
+                        and _rec.get("lon") not in (None, "")
+                        and _rec.get("lat") not in (None, "")):
+                    try:
+                        _rec["distance_km"] = round(_haversine_km(
+                            float(_rec["lon"]), float(_rec["lat"]), s_lon, s_lat), 2)
+                    except Exception:
+                        pass
         records = _apply_refinement(records, instructions, llm_cfg)
         for rec in records:
             rec.pop("_map_marker", None)
