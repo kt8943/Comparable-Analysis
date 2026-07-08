@@ -753,7 +753,7 @@ def _system_msg(country_name: str) -> str:
         f"You are a senior {country_name} commercial real estate analyst supporting "
         "institutional deal underwriting. You classify comparable investment "
         "transactions and assess how relevant each is to a given subject property. "
-        'Always wrap your output array in {"comparables": [...]} — no markdown fences.'
+        'Return your answer as a JSON object with key "comparables" containing an array — no markdown fences.'
     )
 
 

@@ -594,7 +594,7 @@ def _classify_system(country_name: str) -> str:
     return (
         f"You are a senior {country_name} commercial real estate analyst. "
         "Classify land sale comparables by location tier and site quality. "
-        'Return ONLY {"comparables": [...]} — no markdown fences.'
+        'Return ONLY a JSON object {"comparables": [...]} — no markdown fences.'
     )
 
 

@@ -419,105 +419,240 @@ def run_agent_loop(
     return records
 
 
-# ── GPT-4o function-calling refinement agent ──────────────────────────────────
+# ── GPT refinement agent — Python-executed tools, multi-turn function calling ──
 
-_GPT_REFINE_SYSTEM = """You are an analyst assistant helping filter and reorder real estate comparable transaction records.
+def _try_parse_date(s):
+    """Parse a date string in any common format; returns datetime or None."""
+    import re as _re
+    from datetime import datetime as _dt
+    s = str(s).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%Y", "%b %Y", "%B %Y", "%Y"):
+        try:
+            return _dt.strptime(s[:10], fmt)
+        except ValueError:
+            pass
+    m = _re.match(r"Q([1-4])\s*(\d{4})", s, _re.I)
+    if m:
+        q, yr = int(m.group(1)), int(m.group(2))
+        return _dt(yr, (q - 1) * 3 + 1, 1)
+    return None
 
-You will receive a numbered list of records and an instruction from the analyst.
-Interpret the instruction carefully and call exactly ONE of the available tools.
 
-You can:
-- Remove records that don't meet the stated criteria (filter_records)
-- Keep only specific records in a specified order — use this for "sort by", "top N", or "most recent" (keep_records)
-- Do nothing if the instruction is unclear or no change is needed (no_change)
+def _sort_key(v):
+    """Unified sort key: numeric < date < string < None."""
+    if v is None or v == "":
+        return (3, 0)
+    try:
+        return (0, float(v))
+    except (TypeError, ValueError):
+        pass
+    d = _try_parse_date(v)
+    if d:
+        return (1, d.timestamp())
+    return (2, str(v).lower())
 
-Be conservative: if a record's data is missing or ambiguous, keep it rather than removing it.
-For date comparisons, parse dates from any format (e.g. "Jan 2026", "2026-01-15", "Q1 2026").
-Always provide a clear reason explaining what was done and why."""
 
-_GPT_REFINE_TOOLS = [
+def _exec_filter_by_criterion(records, field, op, value):
+    """Python-executed: return 1-based indices of records to REMOVE."""
+    to_remove: set[int] = set()
+    for i, r in enumerate(records, 1):
+        v = r.get(field)
+        if v is None or v == "":
+            continue
+        if op in ("contains", "not_contains"):
+            match = str(value).lower() in str(v).lower()
+            if (op == "contains" and match) or (op == "not_contains" and not match):
+                to_remove.add(i)
+        else:
+            sk_v   = _sort_key(v)
+            sk_val = _sort_key(value)
+            # Only compare same type (numeric vs numeric, date vs date)
+            if sk_v[0] != sk_val[0] or sk_v[0] >= 2:
+                continue
+            a, b = sk_v[1], sk_val[1]
+            match = {">": a > b, ">=": a >= b, "<": a < b,
+                     "<=": a <= b, "==": a == b, "!=": a != b}.get(op, False)
+            if match:
+                to_remove.add(i)
+    return to_remove
+
+
+def _exec_keep_top_n(records, field, n, descending=True):
+    """Return top-N records sorted by field (Python sorts, not GPT)."""
+    indexed = list(enumerate(records))
+    indexed.sort(key=lambda x: _sort_key(x[1].get(field)), reverse=descending)
+    return [r for _, r in indexed[:max(0, n)]]
+
+
+def _exec_sort_records(records, field, descending=True):
+    return sorted(records, key=lambda r: _sort_key(r.get(field)), reverse=descending)
+
+
+def _exec_remove_by_name(records, names):
+    lowered = [n.lower() for n in names]
+    return [r for r in records
+            if not any(sub in str(r.get("property_name") or r.get("site_name") or "").lower()
+                       for sub in lowered)]
+
+
+_GPT_REFINE_SYSTEM = """You are an analyst assistant for filtering and sorting real estate comparable records.
+
+You have two types of tools:
+1. QUERY tools (get_field_values, compute_stats) — call these to inspect actual field values before deciding.
+   After calling a query tool you will receive results, then call another tool.
+2. ACTION tools (filter_by_criterion, keep_top_n, sort_records, remove_by_name, no_change) — call ONE of
+   these when ready. Python will execute it reliably; you do NOT need to count indices yourself.
+
+Workflow:
+- If you need to see field values or statistics to make a decision, call a query tool FIRST.
+- Then call ONE action tool.
+
+Rules:
+- Prefer action tools that Python executes (filter_by_criterion, keep_top_n, sort_records) over guessing.
+- For date fields use ISO format for value: e.g. "2024-01-01" for "from 2024 onward".
+- Be conservative: if a record's data is missing or ambiguous, keep it."""
+
+_GPT_QUERY_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "filter_records",
-            "description": (
-                "Remove records that don't meet the analyst's criteria. "
-                "Use when you want to exclude specific records based on any field value, "
-                "date range, price threshold, distance, tenure type, etc."
-            ),
+            "name": "get_field_values",
+            "description": "Get each record's value for a field (with its 1-based index and name). Call this before filtering to see exact values.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "indices_to_remove": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "1-based position numbers of records to REMOVE"
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Explain which records were removed and the criteria applied"
-                    }
+                    "field": {"type": "string", "description": "Field name to inspect"}
                 },
-                "required": ["indices_to_remove", "reason"]
-            }
-        }
+                "required": ["field"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
-            "name": "keep_records",
+            "name": "compute_stats",
+            "description": "Compute min/max/mean/median/p25/p75 for a numeric field. Use for 'remove outliers' or threshold-based instructions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string", "description": "Numeric field name"}
+                },
+                "required": ["field"],
+            },
+        },
+    },
+]
+
+_GPT_ACTION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "filter_by_criterion",
             "description": (
-                "Keep only specific records, in the given order. "
-                "Use for 'top N', 'most recent', 'sort by price', or any instruction "
-                "that selects a subset and/or changes the order."
+                "Remove records where a field meets a criterion. "
+                "Python executes the comparison reliably — do NOT guess indices. "
+                "Works on numeric fields (price, area, distance, years) and dates."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "indices_to_keep": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": (
-                            "1-based position numbers of records to KEEP, "
-                            "in the desired output order"
-                        )
-                    },
-                    "reason": {
+                    "field": {"type": "string"},
+                    "op": {
                         "type": "string",
-                        "description": "Explain what was selected and the ordering applied"
-                    }
+                        "enum": [">", ">=", "<", "<=", "==", "!=", "contains", "not_contains"],
+                        "description": "Use contains/not_contains for string fields; others for numeric/date.",
+                    },
+                    "value": {
+                        "description": "Threshold value. Use ISO date '2024-01-01' for dates.",
+                    },
+                    "reason": {"type": "string"},
                 },
-                "required": ["indices_to_keep", "reason"]
-            }
-        }
+                "required": ["field", "op", "value", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keep_top_n",
+            "description": "Keep only the N records with the highest (or lowest) value of a field. Python sorts — perfect for 'most recent 5', 'top 8 by price', etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "n": {"type": "integer", "description": "Number of records to keep"},
+                    "descending": {
+                        "type": "boolean",
+                        "description": "True = keep highest values (newest dates, highest price). False = keep lowest.",
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["field", "n", "descending", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sort_records",
+            "description": "Reorder all records by a field, keeping every record.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "descending": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["field", "descending", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_by_name",
+            "description": "Remove records whose property name contains any of the given substrings (case-insensitive).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Name substrings to match",
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["names", "reason"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "no_change",
-            "description": "Keep all records unchanged when no filtering or reordering is needed.",
+            "description": "Keep all records unchanged.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "Explain why no change was made"
-                    }
-                },
-                "required": ["reason"]
-            }
-        }
-    }
+                "properties": {"reason": {"type": "string"}},
+                "required": ["reason"],
+            },
+        },
+    },
 ]
+
+_ACTION_TOOL_NAMES = {
+    "filter_by_criterion", "keep_top_n", "sort_records", "remove_by_name", "no_change"
+}
 
 
 def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
     """
-    GPT-4o function-calling refinement agent.
+    GPT refinement agent with Python-executed tools and multi-turn function calling.
 
-    Sends all records + analyst instruction to GPT in a single call.
-    GPT decides whether to filter (remove), keep/reorder (select subset in order),
-    or leave unchanged — using native function calling for reliable structured output.
+    GPT decides WHAT criterion to apply; Python executes it reliably.
+    Query tools (get_field_values, compute_stats) let GPT inspect data before deciding.
+    Action tools (filter_by_criterion, keep_top_n, sort_records, remove_by_name) are
+    executed by Python — no index-guessing, reliable date/numeric comparison.
     """
     try:
         import openai as _openai
@@ -532,76 +667,123 @@ def run_agent_loop_gpt(instruction: str, records: list, llm_cfg: dict) -> list:
         raise ValueError("OpenAI API key not found in llm_cfg or OPENAI_API_KEY env var")
 
     gpt_model = llm_cfg.get("openai_model", "gpt-4o")
-    client = _openai.OpenAI(api_key=api_key)
+    client    = _openai.OpenAI(api_key=api_key, max_retries=2)
+    all_tools = _GPT_QUERY_TOOLS + _GPT_ACTION_TOOLS
 
     _SKIP = {"_map_marker", "_source", "raw_description"}
 
-    # Build compact numbered record list for GPT
+    # Collect available field names for the header line
+    all_fields: set[str] = set()
+    for r in records:
+        for k, v in r.items():
+            if k not in _SKIP and v is not None and v != "":
+                all_fields.add(k)
+
+    # Compact record index
     rows = []
     for i, r in enumerate(records, 1):
         parts: list[str] = [f"#{i}"]
         name = r.get("property_name") or r.get("site_name") or ""
         if name:
             parts.append(f'"{name}"')
-        for k, v in r.items():
-            if k in _SKIP or k in {"property_name", "site_name"}:
-                continue
-            if v is None or v == "":
-                continue
-            parts.append(f"{k}={v!r}")
+        for k in sorted(all_fields - {"property_name", "site_name"}):
+            v = r.get(k)
+            if v is not None and v != "":
+                parts.append(f"{k}={v!r}")
         rows.append("  " + " | ".join(parts))
 
-    records_text = "\n".join(rows)
-    user_msg = (
-        f"Records ({len(records)} total):\n{records_text}\n\n"
-        f"Analyst instruction: {instruction}"
-    )
+    messages = [
+        {"role": "system", "content": _GPT_REFINE_SYSTEM},
+        {"role": "user", "content": (
+            f"Available fields: {sorted(all_fields)}\n\n"
+            f"Records ({len(records)} total):\n" + "\n".join(rows) + "\n\n"
+            f"Instruction: {instruction}"
+        )},
+    ]
 
-    print(f"  [GPT Refine] Sending {len(records)} records to {gpt_model} ...")
-    resp = client.chat.completions.create(
-        model=gpt_model,
-        messages=[
-            {"role": "system", "content": _GPT_REFINE_SYSTEM},
-            {"role": "user",   "content": user_msg},
-        ],
-        tools=_GPT_REFINE_TOOLS,
-        tool_choice="required",
-        temperature=0,
-    )
+    print(f"  [GPT Refine] {len(records)} records → {gpt_model} ...")
 
-    tool_calls = resp.choices[0].message.tool_calls
-    if not tool_calls:
-        print("  [GPT Refine] No tool call returned — keeping all records")
-        return records
+    for turn in range(1, 6):
+        resp      = client.chat.completions.create(
+            model=gpt_model, messages=messages,
+            tools=all_tools, tool_choice="required",
+            temperature=0, timeout=60,
+        )
+        msg        = resp.choices[0].message
+        tool_calls = msg.tool_calls or []
 
-    tc      = tool_calls[0]
-    fn_name = tc.function.name
-    fn_args = json.loads(tc.function.arguments)
-    reason  = fn_args.get("reason", "")
+        if not tool_calls:
+            print(f"  [GPT Refine] Turn {turn}: no tool call — keeping all")
+            return records
 
-    if fn_name == "filter_records":
-        to_remove = {int(x) for x in fn_args.get("indices_to_remove", [])}
-        removed_names = [
-            str(records[i - 1].get("property_name")
-                or records[i - 1].get("site_name") or "?")
-            for i in sorted(to_remove) if 1 <= i <= len(records)
-        ]
-        result = [r for i, r in enumerate(records, 1) if i not in to_remove]
-        print(f"  [GPT Refine] Removed {len(to_remove)}: {removed_names}")
-        print(f"  [GPT Refine] {reason}")
-        print(f"  [GPT Refine] {len(records)} → {len(result)} records")
-        return result
+        # If an action tool is present, execute it and return immediately
+        action = next((tc for tc in tool_calls if tc.function.name in _ACTION_TOOL_NAMES), None)
+        if action:
+            fn   = action.function.name
+            args = json.loads(action.function.arguments)
+            rsn  = args.get("reason", "")
+            print(f"  [GPT Refine] Turn {turn}: {fn} — {rsn}")
 
-    if fn_name == "keep_records":
-        to_keep = [int(x) for x in fn_args.get("indices_to_keep", [])]
-        result  = [records[i - 1] for i in to_keep if 1 <= i <= len(records)]
-        print(f"  [GPT Refine] Kept {len(result)} records in specified order")
-        print(f"  [GPT Refine] {reason}")
-        print(f"  [GPT Refine] {len(records)} → {len(result)} records")
-        return result
+            if fn == "filter_by_criterion":
+                to_rm = _exec_filter_by_criterion(
+                    records, args["field"], args["op"], args["value"])
+                removed = [
+                    str(records[i - 1].get("property_name")
+                        or records[i - 1].get("site_name") or "?")
+                    for i in sorted(to_rm) if 1 <= i <= len(records)
+                ]
+                result = [r for i, r in enumerate(records, 1) if i not in to_rm]
+                print(f"  [GPT Refine] Removed {len(to_rm)}: {removed}")
 
-    # no_change
-    print(f"  [GPT Refine] No change. {reason}")
+            elif fn == "keep_top_n":
+                result = _exec_keep_top_n(
+                    records, args["field"], args["n"], args.get("descending", True))
+
+            elif fn == "sort_records":
+                result = _exec_sort_records(
+                    records, args["field"], args.get("descending", True))
+                print(f"  [GPT Refine] Sorted {len(result)} records by {args['field']}")
+
+            elif fn == "remove_by_name":
+                result = _exec_remove_by_name(records, args["names"])
+
+            else:  # no_change
+                print(f"  [GPT Refine] No change.")
+                return records
+
+            print(f"  [GPT Refine] {len(records)} → {len(result)} records")
+            return result
+
+        # Only query tools — execute them and continue the loop
+        # Rebuild assistant message as a plain dict (SDK objects aren't JSON-serialisable)
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id, "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in tool_calls
+            ],
+        })
+        for tc in tool_calls:
+            fn   = tc.function.name
+            args = json.loads(tc.function.arguments)
+            print(f"  [GPT Refine] Turn {turn}: query {fn}({args.get('field', '')})")
+            if fn == "get_field_values":
+                result_data = _qt_get_values(records, args["field"])
+            elif fn == "compute_stats":
+                result_data = _qt_compute_stats(records, args["field"])
+            else:
+                result_data = {"error": f"Unknown query tool: {fn}"}
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result_data),
+            })
+
+    print("  [GPT Refine] Max turns reached — keeping all records")
     return records
 
 
