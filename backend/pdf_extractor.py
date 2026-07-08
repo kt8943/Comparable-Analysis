@@ -1147,6 +1147,8 @@ def _gpt_extract_full_pdf(
         "- Copy property names exactly as printed — do not paraphrase or abbreviate."
     )
 
+    import time as _time
+
     n_batches = max(1, (n_pages + batch_size - 1) // batch_size)
     print(f"  [GPT-4o] {n_pages} page(s) → {n_batches} batch(es) of ≤{batch_size} "
           f"at detail='high' ...")
@@ -1170,21 +1172,32 @@ def _gpt_extract_full_pdf(
             }})
         messages = [{"role": "system", "content": system},
                     {"role": "user",   "content": user_content}]
-        try:
-            print(f"  [GPT-4o] batch {b + 1}/{n_batches} — pages {start + 1}-{end} …")
-            raw = _openai_chat(llm_cfg, messages, timeout=300)
-            raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-            raw = re.sub(r"\n?```$", "", raw)
-            m   = re.search(r"\[[\s\S]*\]", raw)
-            if not m:
-                print(f"  [GPT-4o] batch {b + 1}: no JSON array in response")
-                continue
-            extracted = json.loads(m.group(0))
-            if isinstance(extracted, list):
-                all_items.extend(x for x in extracted if isinstance(x, dict))
-        except Exception as e:
-            print(f"  [GPT-4o] batch {b + 1} failed: {e}")
-            continue
+
+        # Retry up to 3 times; on 429 rate-limit wait 65s for the TPM window to clear
+        for attempt in range(3):
+            try:
+                print(f"  [GPT-4o] batch {b + 1}/{n_batches} — pages {start + 1}-{end} …"
+                      + (f" (retry {attempt})" if attempt else ""))
+                raw = _openai_chat(llm_cfg, messages, timeout=300)
+                raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+                raw = re.sub(r"\n?```$", "", raw)
+                m   = re.search(r"\[[\s\S]*\]", raw)
+                if not m:
+                    print(f"  [GPT-4o] batch {b + 1}: no JSON array in response")
+                else:
+                    extracted = json.loads(m.group(0))
+                    if isinstance(extracted, list):
+                        all_items.extend(x for x in extracted if isinstance(x, dict))
+                break  # success — exit retry loop
+            except Exception as e:
+                err = str(e)
+                if "429" in err and attempt < 2:
+                    wait = 65
+                    print(f"  [GPT-4o] Rate limit hit — waiting {wait}s before retry ...")
+                    _time.sleep(wait)
+                else:
+                    print(f"  [GPT-4o] batch {b + 1} failed: {e}")
+                    break
     doc.close()
 
     result = []
