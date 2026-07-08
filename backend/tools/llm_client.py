@@ -69,8 +69,9 @@ def openai_chat(llm_cfg: dict, messages: list,
         raise ImportError("pip install openai")
     key    = llm_cfg.get("openai_api_key", "") or None  # None triggers env-var fallback
     model  = llm_cfg.get("openai_model", "gpt-4o-mini")
-    client = _openai.OpenAI(api_key=key)
-    kwargs: dict = {"model": model, "messages": messages, "temperature": 0}
+    # max_retries=2: auto-retry on transient connection drops (503, timeout, mid-stream close)
+    client = _openai.OpenAI(api_key=key, max_retries=2)
+    kwargs: dict = {"model": model, "messages": messages, "temperature": 0, "timeout": timeout}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     resp = client.chat.completions.create(**kwargs)

@@ -1109,7 +1109,7 @@ def _gpt_extract_full_pdf(
     subj_tokens: set,
     llm_cfg: dict,
     max_pages: int = 60,
-    batch_size: int = 8,
+    batch_size: int = 5,
 ) -> list:
     """
     GPT-4o vision path — replaces Stages 1-4 entirely for OpenAI provider.
