@@ -1110,6 +1110,7 @@ def _gpt_extract_full_pdf(
     llm_cfg: dict,
     max_pages: int = 60,
     batch_size: int = 5,
+    reject_table_headers: list = None,
 ) -> list:
     """
     GPT-4o vision path — replaces Stages 1-4 entirely for OpenAI provider.
@@ -1135,16 +1136,28 @@ def _gpt_extract_full_pdf(
     field_list  = "\n".join(f'  "{k}": {d}' for _, k, d in field_schema)
     keyword_str = ", ".join(f'"{kw}"' for kw in section_keywords[:10])
 
+    exclude_note = ""
+    if reject_table_headers:
+        kw_str = ", ".join(f'"{k}"' for k in reject_table_headers)
+        exclude_note = (
+            "\n- EXCLUDE entire tables whose column headers contain any of these "
+            f"keywords (they belong to a different comp type): {kw_str}. "
+            "For example, skip GLS / government land tender tables that have columns "
+            "like 'Type of Development Allowed', 'Successful Tender Price', 'PSF PPR', "
+            "or 'Tenderer' — those are land sales, not building/asset sales."
+        )
+
     system = (
         "You are a real estate data extraction specialist. "
         "Your skill: given PDF page images, locate every comparable transaction table, "
         "read all rows accurately, and return the data as a structured JSON array. "
         "Rules:\n"
         "- Search EVERY page — there may be multiple tables across different pages.\n"
-        "- Extract ALL rows from ALL tables found.\n"
+        "- Extract ALL rows from ALL relevant tables found.\n"
         "- Output ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
         "- One JSON object per transaction row.\n"
         "- Copy property names exactly as printed — do not paraphrase or abbreviate."
+        + exclude_note
     )
 
     import time as _time
@@ -1600,6 +1613,7 @@ def extract_pdf_records(
         records = _gpt_extract_full_pdf(
             pdf_path, section_keywords, field_schema,
             subj_tokens, llm_cfg, max_pages,
+            reject_table_headers=reject_table_headers,
         )
         records = _dedup(records) if dedup else records
         print(f"  [PDF] {len(records)} record(s) extracted")
