@@ -448,6 +448,43 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
     if not anchor_idxs:
         return rows  # no price anchors — leave rows untouched
 
+    # ── Multi-line NAME grouping ──────────────────────────────────────────────
+    # A property name can wrap over several physical rows with its PRICE anchor
+    # sitting ANYWHERE in the block (even the middle line). Pure row-distance then
+    # leaks the top lines onto the transaction above and the bottom lines onto the
+    # one below. Instead, chain consecutive name-bearing rows that read as one
+    # wrapped cell — the upper line ends mid-phrase (lowercase word / comma), or
+    # the lower line starts lowercase (a continuation tail) — and hand the whole
+    # chain to the single anchor it contains. Chains that are ambiguous (0 or >1
+    # anchors) fall back to the row-distance logic below, so common single-line
+    # tables are unaffected.
+    def _name_continues(prev: str, nxt: str) -> bool:
+        prev, nxt = prev.strip(), nxt.strip()
+        if prev.endswith((',', '&', '-', '/')):
+            return True
+        toks = prev.split()
+        if toks and toks[-1].strip('.,;:)')[:1].islower():
+            return True           # prev ends in a lowercase word → unfinished
+        return nxt[:1].islower()  # nxt is a lowercase continuation tail
+
+    _anchor_set = set(anchor_idxs)
+    _name_of = lambda r: str(r[name_col]).strip() if name_col < len(r) else ''
+    _name_rows = [i for i in range(len(rows)) if _name_of(rows[i])]
+    name_group_anchor: dict = {}
+    _k = 0
+    while _k < len(_name_rows):
+        grp = [_name_rows[_k]]
+        while (_k + 1 < len(_name_rows) and
+               _name_continues(_name_of(rows[_name_rows[_k]]),
+                               _name_of(rows[_name_rows[_k + 1]]))):
+            _k += 1
+            grp.append(_name_rows[_k])
+        _anchors_in = [g for g in grp if g in _anchor_set]
+        if len(_anchors_in) == 1:      # unambiguous chain → adopt the grouping
+            for g in grp:
+                name_group_anchor[g] = _anchors_in[0]
+        _k += 1
+
     # collected[anchor] = list of (row_idx, row) pieces that belong to that anchor.
     collected: dict = {a: [(a, rows[a])] for a in anchor_idxs}
     for i, row in enumerate(rows):
@@ -455,6 +492,13 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
             continue
         if not any(str(v or '').strip() for v in row):
             continue  # blank row
+
+        # Name-continuation chain wins over row-distance when it is unambiguous.
+        _grp_anchor = name_group_anchor.get(i)
+        if _grp_anchor is not None and _grp_anchor != i:
+            collected[_grp_anchor].append((i, row))
+            continue
+
         frag_cols = [c for c, v in enumerate(row) if str(v or '').strip()]
 
         # A name fragment beginning with a lowercase letter is the tail of the

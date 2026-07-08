@@ -380,12 +380,18 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
         llm_cfg, subject_name=subject_name,
         reject_table_headers=_LAND_TABLE_MARKERS,
         extra_exclusion_note=(
-            "Use the table's title or section heading to decide whether to extract from it. "
-            "If the heading conveys that the table is about the SALE or INVESTMENT "
-            "TRANSACTION of built properties, extract from it. "
-            "If the heading conveys that the table is about LEASING / RENTAL activity, "
-            "LAND SALES / GLS / GOVERNMENT LAND TENDERS, or any topic that is not "
-            "the completed sale of an already-built property, SKIP the entire table."
+            "Decide what a table is from its TITLE and COLUMN HEADERS only — never "
+            "from the property use/sector of individual rows. (Both residential AND "
+            "commercial land sales exist, so a row marked 'Commercial' does not make "
+            "a land-tender table in scope.) "
+            "EXTRACT from a table whose title/columns indicate the SALE or INVESTMENT "
+            "TRANSACTION of built properties (e.g. title 'Investment Sales' / 'Notable "
+            "Transactions', with a Buyer or Purchaser column). "
+            "SKIP the whole table when its title or columns indicate a Government Land "
+            "Sales (GLS) land tender — e.g. a title like 'Successful Tender' or columns "
+            "like 'Successful Tenderer', 'Date of Award', or 'psf ppr' — or Leasing / "
+            "Rental activity. Those are land or lease tables, not building sales, "
+            "regardless of whether individual rows say Residential or Commercial."
         ),
     )
     if not raw_records:
@@ -499,12 +505,15 @@ Rules:
 - Do not invent or estimate values — only extract what is visible in the image.
 - Skip header rows and average/total rows.
 - Price ranges like "600-630" should be returned as the string "600-630" (not split).
-- SCOPE — this is an ASSET SALES / INVESTMENT analysis. Use the table's title,
-  section heading, or the overall meaning of its content to decide whether to extract
-  from it. If the table is about the SALE or INVESTMENT TRANSACTION of a built
-  property, extract from it. If the table is about LEASING / RENTAL activity, LAND
-  SALES / GLS / GOVERNMENT LAND TENDERS, or any other topic that is not the completed
-  sale of a built property, SKIP the entire table and return an empty array [].
+- SCOPE — this is an ASSET SALES / INVESTMENT analysis. Decide what the table is from
+  its TITLE and COLUMN HEADERS only — never from the property use/sector of individual
+  rows (both residential AND commercial land sales exist, so a 'Commercial' row does
+  not make a land-tender table in scope). EXTRACT when the title/columns indicate the
+  SALE or INVESTMENT TRANSACTION of built properties (e.g. 'Investment Sales' / 'Notable
+  Transactions', with a Buyer/Purchaser column). SKIP the whole table (return []) when
+  the title or columns indicate a Government Land Sales (GLS) land tender — e.g. title
+  'Successful Tender' or columns 'Successful Tenderer' / 'Date of Award' / 'psf ppr' —
+  or Leasing / Rental activity.
 - Extract raw numeric values exactly as shown — do NOT convert units. Python handles
   all unit conversion (sqm to sqft, SGD million to billion) after extraction.
 """
