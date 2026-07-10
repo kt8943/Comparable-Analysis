@@ -39,10 +39,10 @@ Session state keys used across this file
 -----------------------------------------
   nd_step            : int  — which step of the New Deal wizard is active (1 or 2)
   nd_preview_fields  : dict — LLM-derived field values waiting for user review
-  main_nav           : str  — which top-level nav item is selected
+  active_page        : str  — active nav item: new_deal | existing | overview | comps | rationale
   deal_nav           : str  — which existing deal is selected in the Existing Deals sidebar
-  sb_analysis_model  : str  — selected analysis model display string (sidebar)
-  sb_search_model    : str  — selected online-search model (sidebar)
+  ao_deal_select     : str  — deal selectbox in the Analysis Output workspace
+  sb_analysis_model  : str  — analysis model (⚙️ Shared Settings); also drives online search
   comp_deal          : str  — last selected deal in the Comps section
   comp_deal_select   : str  — selectbox state in render_comparable_analysis
   comp_type_radio    : str  — which comp type tab is active
@@ -171,6 +171,47 @@ st.markdown("""
     background-color : #ffffff !important;
     color            : #1A3A5C !important;
     border           : 1px solid #1A3A5C !important;
+}
+/* Keep the PRIMARY (active-page) nav button legible: lighter-navy fill, white
+   text, and don't invert to white on hover/focus. Covers both the `kind`
+   attribute and the stBaseButton-primary testid used by Streamlit 1.58. */
+[data-testid="stSidebar"] button[kind="primary"],
+[data-testid="stSidebar"] button[kind="primary"]:hover,
+[data-testid="stSidebar"] button[kind="primary"]:active,
+[data-testid="stSidebar"] button[kind="primary"]:focus,
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"],
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:hover,
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:active,
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:focus {
+    background-color : #2E5A85 !important;
+    color            : #ffffff !important;
+    border           : 1px solid #ffffff !important;
+}
+
+/* ── Sidebar expander headers (Shared Settings / nav groups) ──
+   Keep the dark sidebar background; never flash white on click / focus /
+   open. Only a subtle translucent tint on hover. */
+[data-testid="stSidebar"] [data-testid="stExpander"] {
+    background-color: transparent !important;
+    border: 1px solid rgba(255,255,255,0.18) !important;
+}
+[data-testid="stSidebar"] [data-testid="stExpander"] details,
+[data-testid="stSidebar"] [data-testid="stExpander"] details[open],
+[data-testid="stSidebar"] [data-testid="stExpander"] summary,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary:focus,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary:active,
+[data-testid="stSidebar"] [data-testid="stExpander"] details[open] > summary,
+[data-testid="stSidebar"] [data-testid="stExpanderHeader"],
+[data-testid="stSidebar"] .streamlit-expanderHeader {
+    background-color: transparent !important;
+    color: #ffffff !important;
+    box-shadow: none !important;
+}
+[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover,
+[data-testid="stSidebar"] [data-testid="stExpanderHeader"]:hover,
+[data-testid="stSidebar"] .streamlit-expanderHeader:hover {
+    background-color: rgba(255,255,255,0.10) !important;
+    color: #ffffff !important;
 }
 
 /* ── Sidebar radio as nav menu ───────────────────────────── */
@@ -351,9 +392,8 @@ def _apply_model_overrides(cfg: dict) -> dict:
     _raw_vision    = st.session_state.get("sb_vision_model", "")
     vision_model   = ("" if _raw_vision.startswith("──")
                       else _parse_model_name(_raw_vision))
-    search_model   = st.session_state.get("sb_search_model", "")
 
-    if not analysis_model and not search_model and not vision_model:
+    if not analysis_model and not vision_model:
         return cfg  # nothing to patch
 
     import copy
@@ -371,6 +411,18 @@ def _apply_model_overrides(cfg: dict) -> dict:
             cfg.setdefault("llm", {})["provider"] = "ollama"
             cfg.setdefault("llm", {}).setdefault("ollama", {})["model"] = analysis_model
 
+        # Online search is folded into the analysis-model choice. Web search only
+        # runs on OpenAI search-preview models (Ollama can't browse), so map the
+        # analysis model to the matching search + extract models: gpt-4o → the
+        # full search model, everything else (mini / Ollama / rule-based) → the
+        # cheaper mini search model.
+        if analysis_model == "gpt-4o":
+            cfg.setdefault("openai", {})["search_model"]  = "gpt-4o-search-preview"
+            cfg.setdefault("openai", {})["extract_model"] = "gpt-4o"
+        else:
+            cfg.setdefault("openai", {})["search_model"]  = "gpt-4o-mini-search-preview"
+            cfg.setdefault("openai", {})["extract_model"] = "gpt-4o-mini"
+
     if vision_model:
         if vision_model in _OPENAI_VISION_MODELS:
             cfg.setdefault("llm", {})["openai_vision_model"] = vision_model
@@ -379,18 +431,18 @@ def _apply_model_overrides(cfg: dict) -> dict:
             # the fast analysis model while image tasks use the vision model.
             cfg.setdefault("llm", {}).setdefault("ollama", {})["vision_model"] = vision_model
 
-    if search_model:
-        cfg.setdefault("openai", {})["search_model"]  = search_model
-        cfg.setdefault("openai", {})["extract_model"] = (
-            "gpt-4o-mini" if "mini" in search_model else "gpt-4o"
-        )
-
     return cfg
 
 
 def _run_script(script: str, config_path: str, flags: list = None,
-                expand_log: bool = False, log_state_key: str = None) -> bool:
-    """Run a backend script, injecting the sidebar LLM model overrides into the config."""
+                expand_log: bool = False, log_state_key: str = None,
+                stream_live: bool = True) -> bool:
+    """Run a backend script, injecting the sidebar LLM model overrides into the config.
+
+    ``stream_live`` — when True (default), the last 40 log lines stream into a live
+    box during the run. Set False (e.g. on the Overview) to show only the one-line
+    'Running … [model] …' spinner; the full log stays in the collapsed run-log
+    expander for manual inspection."""
     cfg      = load_config(config_path)
     patched  = _apply_model_overrides(cfg)
 
@@ -421,7 +473,9 @@ def _run_script(script: str, config_path: str, flags: list = None,
     # Stream stdout+stderr line-by-line into a live-updating box so long-running
     # scripts (e.g. Online Search) show progress instead of a silent spinner.
     _lines, _live = [], st.empty()
-    with st.spinner(f"Running `{script}`{model_label} … (live log below)"):
+    _spin = (f"Running `{script}`{model_label} … (live log below)" if stream_live
+             else f"Running `{script}`{model_label} …")
+    with st.spinner(_spin):
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace", cwd=str(ROOT), env=_child_env,
@@ -429,7 +483,8 @@ def _run_script(script: str, config_path: str, flags: list = None,
         )
         for _ln in proc.stdout:
             _lines.append(_ln.rstrip("\n"))
-            _live.code("\n".join(_lines[-40:]), language="text")   # last 40 lines, snappy
+            if stream_live:
+                _live.code("\n".join(_lines[-40:]), language="text")   # last 40 lines, snappy
         proc.wait()
     _live.empty()   # replace the live tail with the full expander below
     out, returncode = "\n".join(_lines), proc.returncode
@@ -1900,30 +1955,37 @@ def _markdown_to_docx(md_text: str) -> bytes:
         sec.top_margin   = Inches(1.0)
         sec.bottom_margin = Inches(1.0)
 
-    import re as _re
+    _append_markdown_to_doc(doc, md_text)
 
+    _apply_docx_font(doc, "Arial Narrow", 10)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def _append_markdown_to_doc(doc, md_text: str):
+    """Append markdown (headings, paragraphs, metadata lines) to an existing
+    python-docx Document. Shared by _markdown_to_docx and _build_combined_docx."""
+    import re as _re
+    from docx.shared import Inches
     for line in md_text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-
-        # Headings
         if stripped.startswith("### "):
             doc.add_heading(stripped[4:].strip(), level=3)
         elif stripped.startswith("## "):
             doc.add_heading(stripped[3:].strip(), level=2)
         elif stripped.startswith("# "):
             doc.add_heading(stripped[2:].strip(), level=1)
-        # Horizontal rule
         elif stripped == "---":
             doc.add_paragraph("─" * 60)
-        # Blockquote (source audit note)
         elif stripped.startswith("> "):
             p = doc.add_paragraph()
             run = p.add_run(stripped[2:].strip())
             run.italic = True
             p.paragraph_format.left_indent = Inches(0.4)
-        # Metadata lines: **Key:** value
         elif stripped.startswith("**") and ":**" in stripped:
             p = doc.add_paragraph()
             m = _re.match(r'\*\*(.+?):\*\*\s*(.*)', stripped)
@@ -1933,10 +1995,480 @@ def _markdown_to_docx(md_text: str) -> bytes:
                 p.add_run(m.group(2))
             else:
                 p.add_run(stripped)
-        # Normal paragraph
         else:
             doc.add_paragraph(stripped)
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PGIM styled comp table  +  combined-report export  (used by the Overview)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_PGIM_NAVY = "#1F3864"
+
+# Output prefix → (section heading, export section title, subject banner, comps
+# banner, average-column keywords). Single source of truth for the three comp
+# types across the Overview preview and the combined Word export. Order here is
+# the render order (Rent → Asset Sales → Land; Investment Rationale follows).
+_COMP_TYPES = [
+    ("Rent_Comps",              "Rent Comparables",
+     "Rent Comparables",
+     "Subject Rents", "Leasing Comparables", ("psf",)),
+    ("Transaction_Comparables", "Transaction Comparables (Asset Sales)",
+     "Transaction Comparables (Asset Sales)",
+     "Subject Sales", "Comparable Asset Sales", ("psf", "cap rate", "capitalisation")),
+    ("Land_Sale_Comps",         "Transaction Comparables (Land Sales)",
+     "Transaction Comparables (Land Sales)",
+     "Subject Land Sales", "Comparable Land Sales", ("psf", "tenure")),
+]
+
+
+def _input_list(v) -> list:
+    """Config input value → list of paths (handles str, list, or None)."""
+    if not v:
+        return []
+    return [v] if isinstance(v, str) else list(v)
+
+
+def _rationale_body(md_text: str) -> str:
+    """Return just the rationale prose — strip the metadata header block
+    (title / Address / Asset Class / Country / Generated / Market Reports Used /
+    the LLM-generated notice) and the '## Input Summary' section. Used by the
+    Overview preview and the Word export; the detail subtab shows the full doc."""
+    lines = md_text.splitlines()
+    # 1) Drop the leading metadata block — everything up to & incl. the first '---'.
+    start = 0
+    for i, ln in enumerate(lines):
+        if ln.strip() == "---":
+            start = i + 1
+            break
+    rest = lines[start:]
+    # 2) If an 'Input Summary' section leads, drop it up to & incl. its closing '---'.
+    j = 0
+    while j < len(rest) and not rest[j].strip():
+        j += 1
+    if j < len(rest) and rest[j].strip().lower().lstrip("# ").startswith("input summary"):
+        k = j + 1
+        while k < len(rest) and rest[k].strip() != "---":
+            k += 1
+        rest = rest[k + 1:]
+    return "\n".join(rest).strip()
+
+
+def _save_uploads_append(cfg: dict, excel_key: str, pdf_key: str, image_key: str,
+                         uploaded_files) -> dict:
+    """Save uploaded files to Input_files/ and UNION them into the config's input
+    lists (append, not replace — deduped by path). Mutates and returns cfg."""
+    img_exts = {".png", ".jpg", ".jpeg"}
+    buckets = {excel_key: _input_list(cfg.get(excel_key)),
+               pdf_key:   _input_list(cfg.get(pdf_key)),
+               image_key: _input_list(cfg.get(image_key))}
+    for uf in uploaded_files:
+        suf = Path(uf.name).suffix.lower()
+        key = image_key if suf in img_exts else (pdf_key if suf == ".pdf" else excel_key)
+        sp = ROOT / "Input_files" / uf.name
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_bytes(uf.getvalue())
+        rel = str(sp.relative_to(ROOT))
+        if rel not in buckets[key]:
+            buckets[key].append(rel)
+    for k, v in buckets.items():
+        if v:
+            cfg[k] = v[0] if len(v) == 1 else v
+    return cfg
+
+
+def _compute_average(header, comps, keywords):
+    """Compute an Average row from the comp rows for columns whose header matches
+    any keyword (e.g. 'psf', 'cap rate', 'tenure'). Needed because the Excel's
+    =AVERAGEIF formulas have no cached value when read via openpyxl data_only."""
+    if not comps or not keywords:
+        return None
+    avg = [""] * len(header)
+    if header:
+        avg[0] = "Average"
+    any_val = False
+    for j, h in enumerate(header):
+        if not any(k in h.lower() for k in keywords):
+            continue
+        nums, had_pct = [], False
+        for row in comps:
+            if j < len(row):
+                raw = str(row[j]).strip()
+                if "%" in raw:
+                    had_pct = True
+                v = raw.replace(",", "").replace("%", "").strip()
+                try:
+                    nums.append(float(v))
+                except ValueError:
+                    pass
+        if nums:
+            m = sum(nums) / len(nums)
+            s = f"{m:,.1f}" if abs(m) < 1000 else f"{m:,.0f}"
+            avg[j] = (s + "%") if had_pct else s
+            any_val = True
+    return avg if any_val else None
+
+
+def _read_pgim_grid(excel_path, avg_keywords=None):
+    """Read a formatted comp Excel into a structured PGIM layout (values only —
+    colours are applied by row role downstream):
+        {"header": [labels], "subject": [[vals], ...],
+         "comps":  [[vals], ...], "average": [vals] | None}
+    Column order is preserved and the internal 'Source' column is dropped. If the
+    Excel's average row is empty (formula with no cached value), an Average row is
+    computed from the comps for the columns matching ``avg_keywords``."""
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+    try:
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
+    except Exception:
+        return None
+    ws = wb.active
+    hidden = {i for i in range(1, ws.max_column + 1)
+              if ws.column_dimensions.get(get_column_letter(i),
+                 type("_", (), {"hidden": False})()).hidden}
+    rows = list(ws.iter_rows())
+
+    def _vis(row):
+        return [c for j, c in enumerate(row, 1) if j not in hidden]
+
+    def _is_avg_fill(cell):
+        try:
+            rgb = cell.fill.fgColor.rgb
+            return isinstance(rgb, str) and rgb.upper().endswith("D6DCE4")
+        except Exception:
+            return False
+
+    # First column-header row (contains 'property' + 'marker').
+    header_idx = None
+    for i, row in enumerate(rows):
+        strs = [str(c.value or "").lower() for c in _vis(row)]
+        if (sum(1 for s in strs if s) >= 3
+                and any("property" in s for s in strs)
+                and any("marker" in s for s in strs)):
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+
+    vis_header = _vis(rows[header_idx])
+    # Hide the internal "Source" column from the PGIM view + Word export.
+    drop = {idx for idx, c in enumerate(vis_header)
+            if str(c.value or "").strip().lower() == "source"}
+
+    def _keep(cells):
+        return [c for idx, c in enumerate(cells) if idx not in drop]
+
+    def _vals(cells):
+        return ["" if c.value in (None, "") else str(c.value).replace("\n", " ").strip()
+                for c in _keep(cells)]
+
+    def _is_header(cells):
+        low = [str(c.value or "").lower() for c in _keep(cells)]
+        return any("property" in s for s in low) and any("marker" in s for s in low)
+
+    def _is_blank(cells):
+        return all(c.value in (None, "") for c in _keep(cells))
+
+    def _is_average(cells):
+        if any(str(c.value or "").strip().lower() == "average" for c in _keep(cells)):
+            return True
+        return any(_is_avg_fill(c) for c in cells)
+
+    header = [str(c.value or "").replace("\n", " ").strip() for c in _keep(vis_header)]
+    subject, comps, average = [], [], None
+    phase = 0  # 0 = subject block, 1 = comps block (after the blank / repeat header)
+    for row in rows[header_idx + 1:]:
+        cells = _vis(row)
+        if _is_average(cells):
+            _v = _vals(cells)
+            if any(_v):                       # keep only a non-empty average row
+                average = _v
+            phase = 1
+            continue
+        if _is_blank(cells):
+            if phase == 0 and subject:        # blank after the subject block
+                phase = 1
+            continue
+        if _is_header(cells):                 # repeated header before comps
+            phase = 1
+            continue
+        (subject if phase == 0 else comps).append(_vals(cells))
+    if not average:                       # Excel formula average → compute here
+        average = _compute_average(header, comps, avg_keywords)
+    return {"header": header, "subject": subject, "comps": comps, "average": average}
+
+
+def _fg_for(bg_hex) -> str:
+    """White or navy text for a given background hex, chosen for contrast."""
+    if not bg_hex:
+        return "#1A3A5C"
+    try:
+        r, g, b = int(bg_hex[1:3], 16), int(bg_hex[3:5], 16), int(bg_hex[5:7], 16)
+        return "#ffffff" if (0.299 * r + 0.587 * g + 0.114 * b) < 140 else "#1A3A5C"
+    except Exception:
+        return "#1A3A5C"
+
+
+def _pgim_table_html(excel_path, subject_banner: str, comp_banner: str,
+                     avg_keywords=None):
+    """Formatted comp Excel → static PGIM-standard HTML table:
+       navy banner → column names → subject → blank → navy banner → comps →
+       grey bold average. None if unreadable."""
+    import html as _html
+    grid = _read_pgim_grid(excel_path, avg_keywords)
+    if not grid or not grid["header"]:
+        return None
+    header = grid["header"]
+    ncol = len(header)
+    # Horizontal rules only (no vertical lines). Banners left, other cells centered.
+    _cb = "border-bottom:1px solid #cfd8e3;padding:5px 9px;text-align:left;"
+    _cd = "border-bottom:1px solid #cfd8e3;padding:5px 9px;text-align:center;"
+
+    def _banner(text):
+        return (f'<tr><td colspan="{ncol}" style="{_cb}background:{_PGIM_NAVY};'
+                f'color:#ffffff;font-weight:700;">{_html.escape(text)}</td></tr>')
+
+    def _row(vals, bold=False, bg="#ffffff"):
+        vals = (list(vals) + [""] * ncol)[:ncol]
+        w = "font-weight:700;" if bold else ""
+        tds = "".join(f'<td style="{_cd}background:{bg};color:#000000;{w}">'
+                      f'{_html.escape(v)}</td>' for v in vals)
+        return f"<tr>{tds}</tr>"
+
+    out = ['<div style="overflow-x:auto">',
+           '<table style="border-collapse:collapse;width:100%;'
+           'font-family:Segoe UI,Arial,sans-serif;font-size:12px;">']
+    out.append(_banner(subject_banner))
+    out.append(_row(header, bold=True))               # column names — black, no fill
+    for s in grid["subject"]:
+        out.append(_row(s))
+    out.append(f'<tr><td colspan="{ncol}" style="border:0;height:10px;"></td></tr>')
+    out.append(_banner(comp_banner))
+    for c in grid["comps"]:
+        out.append(_row(c))
+    if grid["average"]:
+        out.append(_row(grid["average"], bold=True, bg="#D6DCE4"))
+    out.append("</table></div>")
+    return "".join(out)
+
+
+def _set_cell_bg(cell, hex_no_hash: str):
+    """Shade a python-docx table cell (adds a w:shd element)."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_no_hash)
+    tcPr.append(shd)
+
+
+def _table_horizontal_borders(table, color: str = "808080", sz: str = "4"):
+    """Horizontal rules only — remove all vertical (inner + outer) lines."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    tblPr = table._tbl.tblPr
+    for existing in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(existing)
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "bottom", "insideH"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single"); el.set(qn("w:sz"), sz)
+        el.set(qn("w:space"), "0"); el.set(qn("w:color"), color)
+        borders.append(el)
+    for edge in ("left", "right", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "none"); el.set(qn("w:sz"), "0")
+        el.set(qn("w:space"), "0"); el.set(qn("w:color"), "auto")
+        borders.append(el)
+    tblPr.append(borders)
+
+
+def _add_pgim_table_to_doc(doc, excel_path, subject_banner: str, comp_banner: str,
+                           avg_keywords=None) -> bool:
+    """Add a native PGIM-standard Word table: navy banner → column names →
+    subject → blank → navy banner → comps → grey bold average. Horizontal rules
+    only (no vertical lines); every cell centered except the navy banners."""
+    from docx.shared import RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+    grid = _read_pgim_grid(excel_path, avg_keywords)
+    if not grid or not grid["header"]:
+        return False
+    header = grid["header"]
+    ncol = len(header)
+
+    # Ordered row plan: (kind, values)
+    seq = [("banner", subject_banner), ("header", header)]
+    seq += [("data", s) for s in grid["subject"]]
+    seq.append(("blank", None))
+    seq.append(("banner", comp_banner))
+    seq += [("data", c) for c in grid["comps"]]
+    if grid["average"]:
+        seq.append(("average", grid["average"]))
+
+    table = doc.add_table(rows=len(seq), cols=ncol)
+    _table_horizontal_borders(table)
+
+    for ridx, (kind, vals) in enumerate(seq):
+        row = table.rows[ridx]
+        if kind == "banner":
+            merged = row.cells[0]
+            for j in range(1, ncol):
+                merged = merged.merge(row.cells[j])
+            merged.text = vals
+            merged.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            _set_cell_bg(merged, _PGIM_NAVY.lstrip("#"))
+            for p in merged.paragraphs:               # banner stays left-aligned
+                for r in p.runs:
+                    r.font.bold = True
+                    r.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+            continue
+        if kind == "blank":
+            continue                                   # empty separator row
+        cvals = (list(vals) + [""] * ncol)[:ncol]
+        grey = kind == "average"
+        bold = kind in ("header", "average")
+        for j, v in enumerate(cvals):
+            cell = row.cells[j]
+            cell.text = v
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            if grey:
+                _set_cell_bg(cell, "D6DCE4")
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for r in p.runs:
+                    if bold:
+                        r.font.bold = True
+                    r.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+    return True
+
+
+def _apply_docx_font(doc, name: str = "Arial Narrow", size_pt: float = 10):
+    """Force one font + size across the whole document — the Normal/heading
+    styles plus every run in body paragraphs and table cells. Colour and bold
+    already set on runs are preserved (only name + size are changed)."""
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+    for style_name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3"):
+        try:
+            stl = doc.styles[style_name]
+            stl.font.name = name
+            stl.font.size = Pt(size_pt)
+            stl.font.italic = False
+        except Exception:
+            pass
+
+    def _set_runs(paragraphs):
+        for p in paragraphs:
+            for r in p.runs:
+                r.font.name = name
+                r.font.size = Pt(size_pt)
+                r.font.italic = False       # kill any inherited italic
+                # Pin the East-Asian / complex-script slots too, so Word doesn't
+                # substitute a different face for any character.
+                try:
+                    rpr = r._element.get_or_add_rPr()
+                    rfonts = rpr.find(qn("w:rFonts"))
+                    if rfonts is None:
+                        rfonts = rpr.makeelement(qn("w:rFonts"), {})
+                        rpr.append(rfonts)
+                    for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+                        rfonts.set(qn(attr), name)
+                except Exception:
+                    pass
+
+    _set_runs(doc.paragraphs)
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:      # tight rows — no para spacing
+                    p.paragraph_format.space_before = Pt(0)
+                    p.paragraph_format.space_after = Pt(0)
+                _set_runs(cell.paragraphs)
+
+
+def _png_size(path):
+    """(width, height) in pixels from a PNG header, else (None, None)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+        if len(head) >= 24 and head[:8] == b"\x89PNG\r\n\x1a\n":
+            import struct
+            return struct.unpack(">II", head[16:24])
+    except Exception:
+        pass
+    return None, None
+
+
+def _add_map_fit(doc, map_path, usable_w, usable_h):
+    """Insert a map scaled to the largest size that fits the content box
+    (usable_w × usable_h), preserving aspect ratio."""
+    _pw, _ph = _png_size(str(map_path))
+    try:
+        if _pw and _ph and (_pw / _ph) < (usable_w / usable_h):
+            doc.add_picture(str(map_path), height=usable_h)   # tall image → cap height
+        else:
+            doc.add_picture(str(map_path), width=usable_w)    # wide image → fill width
+    except Exception:
+        try:
+            doc.add_picture(str(map_path), width=usable_w)
+        except Exception:
+            pass
+
+
+def _build_combined_docx(deal_name: str, cfg: dict):
+    """One Word file: Sales / Land / Rent PGIM tables + location maps, then the
+    Investment Rationale. Returns docx bytes, or None if there is nothing yet."""
+    from docx import Document
+    from docx.shared import Inches, Cm
+    from docx.enum.section import WD_ORIENT
+    out_dir = ROOT / Path(cfg.get("output_file", "output/x/x.xlsx")).parent
+    subj = cfg.get("subject_property", {})
+
+    doc = Document()
+    for sec in doc.sections:
+        # US Letter, landscape (27.94 cm × 21.59 cm). python-docx needs the
+        # width/height swapped manually when setting orientation.
+        sec.orientation = WD_ORIENT.LANDSCAPE
+        sec.page_width  = Cm(27.94)
+        sec.page_height = Cm(21.59)
+        sec.left_margin = sec.right_margin = Inches(0.5)
+        sec.top_margin  = sec.bottom_margin = Inches(0.5)
+    _sec0 = doc.sections[0]
+    _usable_w = _sec0.page_width - _sec0.left_margin - _sec0.right_margin
+    _usable_h = _sec0.page_height - _sec0.top_margin - _sec0.bottom_margin
+    doc.add_heading(subj.get("property_name", deal_name), level=0)
+    if subj.get("address"):
+        doc.add_paragraph(subj["address"])
+
+    any_content = False
+    for prefix, _heading, title, _sub_banner, _comp_banner, _avg_kw in _COMP_TYPES:
+        xls, used = _latest_comp_excel(out_dir, prefix)
+        if not xls:
+            continue
+        any_content = True
+        doc.add_heading(title, level=1)
+        _add_pgim_table_to_doc(doc, str(xls), _sub_banner, _comp_banner, _avg_kw)
+        maps = sorted(out_dir.glob(f"{used}*_map.png"))
+        if maps:
+            _add_map_fit(doc, maps[-1], _usable_w, _usable_h)
+
+    rat = out_dir / "Investment_Rationale.md"
+    if rat.exists():
+        any_content = True
+        doc.add_page_break()
+        doc.add_heading("Investment Rationale", level=1)
+        try:
+            _append_markdown_to_doc(doc, _rationale_body(rat.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    if not any_content:
+        return None
+    _apply_docx_font(doc, "Arial Narrow", 10)
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -2062,16 +2594,8 @@ for _k, _v in {"nd_step": 1, "nd_preview_fields": None}.items():
 
 deals = load_deals()
 
-# Apply any programmatic navigation requests BEFORE the radio widget is
-# instantiated — writing to a widget key after instantiation is forbidden
-# in Streamlit. Instead, other code sets st.session_state["_nav_goto"] and
-# we move it here to the correct key before the widget sees it.
-if "_nav_goto" in st.session_state:
-    st.session_state["main_nav"] = st.session_state.pop("_nav_goto")
-
 with st.sidebar:
-    st.markdown("## 🏢 PGIM")
-    st.caption("Deal Analysis Platform")
+    st.markdown("## 🏢 IC Preparation @ PGIM")
     st.divider()
 
     # ── Shared Settings ───────────────────────────────────────────────────────
@@ -2166,110 +2690,79 @@ with st.sidebar:
                 st.success("Saved")
             except Exception as e:
                 st.error(f"Save failed: {e}")
-    st.divider()
 
-    # Top-level nav
-    main_nav = st.radio(
-        "nav",
-        ["🏗️  New Deal", "📁  Existing Deals",
-         "📋  Comparable Analysis", "✍️  Investment Rationale"],
-        key="main_nav",
-    )
-
-    # ── Existing Deals sub-nav: deal list under 📁 tab ───────────────────────
-    if main_nav.startswith("📁"):
+        # ── Analysis model (also drives online search) ───────────────────────
         st.divider()
-        st.markdown("<div style='font-size:11px;letter-spacing:1px;"
-                    "font-weight:700;opacity:0.7;margin-bottom:6px'>"
-                    "YOUR DEALS</div>", unsafe_allow_html=True)
-
-        if deals:
-            selected_deal_nav = st.radio(
-                "deals",
-                list(deals.keys()),
-                key="deal_nav",
-            )
-        else:
-            st.caption("No deals yet — create one in **New Deal**.")
-            selected_deal_nav = None
-    else:
-        selected_deal_nav = None
-
+        st.markdown(
+            "<div style='font-size:11px;letter-spacing:1px;font-weight:700;"
+            "opacity:0.7;margin-bottom:6px'>ANALYSIS MODEL</div>",
+            unsafe_allow_html=True,
+        )
+        _ollama_url    = _ollama_base_url()
+        _ollama_models = _list_ollama_models(_ollama_url)
+        _raw_ollama    = _sort_models_by_speed(_ollama_models) if _ollama_models else []
+        _analysis_opts = [_fmt_model(m) for m in _raw_ollama]
+        _analysis_opts += [_fmt_model(m) for m in _OPENAI_ANALYSIS_MODELS]
+        _analysis_opts += [_NO_LLM_OPTION]
+        st.selectbox(
+            "🤖 Analysis model",
+            _analysis_opts,
+            index=0,
+            key="sb_analysis_model",
+            help="Drives comps scanning, investment rationale, new-deal setup, and "
+                 "online search. A GPT selection also runs AI web search on the "
+                 "matching OpenAI search model; Ollama / rule-based selections fall "
+                 "back to gpt-4o-mini for the online-search step only.",
+        )
+        _active_analysis = _parse_model_name(
+            st.session_state.get("sb_analysis_model",
+                                 _analysis_opts[0] if _analysis_opts else ""))
+        _is_openai = _active_analysis in _OPENAI_ANALYSIS_MODELS
+        if not _ollama_models and not _is_openai:
+            st.caption("⚠️ Ollama not detected — start Ollama or pick a GPT model.")
+        if _is_openai and not os.environ.get("OPENAI_API_KEY"):
+            st.caption("⚠️ OpenAI API key not set — add it in the fields above.")
     st.divider()
 
-    # ── LLM Model selector ───────────────────────────────────────────────────
-    st.markdown(
-        "<div style='font-size:11px;letter-spacing:1px;font-weight:700;"
-        "opacity:0.7;margin-bottom:6px'>LLM MODELS</div>",
-        unsafe_allow_html=True,
-    )
+    # Top-level nav — two collapsible groups styled like Shared Settings above:
+    #   • Analysis Output  → Overview + Comparable Analysis + Investment Rationale
+    #   • Deal List        → New Deal + Existing Deals
+    # A single ``active_page`` drives the router; the active item is highlighted
+    # (primary button) and its group auto-expands.
+    _active = st.session_state.setdefault("active_page", "new_deal")
 
-    # Analysis model — always driven by sidebar selection, never by config file
-    ollama_url    = _ollama_base_url()
-    ollama_models = _list_ollama_models(ollama_url)
+    def _nav_item(label, page_id, key):
+        if st.button(label, use_container_width=True, key=key,
+                     type=("primary"
+                           if st.session_state.get("active_page") == page_id
+                           else "secondary")):
+            st.session_state["active_page"] = page_id
+            st.rerun()
 
-    # Build display options: installed Ollama models (speed-ordered) + OpenAI + rule-based
-    raw_ollama_opts = _sort_models_by_speed(ollama_models) if ollama_models else []
-    analysis_opts   = [_fmt_model(m) for m in raw_ollama_opts]
-    analysis_opts  += [_fmt_model(m) for m in _OPENAI_ANALYSIS_MODELS]
-    analysis_opts  += [_NO_LLM_OPTION]
+    with st.expander("📊  Analysis Output",
+                     expanded=_active in ("overview", "comps", "rationale")):
+        _nav_item("📊  Overview",              "overview",  "nav_overview")
+        _nav_item("📋  Comparable Analysis",   "comps",     "nav_comps")
+        _nav_item("✍️  Investment Rationale",  "rationale", "nav_rationale")
 
-    # Default = first installed Ollama model (index 0), no dependency on any config file
-    a_default_idx = 0
+    with st.expander("📁  Deal List",
+                     expanded=_active in ("new_deal", "existing")):
+        _nav_item("🏗️  New Deal",       "new_deal", "nav_new_deal")
+        _nav_item("📁  Existing Deals",  "existing", "nav_existing")
+        if st.session_state.get("active_page") == "existing":
+            st.markdown("<div style='font-size:11px;letter-spacing:1px;"
+                        "font-weight:700;opacity:0.7;margin:6px 0'>"
+                        "YOUR DEALS</div>", unsafe_allow_html=True)
+            if deals:
+                st.selectbox("deals", list(deals.keys()),
+                             key="deal_nav", label_visibility="collapsed")
+            else:
+                st.caption("No deals yet — create one in **New Deal**.")
 
-    st.selectbox(
-        "🤖 Analysis model",
-        analysis_opts,
-        index=a_default_idx,
-        key="sb_analysis_model",
-        help="Used for comps scanning, investment rationale, and new deal setup.",
-    )
-
-    # Vision model — only used when processing image/screenshot uploads.
-    # Filtered to show only vision-capable models + OpenAI options.
-    vision_ollama  = [m for m in raw_ollama_opts
-                      if any(kw in m.lower() for kw in _VISION_MODEL_KEYWORDS)]
-    vision_opts    = [_fmt_model(m) for m in vision_ollama]
-    vision_opts   += [_fmt_model(m) for m in _OPENAI_VISION_MODELS]
-    if not vision_opts:
-        vision_opts = ["── none installed  (run: ollama pull minicpm-v) ──"]
-
-    st.selectbox(
-        "👁️ Vision model",
-        vision_opts,
-        index=0,
-        key="sb_vision_model",
-        help="Used only for image/screenshot uploads. Run 'ollama pull minicpm-v' to install locally.",
-    )
-
-    # Online search model (OpenAI only)
-    default_search = "gpt-4o-mini-search-preview"
-    try:
-        s_default_idx = _OPENAI_SEARCH_MODELS.index(default_search)
-    except ValueError:
-        s_default_idx = 0
-
-    st.selectbox(
-        "🌐 Online search model",
-        _OPENAI_SEARCH_MODELS,
-        index=s_default_idx,
-        key="sb_search_model",
-        help="Used for AI-powered online comparable search (OpenAI only).",
-    )
-
-    # Derive active model names (still needed by _apply_model_overrides / _run_script)
-    active_analysis = _parse_model_name(
-        st.session_state.get("sb_analysis_model", analysis_opts[0] if analysis_opts else "")
-    )
-    is_openai = active_analysis in _OPENAI_ANALYSIS_MODELS
-
-    # Warn if Ollama is unreachable and an Ollama model is selected
-    if not ollama_models and not is_openai:
-        st.caption("⚠️ Ollama not detected — start Ollama or select a GPT model above.")
-
-    # Remind user to set key if an OpenAI model is selected but no key is configured
-    if is_openai and not os.environ.get("OPENAI_API_KEY"):
-        st.caption("⚠️ OpenAI API key not set — add it in ⚙️ Shared Settings above.")
+    # Vision + online-search model selectors have been retired from the sidebar.
+    # The single Analysis model in ⚙️ Shared Settings now drives everything,
+    # including online search (see _apply_model_overrides). The vision code path
+    # (sb_vision_model) remains intact and simply defaults to no override.
 
 
 
@@ -2601,9 +3094,15 @@ def _ensure_adhoc_config(name: str, addr: str, asset_class: str, country: str) -
     return str(path)
 
 
-def render_comparable_analysis():
+def render_comparable_analysis(deal_name=None, config_path=None):
     """
     ROUTE C — Run comparable analysis for a selected deal.
+
+    Called two ways:
+      • Embedded (deal_name + config_path given) — as the 📋 subtab of the
+        Analysis Output workspace; the deal is already chosen, so the internal
+        subject-source selector is skipped.
+      • Standalone (no args) — legacy path with its own subject picker.
 
     The user picks a deal from the selectbox at the top, then selects one of
     three comp types via a radio button:
@@ -2637,7 +3136,8 @@ def render_comparable_analysis():
     files (Excel preview table + map) below the buttons, persisting across
     Streamlit re-runs so the results stay visible without re-running.
     """
-    st.title("📋  Comparable Analysis")
+    if deal_name is None:
+        st.title("📋  Comparable Analysis")
 
     # On the shared cloud link the filesystem is wiped on restart, so remind users
     # to export. Detected via Streamlit Cloud's /mount/src path (no-op on a server).
@@ -2647,43 +3147,50 @@ def render_comparable_analysis():
 
     # Subject can come from an existing deal, OR be keyed in ad-hoc (no full New
     # Deal setup needed) — just a name / location.
-    _modes = (["📁  Existing deal", "✏️  New subject property"] if deals
-              else ["✏️  New subject property"])
-    _mode = st.radio("Subject property source", _modes, horizontal=True,
-                     key="comp_subject_mode")
-
-    if _mode.startswith("📁") and deals:
-        default_idx = 0
-        if "comp_deal" in st.session_state and st.session_state["comp_deal"] in deals:
-            default_idx = list(deals.keys()).index(st.session_state["comp_deal"])
-        selected    = st.selectbox("Select Deal", list(deals.keys()),
-                                   index=default_idx, key="comp_deal_select")
-        config_path = deals[selected]
-        cfg         = load_config(config_path)
-        subj        = cfg["subject_property"]
+    if config_path is not None:
+        # Embedded in the Analysis Output workspace — the parent page already
+        # picked the deal, so skip the subject-source selector entirely.
+        selected = deal_name
+        cfg      = load_config(config_path)
+        subj     = cfg["subject_property"]
     else:
-        c1, c2 = st.columns(2)
-        _ah_name = c1.text_input("Subject property name", key="adhoc_name",
-                                 placeholder="e.g. Marina Bay Tower")
-        _ah_addr = c2.text_input("Location / address", key="adhoc_addr",
-                                 placeholder="e.g. 10 Marina Blvd, Singapore")
-        c3, c4 = st.columns(2)
-        _ah_class   = c3.selectbox("Asset class",
-                                   ["office", "retail", "industrial", "logistics",
-                                    "hospitality", "residential", "mixed"],
-                                   key="adhoc_class")
-        _ah_country = c4.text_input("Country", value="Singapore", key="adhoc_country")
-        if _ah_name.strip() or _ah_addr.strip():
-            config_path = _ensure_adhoc_config(_ah_name.strip(), _ah_addr.strip(),
-                                               _ah_class, _ah_country.strip())
-            cfg  = load_config(config_path)
-            subj = cfg["subject_property"]
+        _modes = (["📁  Existing deal", "✏️  New subject property"] if deals
+                  else ["✏️  New subject property"])
+        _mode = st.radio("Subject property source", _modes, horizontal=True,
+                         key="comp_subject_mode")
+
+        if _mode.startswith("📁") and deals:
+            default_idx = 0
+            if "comp_deal" in st.session_state and st.session_state["comp_deal"] in deals:
+                default_idx = list(deals.keys()).index(st.session_state["comp_deal"])
+            selected    = st.selectbox("Select Deal", list(deals.keys()),
+                                       index=default_idx, key="comp_deal_select")
+            config_path = deals[selected]
+            cfg         = load_config(config_path)
+            subj        = cfg["subject_property"]
         else:
-            # No subject typed yet — leave config unset but still fall through so
-            # the Import panel below renders (a first-time visitor with zero deals
-            # must be able to restore a saved deal from a JSON file).
-            config_path = None
-            cfg = subj = None
+            c1, c2 = st.columns(2)
+            _ah_name = c1.text_input("Subject property name", key="adhoc_name",
+                                     placeholder="e.g. Marina Bay Tower")
+            _ah_addr = c2.text_input("Location / address", key="adhoc_addr",
+                                     placeholder="e.g. 10 Marina Blvd, Singapore")
+            c3, c4 = st.columns(2)
+            _ah_class   = c3.selectbox("Asset class",
+                                       ["office", "retail", "industrial", "logistics",
+                                        "hospitality", "residential", "mixed"],
+                                       key="adhoc_class")
+            _ah_country = c4.text_input("Country", value="Singapore", key="adhoc_country")
+            if _ah_name.strip() or _ah_addr.strip():
+                config_path = _ensure_adhoc_config(_ah_name.strip(), _ah_addr.strip(),
+                                                   _ah_class, _ah_country.strip())
+                cfg  = load_config(config_path)
+                subj = cfg["subject_property"]
+            else:
+                # No subject typed yet — leave config unset but still fall through
+                # so the Import panel below renders (a first-time visitor with zero
+                # deals must be able to restore a saved deal from a JSON file).
+                config_path = None
+                cfg = subj = None
 
     # ── Export / Import deal (portable per-user storage; no server DB needed) ──
     # On the cloud the filesystem is wiped on restart, so users keep their own deal
@@ -2953,6 +3460,19 @@ def render_comparable_analysis():
             needs_patch = True
             st.warning(f"Image will be removed from config on next run.")
 
+        # New uploads APPEND to any already-configured inputs of the same kind
+        # (deduped by path), rather than replacing them. The merge base is
+        # ``patched`` so a "Remove" ticked above clears first, then the new
+        # upload appends to the emptied list.
+        def _append_saved(key, saved_rels):
+            _merged = _input_list(patched.get(key))
+            for _rel in saved_rels:
+                if _rel not in _merged:
+                    _merged.append(_rel)
+            # Single item → plain string (backwards compat); multiple → list
+            patched[key] = _merged[0] if len(_merged) == 1 else _merged
+            return _merged
+
         if uploaded_excels:
             _saved_excels = []
             for _uf in uploaded_excels:
@@ -2961,10 +3481,8 @@ def render_comparable_analysis():
                 _sp.write_bytes(_uf.getvalue())
                 _saved_excels.append(str(_sp.relative_to(ROOT)))
                 st.success(f"Excel saved → `{_saved_excels[-1]}`")
-            # Single Excel → plain string (backwards compat); multiple → list
-            excel_input = _saved_excels[0] if len(_saved_excels) == 1 else _saved_excels
-            patched[configured_key] = excel_input
-            active_input = _saved_excels[0]
+            _merged_xl = _append_saved(configured_key, _saved_excels)
+            active_input = _merged_xl[0]
             needs_patch = True
 
         if uploaded_pdfs:
@@ -2975,10 +3493,8 @@ def render_comparable_analysis():
                 _pp.write_bytes(_uf.getvalue())
                 _saved_pdfs.append(str(_pp.relative_to(ROOT)))
                 st.success(f"PDF saved → `{_saved_pdfs[-1]}`")
-            # Single PDF → plain string (backwards compat); multiple → list
-            pdf_input = _saved_pdfs[0] if len(_saved_pdfs) == 1 else _saved_pdfs
-            patched[configured_pdf_key] = pdf_input
-            active_input = active_input or _saved_pdfs[0]
+            _merged_pdf = _append_saved(configured_pdf_key, _saved_pdfs)
+            active_input = active_input or _merged_pdf[0]
             needs_patch = True
 
         if uploaded_images:
@@ -2989,10 +3505,8 @@ def render_comparable_analysis():
                 _ip.write_bytes(_uf.getvalue())
                 _saved_images.append(str(_ip.relative_to(ROOT)))
                 st.success(f"Image saved → `{_saved_images[-1]}`")
-            # Single image → plain string (backwards compat); multiple → list
-            img_input = _saved_images[0] if len(_saved_images) == 1 else _saved_images
-            patched[configured_image_key] = img_input
-            active_input = active_input or _saved_images[0]
+            _merged_img = _append_saved(configured_image_key, _saved_images)
+            active_input = active_input or _merged_img[0]
             needs_patch = True
 
         if _has_manual:
@@ -3026,19 +3540,26 @@ def render_comparable_analysis():
             json.dump(patched, tmp); tmp.close()
             tmp_cfg_path = tmp.name
 
-            # If any "Remove" checkbox was ticked, also persist the change to
-            # the real config file so it doesn't reappear on next page load.
-            if clear_excel or clear_pdf or clear_image:
-                _save = dict(cfg)
-                if clear_excel:
-                    _save.pop(configured_key, None)
-                if clear_pdf:
-                    _save.pop(configured_pdf_key, None)
-                if clear_image:
-                    _save.pop(configured_image_key, None)
-                with open(config_path, "w", encoding="utf-8") as _f:
-                    json.dump(_save, _f, indent=2)
-                st.rerun()
+            # Persist input-file changes to the REAL config so uploads ACCUMULATE
+            # (append) across runs/sessions, and "Remove" ticks stick. Only the
+            # three input keys are copied over from ``patched`` — other runtime
+            # patches (e.g. tenure override) stay in the temp config only.
+            _uploaded_any = bool(uploaded_excels or uploaded_pdfs or uploaded_images)
+            if _uploaded_any or clear_excel or clear_pdf or clear_image:
+                _save = load_config(config_path)
+                for _k in (configured_key, configured_pdf_key, configured_image_key):
+                    _val = patched.get(_k)
+                    if _val:
+                        _save[_k] = _val
+                    else:
+                        _save.pop(_k, None)
+                Path(config_path).write_text(
+                    json.dumps(_save, indent=2, ensure_ascii=False), encoding="utf-8")
+                # Rerun only on Remove, to refresh the "configured" display. Do
+                # NOT rerun on upload — the uploader still holds the files, which
+                # would re-trigger this block and loop.
+                if clear_excel or clear_pdf or clear_image:
+                    st.rerun()
 
         st.write("")
         _name_only = st.checkbox(
@@ -3273,9 +3794,12 @@ def render_comparable_analysis():
 
 _SHOW_RATIONALE_TIMING = True   # set False to hide "Generated on … took …s" caption
 
-def render_investment_rationale():
+def render_investment_rationale(deal_name=None, config_path=None):
     """
     ROUTE D — Generate and refine the 3-section investment rationale.
+
+    Called embedded (deal_name + config_path given) as the ✍️ subtab of the
+    Analysis Output workspace, or standalone (no args) with its own deal picker.
 
     Overview
     --------
@@ -3315,11 +3839,12 @@ def render_investment_rationale():
     passed to the backend via --refinement-file flag, where it is injected into
     the prompt as a high-priority REFINEMENT INSTRUCTIONS block.
     """
-    st.title("✍️  Investment Rationale")
-    st.caption(
-        "Select a deal, tick the market reports you want to use, "
-        "add any analyst notes, then generate a 3-section investment rationale."
-    )
+    if deal_name is None:
+        st.title("✍️  Investment Rationale")
+        st.caption(
+            "Select a deal, tick the market reports you want to use, "
+            "add any analyst notes, then generate a 3-section investment rationale."
+        )
     st.warning(
         "**LLM-generated — be mindful of data privacy.** This feature sends the selected "
         "market-report text and deal details to the chosen analysis model to extract "
@@ -3335,13 +3860,19 @@ def render_investment_rationale():
         return
 
     # ── Deal selector ─────────────────────────────────────────────────────────
-    selected = st.selectbox(
-        "Select Deal", list(deals.keys()),
-        key="ir_deal_select",
-    )
-    config_path = deals[selected]
-    cfg         = load_config(config_path)
-    subj        = cfg["subject_property"]
+    if config_path is not None:
+        # Embedded in Analysis Output — deal already chosen by the parent page.
+        selected    = deal_name
+        cfg         = load_config(config_path)
+        subj        = cfg["subject_property"]
+    else:
+        selected = st.selectbox(
+            "Select Deal", list(deals.keys()),
+            key="ir_deal_select",
+        )
+        config_path = deals[selected]
+        cfg         = load_config(config_path)
+        subj        = cfg["subject_property"]
 
     # Inline deal strip
     i1, i2, i3, i4 = st.columns(4)
@@ -3756,10 +4287,10 @@ def render_existing_deals(deal_name: str | None, config_path: str | None):
                                 use_container_width=True)
 
         st.divider()
-        if st.button("📋  Go to Comparable Analysis →", type="primary",
+        if st.button("📊  Open in Analysis Output →", type="primary",
                      key="ed_goto_comps"):
-            st.session_state["_nav_goto"] = "📋  Comparable Analysis"
-            st.session_state["comp_deal"] = deal_name
+            st.session_state["active_page"] = "overview"
+            st.session_state["comp_deal"]   = deal_name
             st.rerun()
 
     # ── Edit tab ─────────────────────────────────────────────────────────────
@@ -3830,6 +4361,435 @@ def render_existing_deals(deal_name: str | None, config_path: str | None):
                     st.rerun()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE:  Deal Overview  →  aggregated read-only preview + orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_analysis_output(view: str = "overview"):
+    """
+    ROUTE — Analysis Output workspace.
+
+    One deal-centric page.  A single deal selector at the top; the ``view`` (chosen
+    from the sidebar's Analysis Output group) decides which of three panels shows:
+      • overview   — read-only aggregated preview of every output (Sales / Rent /
+                     Land comp tables + maps, and the Investment Rationale).
+                     Sections with no output are skipped.
+      • comps      — the editable Comparable Analysis detail page.
+      • rationale  — the Investment Rationale generate / refine detail page.
+
+    Edits made in the detail views are saved to output/<Deal>/, and the Overview
+    view re-reads those files on every rerun — so any change reflects on the
+    Overview preview automatically.
+    """
+    st.title("📊  Analysis Output")
+
+    if not deals:
+        st.info("No deals yet — create one in **New Deal** first.")
+        return
+
+    # Single deal selector drives every view. Seeded from / written to the shared
+    # ``comp_deal`` key so it stays in sync across the workspace.
+    _keys = list(deals.keys())
+    _default_idx = 0
+    if st.session_state.get("comp_deal") in deals:
+        _default_idx = _keys.index(st.session_state["comp_deal"])
+    deal = st.selectbox("Select Deal", _keys, index=_default_idx,
+                        key="ao_deal_select")
+    st.session_state["comp_deal"] = deal
+    config_path = deals[deal]
+    cfg  = load_config(config_path)
+    subj = cfg["subject_property"]
+
+    st.caption(f"📍  {subj.get('address') or '—'}")
+    st.divider()
+
+    if view == "comps":
+        render_comparable_analysis(deal, config_path)
+    elif view == "rationale":
+        render_investment_rationale(deal, config_path)
+    else:                                 # overview
+        _render_overview_preview(deal, config_path, cfg)
+
+
+_OV_COMP_ROUTES = {   # label → (excel_key, pdf_key, image_key, scan_script, output_prefix)
+    "📄  Rent":        ("rent_input_file", "rent_input_pdf_file", "rent_input_image_file",
+                        "scan_input_rent_comps.py", "Rent_Comps"),
+    "🏢  Asset Sales": ("input_file", "input_pdf_file", "input_image_file",
+                        "scan_input_sales_comps.py", "Transaction_Comparables"),
+    "🌍  Land":        ("land_input_file", "land_input_pdf_file", "land_input_image_file",
+                        "scan_input_land_comps.py", "Land_Sale_Comps"),
+}
+
+# output prefix → its three config input keys (derived from the routes above)
+_PREFIX_INPUT_KEYS = {r[4]: (r[0], r[1], r[2]) for r in _OV_COMP_ROUTES.values()}
+
+# upload output prefix → (online-search script, online output prefix)
+_ONLINE_ROUTES = {
+    "Rent_Comps":              ("search_online_rent_comps.py",  "Online_Rent_Comps"),
+    "Transaction_Comparables": ("search_online_sales_comps.py", "Online_Comparables"),
+    "Land_Sale_Comps":         ("search_online_land_comps.py",  "Online_Land_Comps"),
+}
+# upload prefix → scan script (for the Generate-all step builder)
+_SCAN_BY_PREFIX = {r[4]: r[3] for r in _OV_COMP_ROUTES.values()}
+
+
+def _latest_comp_excel(out_dir, upload_prefix):
+    """Newest comp Excel for a type across upload + online-search prefixes.
+    Returns (Path, prefix_used) or (None, None) — so the Overview shows whichever
+    source (uploaded scan or online search) was produced most recently."""
+    prefixes = [upload_prefix]
+    if upload_prefix in _ONLINE_ROUTES:
+        prefixes.append(_ONLINE_ROUTES[upload_prefix][1])
+    files = []
+    for _pfx in prefixes:
+        files += [f for f in out_dir.glob(f"{_pfx}*.xlsx") if not f.name.startswith("~")]
+    if not files:
+        return None, None
+    latest = max(files, key=lambda f: f.stat().st_mtime)
+    used = next((p for p in prefixes if latest.name.startswith(p)), upload_prefix)
+    return latest, used
+
+
+_PREFIX_TO_TYPE = {
+    "Transaction_Comparables": "sales",
+    "Rent_Comps":              "rent",
+    "Land_Sale_Comps":         "land",
+}
+
+
+def _run_comp_agent(comp_type, prefix, config_path, cfg, has_files, online_enabled,
+                    max_iters=3):
+    """Bounded acquire→verify→evaluate→reflect→fallback loop for one comp type
+    (see docs/comp_acquisition_agent.md). Runs the scan / online-search scripts
+    as tools via _run_script, then uses backend/comp_acquisition_agent.py to grade
+    the result and pick the next source. Emits live st.write lines (call inside an
+    st.status). Returns (summary, trace)."""
+    import comp_acquisition_agent as agent
+    out_dir = ROOT / Path(cfg.get("output_file", "output/x/x.xlsx")).parent
+
+    _online = _ONLINE_ROUTES.get(prefix)
+    _srcmap = {                                    # source → (script, output prefix)
+        "files":  (_SCAN_BY_PREFIX.get(prefix), prefix),
+        "online": (_online[0] if _online else None, _online[1] if _online else prefix),
+    }
+    plan = []
+    if has_files:
+        plan.append("files")
+    if online_enabled or not has_files:            # online: chosen, or the only source
+        plan.append("online")
+    plan = [s for s in plan if _srcmap[s][0]][:max_iters]
+    if not plan:
+        return None, []
+
+    _full = load_config(config_path)
+    _full["_root"] = str(ROOT)
+    llm_cfg    = _full.get("llm", {})
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+
+    tried, trace, summary = [], [], None
+    source = plan[0]
+    while source and len(tried) < max_iters:
+        script, src_prefix = _srcmap[source]
+        st.write(f"🔄 **{comp_type.title()} — {source}** · `{script}`")
+        try:
+            _run_script(script, config_path, ["--map"], stream_live=False)
+        except Exception as _e:
+            st.write(f"   ⚠ run error: {_e}")
+        run_log = st.session_state.get(f"_runlog_{script}", "")
+        records = agent.read_records(out_dir, src_prefix)
+        src_txt = agent.source_text(_full, comp_type, source, out_dir)
+        checks  = agent.verify_comps(records, src_txt, comp_type)
+        ev      = agent.evaluate(records, checks, run_log, comp_type)
+        tried.append(source)
+        trace.append({"source": source, **ev})
+        summary = {"source_used": source, "prefix": src_prefix, **ev}
+        st.write(f"   → {ev['n_valid']} valid · {int(ev['pct_grounded'] * 100)}% grounded "
+                 f"· confidence {ev['confidence']}"
+                 + (f" · ⚑ {', '.join(ev['flags'])}" if ev['flags'] else ""))
+        if ev["ok"]:
+            break
+        remaining = [s for s in plan if s not in tried and _srcmap[s][0]]
+        refl = agent.reflect(ev, tried, remaining, llm_cfg, openai_key)
+        trace.append({"reflect": refl})
+        st.write(f"   🤔 {refl['diagnosis']}")
+        if refl["next_action"] == "stop" or refl["next_action"] not in remaining:
+            break
+        source = refl["next_action"]
+    return summary, trace
+
+
+def _render_overview_preview(deal: str, config_path: str, cfg: dict):
+    """The Overview: two upload boxes at the top (comparable files + market
+    reports) drive the agentic pipeline, then a STATIC PGIM-standard view of the
+    results — a colored table + location map for Sales / Land / Rent (each shown
+    only if it exists), followed by the Investment Rationale, and a one-click
+    download of everything as a single Word file. Editing happens in the detail
+    views; new uploads here (and there) APPEND to the deal's existing inputs."""
+    out_dir = ROOT / Path(cfg.get("output_file", "output/x/x.xlsx")).parent
+
+    # ── Fresh browser session → reset this deal's Overview ───────────────────
+    # Drop previously-saved comp inputs from the config and delete this deal's
+    # generated outputs, so nothing carries over between sessions (Overview
+    # uploads are treated as session-only). Runs once per deal per session.
+    _init_key = f"_ov_init_{deal}"
+    if not st.session_state.get(_init_key):
+        st.session_state[_init_key] = True
+        _c = load_config(config_path)
+        _changed = False
+        for _keys in _PREFIX_INPUT_KEYS.values():
+            for _k in _keys:
+                if _c.pop(_k, None) is not None:
+                    _changed = True
+        if _changed:
+            Path(config_path).write_text(
+                json.dumps(_c, indent=2, ensure_ascii=False), encoding="utf-8")
+            cfg = _c
+        if out_dir.exists():
+            for _pref in ("Transaction_Comparables", "Rent_Comps", "Land_Sale_Comps",
+                          "Online_Comparables", "Online_Rent_Comps", "Online_Land_Comps",
+                          "Investment_Rationale", "Source_Audit"):
+                for _of in out_dir.glob(f"{_pref}*"):
+                    try:
+                        _of.unlink()
+                    except Exception:
+                        pass
+
+    # Market reports are shared across deals — clear the library once per session
+    # (a session-global flag, so opening a second deal doesn't wipe reports you
+    # just uploaded for the first one).
+    if not st.session_state.get("_ov_reports_cleared"):
+        st.session_state["_ov_reports_cleared"] = True
+        _rdir0 = ROOT / "Input_files" / "market_reports"
+        if _rdir0.exists():
+            for _pdf in _rdir0.glob("*.pdf"):
+                try:
+                    _pdf.unlink()
+                except Exception:
+                    pass
+
+    subj = cfg["subject_property"]
+
+    # Inline subject info strip
+    i1, i2, i3, i4 = st.columns(4)
+    i1.markdown(f"**Class:** {(subj.get('asset_class') or '—').title()}")
+    i2.markdown(f"**GFA:** {int(subj.get('gfa_sf', 0) or 0):,} "
+                f"{subj.get('gfa_unit', 'sf').upper()}")
+    i3.markdown(f"**Quality:** {subj.get('quality') or '—'}")
+    i4.markdown(f"**Country:** {subj.get('country_name') or '—'}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 1 · INPUTS — save each type's files (distinct), then Generate all at once
+    # ════════════════════════════════════════════════════════════════════════
+    st.markdown("#### 1 · Provide inputs")
+    box_c, box_r = st.columns(2)
+
+    # ── Comparable files — pick a type, upload, SAVE (persist only, no run).
+    #    Per-type uploader key means files never bleed across types. ──────────
+    with box_c:
+        with st.container(border=True):
+            st.markdown("**📁 Comparable files** — Excel / PDF / image")
+            ov_ct = st.radio("Comp type", list(_OV_COMP_ROUTES.keys()),
+                             horizontal=True, key="ov_comp_type")
+            ek, pk, ik, script, prefix = _OV_COMP_ROUTES[ov_ct]
+            ov_comp_files = st.file_uploader(
+                f"Upload {ov_ct} comps",
+                type=["xlsx", "pdf", "png", "jpg", "jpeg"],
+                accept_multiple_files=True, key=f"ov_up_{ek}",   # distinct per type
+                label_visibility="collapsed")
+            _saved_c = (_input_list(cfg.get(ek)) + _input_list(cfg.get(pk))
+                        + _input_list(cfg.get(ik)))
+            if _saved_c:
+                st.caption(f"✅ Saved for **{ov_ct}**: "
+                           + ", ".join(f"`{Path(s).name}`" for s in _saved_c))
+                with st.expander("🗑️  Remove saved files"):
+                    _rm = st.multiselect(
+                        "Files to remove", [Path(s).name for s in _saved_c],
+                        key=f"ov_rm_{ek}", label_visibility="collapsed",
+                        placeholder="Choose file(s) to remove…")
+                    if st.button("Remove selected", key=f"ov_rm_btn_{ek}",
+                                 disabled=not _rm, use_container_width=True):
+                        _c = load_config(config_path)
+                        for _k in (ek, pk, ik):
+                            _lst = [p for p in _input_list(_c.get(_k))
+                                    if Path(p).name not in _rm]
+                            if _lst:
+                                _c[_k] = _lst[0] if len(_lst) == 1 else _lst
+                            else:
+                                _c.pop(_k, None)
+                        Path(config_path).write_text(
+                            json.dumps(_c, indent=2, ensure_ascii=False),
+                            encoding="utf-8")
+                        # If no inputs remain for this type, also clear its stale
+                        # output so the table disappears from the view below.
+                        if not any(_input_list(_c.get(_k)) for _k in (ek, pk, ik)):
+                            for _of in out_dir.glob(f"{prefix}*"):
+                                try:
+                                    _of.unlink()
+                                except Exception:
+                                    pass
+                        st.success(f"Removed {len(_rm)} file(s) from {ov_ct}.")
+                        st.rerun()
+            if st.button(f"💾  Save {ov_ct} files", key="ov_comp_save",
+                         use_container_width=True, disabled=not ov_comp_files):
+                _updated = _save_uploads_append(load_config(config_path),
+                                                ek, pk, ik, ov_comp_files)
+                Path(config_path).write_text(
+                    json.dumps(_updated, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+                st.success(f"Saved {len(ov_comp_files)} file(s) to {ov_ct}.")
+                st.rerun()
+            st.checkbox(
+                f"🌐 Allow web fallback for {ov_ct}",
+                key=f"ov_online_{prefix}",
+                help="On Generate all, if the uploaded files don't yield enough "
+                     "grounded comps, the agent falls back to an online search "
+                     "using the deal's search keywords (needs an OpenAI key). "
+                     "With no files uploaded, online search becomes the source.")
+
+    # ── Market reports — upload, SAVE (persist only, no run) ─────────────────
+    with box_r:
+        with st.container(border=True):
+            st.markdown("**📄 Market reports** — PDF (for the rationale)")
+            ov_rpt_files = st.file_uploader(
+                "Upload reports", type=["pdf"], accept_multiple_files=True,
+                key="ov_rpt_up", label_visibility="collapsed")
+            _rdir = ROOT / "Input_files" / "market_reports"
+            _saved_r = sorted(_rdir.glob("*.pdf")) if _rdir.exists() else []
+            if _saved_r:
+                st.caption("✅ Saved reports: "
+                           + ", ".join(f"`{p.name}`" for p in _saved_r))
+                with st.expander("🗑️  Remove saved reports"):
+                    st.caption("Removes the PDF from the shared market-reports "
+                               "library (affects all deals).")
+                    _rmr = st.multiselect(
+                        "Reports to remove", [p.name for p in _saved_r],
+                        key="ov_rm_rpt", label_visibility="collapsed",
+                        placeholder="Choose report(s) to remove…")
+                    if st.button("Remove selected", key="ov_rm_rpt_btn",
+                                 disabled=not _rmr, use_container_width=True):
+                        for _p in _saved_r:
+                            if _p.name in _rmr:
+                                try:
+                                    _p.unlink()
+                                except Exception:
+                                    pass
+                        st.success(f"Removed {len(_rmr)} report(s).")
+                        st.rerun()
+            if st.button("💾  Save reports", key="ov_rpt_save",
+                         use_container_width=True, disabled=not ov_rpt_files):
+                _rdir.mkdir(parents=True, exist_ok=True)
+                for _uf in ov_rpt_files:
+                    (_rdir / _uf.name).write_bytes(_uf.getvalue())
+                st.success(f"Saved {len(ov_rpt_files)} report(s).")
+                st.rerun()
+
+    # ── Generate ALL — agent-checked acquisition per type, then the rationale ─
+    _rdir = ROOT / "Input_files" / "market_reports"
+    _has_reports = _rdir.exists() and any(_rdir.glob("*.pdf"))
+    _todo = []   # (prefix, title, has_files, online_enabled)
+    for _pfx, _hd, _ttl, _sb, _cb, _kw in _COMP_TYPES:
+        _hf = any(cfg.get(k) for k in _PREFIX_INPUT_KEYS[_pfx])
+        _on = bool(st.session_state.get(f"ov_online_{_pfx}"))
+        if _hf or _on:
+            _todo.append((_pfx, _ttl, _hf, _on))
+    _labels = [t[1] + (" 🌐" if t[3] else "") for t in _todo] \
+              + (["Investment Rationale"] if _has_reports else [])
+
+    st.write("")
+    if _labels:
+        st.caption("Will generate (agent-checked): " + " · ".join(_labels))
+    else:
+        st.caption("Save at least one comparable type or market reports above, "
+                   "then Generate.")
+    if st.button("▶  Generate all", type="primary", key="ov_generate_all",
+                 use_container_width=True, disabled=not _labels):
+        with st.status("Running analysis…", expanded=True) as _st:
+            for _pfx, _ttl, _hf, _on in _todo:
+                st.markdown(f"**{_ttl}**")
+                try:
+                    _summary, _ = _run_comp_agent(_PREFIX_TO_TYPE[_pfx], _pfx,
+                                                  config_path, cfg, _hf, _on)
+                    if _summary and _summary.get("confidence", 1) < 0.5:
+                        st.warning(f"⚠ Low confidence ({_summary['confidence']}) "
+                                   f"for {_ttl} — please review before use.")
+                except Exception as _e:
+                    st.error(f"{_ttl} failed: {_e}")
+            if _has_reports:
+                st.markdown("**Investment Rationale**")
+                try:
+                    _run_script("generate_investment_rationale.py", config_path, [],
+                                stream_live=False)
+                except Exception as _e:
+                    st.error(f"Investment Rationale failed: {_e}")
+            _st.update(label="✅ Analysis complete — output updated below.",
+                       state="complete", expanded=True)
+        # No st.rerun(): the static output section below re-reads the freshly
+        # written files on this same run, so the status above stays visible.
+
+    st.divider()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 2 · OUTPUT — static PGIM-standard view
+    # ════════════════════════════════════════════════════════════════════════
+    st.markdown("#### 2 · Output")
+    _any_shown = False
+    for _prefix, _heading, _title, _sub_banner, _comp_banner, _avg_kw in _COMP_TYPES:
+        _latest, _used = _latest_comp_excel(out_dir, _prefix)
+        if not _latest:
+            continue                     # skip if no info
+        _any_shown = True
+        st.markdown(f"### {_heading}")
+        _html = _pgim_table_html(str(_latest), _sub_banner, _comp_banner, _avg_kw)
+        if _html:
+            st.markdown(_html, unsafe_allow_html=True)
+        else:
+            st.caption("(No table preview available.)")
+        _maps = sorted(out_dir.glob(f"{_used}*_map.png"))
+        if _maps:
+            st.image(str(_maps[-1]), use_container_width=True)
+        st.caption("✏️ To edit the table or map, open **📋 Comparable Analysis** "
+                   "in the sidebar.")
+        st.divider()
+
+    # ── Investment Rationale ─────────────────────────────────────────────────
+    _rat = out_dir / "Investment_Rationale.md"
+    if _rat.exists():
+        _any_shown = True
+        st.markdown("### Investment Rationale")
+        try:
+            # Overview shows the rationale prose only — the metadata header +
+            # Input Summary stay in the ✍️ subtab (which renders the full doc).
+            # Escape '$' so Streamlit doesn't read "S$91.8 … S$124.6" as LaTeX
+            # math (which renders italic).
+            st.markdown(_rationale_body(_rat.read_text(encoding="utf-8"))
+                        .replace("$", "\\$"))
+        except Exception as _e:
+            st.error(f"Could not read rationale: {_e}")
+        st.caption("✏️ To edit or regenerate, open **✍️ Investment Rationale** "
+                   "in the sidebar.")
+        st.divider()
+
+    # ── Combined download (everything in one Word file) ──────────────────────
+    if _any_shown:
+        try:
+            _docx = _build_combined_docx(deal, cfg)
+        except Exception as _e:
+            _docx = None
+            st.caption(f"(Combined report unavailable: {_e})")
+        if _docx:
+            st.download_button(
+                "⬇️  Download full report (Word)", _docx,
+                file_name=f"{deal.replace(' ', '_')}_IC_Report.docx",
+                mime="application/vnd.openxmlformats-officedocument."
+                     "wordprocessingml.document",
+                use_container_width=True, key="ov_dl_docx")
+            st.caption("One file with all comp tables, maps and the rationale. "
+                       "(PDF export needs an extra library — ask to enable it.)")
+    else:
+        st.info("No outputs yet — upload comparable files and/or market reports "
+                "above and click **Generate**.")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ROUTER  — dispatch to the correct render function based on sidebar nav
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3839,20 +4799,15 @@ def render_existing_deals(deal_name: str | None, config_path: str | None):
 # into the main area and is fully self-contained.
 # ═════════════════════════════════════════════════════════════════════════════
 
-nav = st.session_state.get("main_nav", "🏗️  New Deal")
+active_page = st.session_state.get("active_page", "new_deal")
 
-if nav.startswith("🏗️"):
+if active_page == "new_deal":
     render_new_deal_form()
-
-elif nav.startswith("📁"):
+elif active_page == "existing":
     deal_nav = st.session_state.get("deal_nav")
     if deal_nav and deal_nav in deals:
         render_existing_deals(deal_nav, deals[deal_nav])
     else:
         render_existing_deals(None, None)
-
-elif nav.startswith("📋"):
-    render_comparable_analysis()
-
-else:
-    render_investment_rationale()
+else:                                    # overview | comps | rationale
+    render_analysis_output(active_page)

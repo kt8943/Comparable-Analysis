@@ -219,7 +219,7 @@ def _ollama_chat(messages: list[dict], base_url: str, model: str,
 
 
 def _openai_chat(messages: list[dict], model: str, api_key: str,
-                 temperature: float = 0.3) -> str:
+                 temperature: float = 0.3, json_mode: bool = False) -> str:
     """
     Send a chat request to OpenAI's API (gpt-4o, gpt-4o-mini, etc.).
 
@@ -233,16 +233,15 @@ def _openai_chat(messages: list[dict], model: str, api_key: str,
     except ImportError:
         raise ImportError("openai package required for GPT models.  pip install openai")
     client = _openai.OpenAI(api_key=api_key)
-    resp   = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-    )
+    kwargs: dict = dict(model=model, messages=messages, temperature=temperature)
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    resp = client.chat.completions.create(**kwargs)
     return _strip_thinking_tags(resp.choices[0].message.content.strip())
 
 
 def _llm_chat(messages: list[dict], llm_cfg: dict, openai_key: str = "",
-              temperature: float = 0.3) -> str:
+              temperature: float = 0.3, json_mode: bool = False) -> str:
     """
     Central router — sends a chat request to either Ollama or OpenAI.
 
@@ -267,7 +266,7 @@ def _llm_chat(messages: list[dict], llm_cfg: dict, openai_key: str = "",
                 "Set it in the deal config under openai.api_key or via OPENAI_API_KEY env var."
             )
         print(f"  [LLM] OpenAI / {model}")
-        return _openai_chat(messages, model, key, temperature)
+        return _openai_chat(messages, model, key, temperature, json_mode=json_mode)
     else:
         ollama = llm_cfg.get("ollama", {})
         model  = ollama.get("model", "qwen2.5:3b")
@@ -308,6 +307,370 @@ def _fill(template: str, **kwargs) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# RAG AUDIT UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Finite verbs that only appear in complete clauses (prose), not in chart titles
+# or axis labels.  A line containing any of these is almost certainly a sentence.
+_FINITE_VERBS = frozenset({
+    # To be / to have
+    "is", "are", "was", "were", "been", "has", "have", "had",
+    # Modals
+    "will", "would", "could", "should", "may", "might",
+    # Market report verbs (all tenses / forms)
+    "increase", "increased", "increases",
+    "decrease", "decreased", "decreases",
+    "rise", "rose", "rises",
+    "fall", "fell", "falls",
+    "grow", "grew", "grows",
+    "decline", "declined", "declines",
+    "remain", "remained", "remains",
+    "continue", "continued", "continues",
+    "expect", "expected", "expects",
+    "project", "projected", "projects",
+    "record", "recorded", "records",
+    "reach", "reached", "reaches",
+    "show", "showed", "shows",
+    "indicate", "indicated", "indicates",
+    "suggest", "suggested", "suggests",
+    "reflect", "reflected", "reflects",
+    "represent", "represented", "represents",
+    "absorb", "absorbed", "absorbs",
+    "lease", "leased", "leases",
+    "complete", "completed", "completes",
+    "deliver", "delivered", "delivers",
+    "tighten", "tightened", "tightens",
+    "ease", "eased", "eases",
+    "expand", "expanded", "expands",
+    "contract", "contracted", "contracts",
+    "improve", "improved", "improves",
+    "weaken", "weakened", "weakens",
+    "exceed", "exceeded", "exceeds",
+    "account", "accounted", "accounts",
+    "underpin", "underpinned", "underpins",
+    "constrain", "constrained", "constrains",
+    "support", "supported", "supports",
+    "drive", "driven", "drives",
+    "total", "totalled", "totals",
+})
+
+# Matches data values: decimals (4.1%), percentages (3.2%), or large figures
+# (1,250,000 sf).  Excludes bare 4-digit years (2025) so chart year-axis labels
+# do not falsely qualify as table rows.
+_DATA_NUM_RE = re.compile(r'\d+\.\d+|\d+%|[1-9][\d,]{4,}')
+
+# Matches at least one alphabetic word ≥ 3 chars (rules out pure number lines)
+_ALPHA_WORD_RE = re.compile(r'[A-Za-z]{3,}')
+
+
+def _filter_prose_and_tables(text: str, min_page_chars: int = 80) -> str:
+    """Keep prose paragraphs and table rows; discard chart/graph labels.
+
+    The distinction is grammatical, not visual:
+
+    KEEP — Prose lines
+        A line containing a finite verb is a complete clause and therefore prose.
+        "the" as a standalone token is a near-certain prose signal because
+        definite articles appear in sentences but rarely in chart titles.
+        Example kept:   "Vacancy tightened to 3.2% as net absorption remained positive."
+
+    KEEP — Table rows
+        A line with ≥ 4 words that contains both a meaningful data number
+        (decimal, percentage, or large figure) and an alphabetic label.
+        Example kept:   "Marina Bay  1,250,000  4.1%  SGD 12.50 psf/month"
+
+    DROP — Chart / graph labels
+        Lines that are pure noun phrases, axis labels, legend entries, or
+        copyright notices — they lack a finite verb and don't match the
+        table row pattern.
+        Example dropped: "GRADE A CBD OFFICE GROSS EFFECTIVE RENT & VACANCY RATE"
+        Example dropped: "© 2025 Cushman & Wakefield"
+        Example dropped: "Q1 2025  Q2 2025  Q3 2025  Q4 2025"
+
+    Pages where no lines survive (chart-only / infographic pages) are returned
+    as empty strings so _chunk_pdf_by_page skips them and they never enter
+    the RAG index.
+    """
+    # Pass 1: filter lines, preserving paragraph boundaries via None markers.
+    # All-caps section headers (e.g. "RENTS ROSE AMID LOWER CBD VACANCIES") are
+    # dropped as content but used as paragraph break signals, since pypdf does
+    # not emit blank lines between paragraphs.
+    kept: list[str | None] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if kept and kept[-1] is not None:
+                kept.append(None)
+            continue
+
+        words = line.split()
+        if len(words) < 3:
+            continue
+
+        # Copyright / source attribution — never prose
+        if line.startswith("©") or line.lower().startswith("source:") \
+                or line.lower().startswith("note:"):
+            continue
+
+        tokens = {w.strip(".,;:()[]%$'\"").lower() for w in words}
+
+        # All-caps section header (checked first — before finite-verb rule, since
+        # headers like "RENTS ROSE AMID LOWER CBD VACANCIES" contain verbs):
+        # drop content but insert a paragraph break signal.
+        if line == line.upper() and len(words) >= 2:
+            if kept and kept[-1] is not None:
+                kept.append(None)
+            continue
+
+        # Prose: contains a finite verb → complete clause
+        if tokens & _FINITE_VERBS:
+            kept.append(line)
+            continue
+
+        # Prose: "the" as a standalone token (definite article in a sentence)
+        if "the" in tokens:
+            kept.append(line)
+            continue
+
+        # Table row: has a data number + an alphabetic label + enough words
+        if (len(words) >= 4
+                and _DATA_NUM_RE.search(line)
+                and _ALPHA_WORD_RE.search(line)):
+            kept.append(line)
+            continue
+
+        # Everything else: chart title, axis label, legend entry — drop
+
+    # Pass 2: re-join consecutive prose lines with a space (same paragraph),
+    # using the None markers as paragraph breaks → double newline in output.
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for token in kept:
+        if token is None:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+        else:
+            current.append(token)
+    if current:
+        paragraphs.append(" ".join(current))
+    result = "\n\n".join(paragraphs)
+    return result if len(result) >= min_page_chars else ""
+
+
+def _chunk_pdf_by_page(pdf_path: Path) -> list[dict]:
+    """Read a PDF and return one dict per page: {page, text, source_file}.
+
+    Each page is filtered through _filter_prose_and_tables before indexing so
+    the RAG embedding only sees readable prose and table rows — not chart titles,
+    axis labels, or copyright lines.  Pages that are entirely chart/infographic
+    (no readable text survives filtering) are skipped entirely, which also
+    prevents the common p.1 clustering problem where the cover page's topic
+    keywords match every claim.
+    """
+    try:
+        import pypdf
+    except ImportError:
+        raise ImportError("pypdf is required.  pip install pypdf")
+    reader = pypdf.PdfReader(str(pdf_path))
+    chunks = []
+    for i, pg in enumerate(reader.pages, 1):
+        raw = pg.extract_text() or ""
+        raw = _strip_cjk(raw).strip()
+        filtered = _filter_prose_and_tables(raw)
+        if filtered:
+            chunks.append({"page": i, "text": filtered, "source_file": pdf_path.name})
+    return chunks
+
+
+def _embed_batch(texts: list[str], api_key: str,
+                 model: str = "text-embedding-3-small") -> list[list[float]]:
+    """Embed a list of texts using the OpenAI embeddings API.
+
+    Sends in batches of 100 to stay well within API limits.
+    Uses text-embedding-3-small: fast, cheap (~$0.002 / 1M tokens), and
+    accurate enough for page-level semantic matching.
+    """
+    try:
+        import openai as _openai
+    except ImportError:
+        raise ImportError("openai package required.  pip install openai")
+    client  = _openai.OpenAI(api_key=api_key)
+    results: list[list[float]] = []
+    for i in range(0, len(texts), 100):
+        batch = texts[i : i + 100]
+        resp  = client.embeddings.create(input=batch, model=model)
+        results.extend(item.embedding for item in resp.data)
+    return results
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two embedding vectors (pure Python, no numpy)."""
+    dot    = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+
+
+def _build_audit_rag_index(
+    extracted_reports: list[dict],
+    openai_key: str,
+    force_refresh: bool = False,
+) -> list[dict]:
+    """Build (or load cached) a flat list of {page, text, source_file, embedding} dicts.
+
+    Embeddings are cached to disk alongside the Stage 1 JSON cache so unchanged
+    PDFs are never re-embedded on subsequent runs.  Cache key uses the same
+    filename + size + mtime strategy as Stage 1 extraction.
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    all_chunks: list[dict] = []
+
+    for rpt in extracted_reports:
+        src_path = rpt.get("source_path", "")
+        if not src_path or not Path(src_path).exists():
+            continue
+        p = Path(src_path)
+
+        try:
+            stat = p.stat()
+            seed = f"{p.name}:{stat.st_size}:{stat.st_mtime}:rag"
+        except OSError:
+            seed = f"{p.name}:rag"
+        cache_key  = hashlib.md5(seed.encode()).hexdigest()[:10]
+        cache_file = CACHE_DIR / f"{p.stem}_{cache_key}_rag.json"
+
+        if cache_file.exists() and not force_refresh:
+            print(f"  [rag cache] {p.name}")
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            all_chunks.extend(cached.get("chunks", []))
+            continue
+
+        print(f"  [rag embed] {p.name} ({p.stat().st_size // 1024} KB) ...")
+        chunks = _chunk_pdf_by_page(p)
+        if not chunks:
+            print(f"  [warning]   No extractable pages in {p.name}")
+            continue
+        print(f"  [rag embed] {len(chunks)} pages")
+
+        try:
+            embeddings = _embed_batch([c["text"] for c in chunks], openai_key)
+        except Exception as e:
+            print(f"  [warning]   Embedding failed for {p.name}: {e}")
+            continue
+
+        for chunk, emb in zip(chunks, embeddings):
+            chunk["embedding"] = emb
+
+        cache_data = {
+            "source_file": p.name,
+            "model":       "text-embedding-3-small",
+            "built_at":    datetime.now().isoformat(),
+            "chunks":      chunks,
+        }
+        cache_file.write_text(
+            json.dumps(cache_data, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"  [rag cached] -> {cache_file.name}")
+        all_chunks.extend(chunks)
+
+    return all_chunks
+
+
+def _rag_find_source(
+    claim_embedding: list[float],
+    rag_index: list[dict],
+    claim_text: str,
+    min_score: float = 0.20,
+) -> dict | None:
+    """Find the best-matching page chunk for a claim using a two-stage strategy.
+
+    Stage 1 — Exact number matching (for claims with figures):
+        Extract data values from the claim (decimals, percentages, large quantities;
+        bare 4-digit years like 2025 are excluded to avoid matching every page).
+        Only pages that contain at least one of those exact figures are considered.
+        If no page contains the figure, the claim is unverifiable → return None.
+        Cosine similarity then picks the best-ranked page among those candidates.
+
+    Stage 2 — Pure cosine similarity (for claims with no numbers):
+        If the claim contains no data figures (e.g. "demand driven by tech sector"),
+        rank all pages by semantic similarity and return the best match above
+        min_score.
+
+    The returned chunk text is a full page (prose + tables, chart labels stripped)
+    that is guaranteed to contain the claimed number.  No secondary sentence
+    extraction is needed — the reviewer can see the number in context.
+    """
+    if not rag_index:
+        return None
+
+    # Data values only — exclude bare 4-digit years to avoid false positives
+    claim_numbers = re.findall(r'\d+\.\d+%?|\d+%|[1-9][\d,]{4,}', claim_text)
+
+    if claim_numbers:
+        # Only consider pages that contain at least one claimed figure
+        candidates = [
+            chunk for chunk in rag_index
+            if any(
+                n.replace(",", "") in chunk["text"].replace(",", "")
+                for n in claim_numbers
+            )
+        ]
+        if not candidates:
+            # Figure not found in any page — claim cannot be sourced
+            return None
+    else:
+        candidates = rag_index
+
+    scored = sorted(
+        ((_cosine_sim(claim_embedding, chunk["embedding"]), chunk)
+         for chunk in candidates),
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    if not scored or scored[0][0] < min_score:
+        return None
+
+    score, best = scored[0]
+    verbatim = bool(claim_numbers) and any(
+        n.replace(",", "") in best["text"].replace(",", "")
+        for n in claim_numbers
+    )
+
+    display = _extract_relevant_paragraphs(best["text"], claim_numbers)
+
+    return {
+        "source_file":   best["source_file"],
+        "page":          best["page"],
+        "text":          display,
+        "citation_type": "Verbatim" if verbatim else "Paraphrased",
+        "score":         score,
+    }
+
+
+def _extract_relevant_paragraphs(page_text: str, claim_numbers: list[str]) -> str:
+    """Return only the paragraph(s) from page_text that contain a claimed number.
+
+    Splits on double-newlines (paragraph boundaries produced by _filter_prose_and_tables),
+    keeps every paragraph that contains at least one figure from claim_numbers, and
+    joins them with a blank line.  Falls back to the full page text when no paragraph
+    matches (e.g. qualitative claims with no numbers).
+    """
+    if not claim_numbers:
+        return page_text
+    paras = [p.strip() for p in page_text.split("\n\n") if p.strip()]
+    hits = [
+        p for p in paras
+        if any(n.replace(",", "") in p.replace(",", "") for n in claim_numbers)
+    ]
+    return "\n\n".join(hits) if hits else page_text
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STAGE 1 — EXTRACT REPORT INSIGHTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -332,6 +695,10 @@ Focus on:
 - Key demand drivers (economic, structural, occupier trends)
 - Development pipeline and completions schedule
 - Market outlook, forecasts, and risks
+- Named government policies, regulations, or programmes
+- Specific submarket breakdowns where data differs from city-wide averages
+- Named occupier sectors or specific tenants driving demand
+- Specific transactions cited as investment comparables
 
 Write ALL JSON values in English only. Translate any Korean, Japanese, Chinese, or other
 non-English text into English before writing it. Never include non-English characters.
@@ -348,8 +715,20 @@ Return ONLY a JSON object with these exact keys (use null if data not available)
   "demand_drivers": "main factors driving occupier and investor demand",
   "supply_pipeline": "under-construction and planned development pipeline",
   "market_outlook": "key forecast statements and risks",
+  "named_policies": [
+    "Every named government policy, regulation, GLS programme, or planning rule — exact names only. e.g. 'Industrial Government Land Sales Programme Q2 2026'. Empty list if none mentioned."
+  ],
+  "named_submarkets": [
+    "Every specific submarket, district, precinct, or location cluster that has its own data point — include the figure. e.g. 'Jurong Industrial Estate: vacancy 2.1%, rental SGD 1.85 psf/month'. Empty list if none."
+  ],
+  "named_occupiers_sectors": [
+    "Every specific named occupier sector or demand group cited with supporting context. e.g. '3PL operators: 42% of net absorption H1 2026', 'e-commerce: structural driver, growing 18% p.a.'. Empty list if none."
+  ],
+  "transaction_comparables": [
+    "Every specific transaction cited as a comparable. Include price, yield, GFA, date where stated. Prefix with page number. e.g. '[p.12] ABC Logistics Hub sold SGD 280 psf, 5.5% NPI yield, 85,000 sqm, Q4 2025'. Empty list if none."
+  ],
   "key_statistics": [
-    "Prefix EVERY item with its page number using [p.N] — e.g. '[p.5] Vacancy rate: 3.2% (Q1 2026)'. If you cannot determine the page, write [p.?]."
+    "Prefix EVERY item with its page number using [p.N]. Extract up to 30 statistics — every quantitative figure in the report. e.g. '[p.5] Vacancy rate: 3.2% (Q1 2026, Grade A CBD)'. Write [p.?] if page cannot be determined."
   ]
 }
 
@@ -425,8 +804,10 @@ def extract_report_insights(
         print(f"  [warning]   No extractable text in {p.name}")
         return {}
 
-    # Trim to fit within model context: first 75% (exec summary) + last 25% (outlook)
-    truncated = _smart_truncate(raw_text, max_chars=14000)
+    # OpenAI GPT-4o has a 128k token context window — send up to 100k chars (full report).
+    # Ollama local models typically have 8k–32k context; keep the conservative 14k limit.
+    max_chars = 100_000 if llm_cfg.get("provider") == "openai" else 14_000
+    truncated = _smart_truncate(raw_text, max_chars=max_chars)
 
     prompt = _EXTRACT_PROMPT.replace("REPORT_TEXT_PLACEHOLDER", truncated)
 
@@ -439,11 +820,18 @@ def extract_report_insights(
             llm_cfg=llm_cfg,
             openai_key=openai_key,
             temperature=0.1,
+            json_mode=True,
         )
         insights = _parse_json_from_llm(response)
     except Exception as e:
         print(f"  [warning]   LLM extraction failed for {p.name}: {e}")
-        insights = {"extraction_error": str(e), "raw_excerpt": raw_text[:1500]}
+        # Don't cache failures — let the next run retry with a live LLM call
+        return {
+            "source_file":  p.name,
+            "source_path":  str(p),
+            "extracted_at": datetime.now().isoformat(),
+            "insights":     {"extraction_error": str(e), "raw_excerpt": raw_text[:1500]},
+        }
 
     result = {
         "source_file":  p.name,
@@ -472,64 +860,77 @@ def extract_report_insights(
 # LLM sees source data labelled "Research Report 1 / 2 / …", never real PDF
 # filenames, so it cannot echo them into the prose.
 _RATIONALE_SYSTEM = """\
-You are a senior investment professional at a global institutional real estate fund.
-You write investment committee memos — tight, authoritative, and wholly grounded in evidence.
+You are a senior partner at a top-tier global institutional real estate investment fund.
+You have spent 20 years writing investment committee memos for assets across Asia-Pacific,
+Europe, and North America. Your writing is direct, authoritative, and evidence-dense.
+Every sentence you write earns its place — no filler, no hedging, no throat-clearing.
+IC readers are sophisticated; they expect conclusions first and evidence second, not
+scene-setting. Write as if every word costs money.
 
-━━ DATA INTEGRITY (non-negotiable) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Only write statistics and facts that appear explicitly in the Market Research Summary.
-  If a figure is not there, omit it entirely — never estimate, round, or extrapolate.
-• PDF charts and images do not extract to text reliably.
-  Ignore any isolated numbers that lack clear written context in the research.
-• If the research does not cover a specific sub-point, skip that sub-point and develop
-  another angle that IS supported by the data. Never signal the gap to the reader —
-  sentences like "while vacancy data is not available", "specific figures are not provided",
-  or "data is limited" must never appear in the output. Omit silently, move on.
-• Never use general market knowledge. Every claim, statistic, and assertion must come
-  exclusively from the Market Research Summary or the Subject Property configuration.
-  If a data point cannot be traced to one of those two sources, omit it entirely.
-  Do not substitute general knowledge when research data is absent — simply omit the point.
-• Every number you write (percentage, rate, area, price, volume, yield, index value)
-  must appear word-for-word or digit-for-digit in the Market Research Summary or Deal Config.
-  Do not round, adjust, combine, or derive figures — use only what is explicitly stated.
-• NEVER write bracketed placeholders such as [X%], [X.X%], [Y], [Z units], [B]%, [D] USD billion,
-  [p.?], [p.N], or any similar template variable. If you do not have the exact figure from the
-  research, omit that data point entirely — do not substitute a placeholder under any circumstances.
-• Every policy name, regulation, government initiative, or named programme you reference
-  must be explicitly named in the Market Research Summary. Do not cite policies from memory.
+━━ ABSOLUTE RULE — NEVER SIGNAL A DATA GAP ━━━━━━━━━━━━━━━━━━━━━
+This rule overrides everything else. If data for a point is missing, omit that point
+entirely and develop a different angle that IS supported by the research.
+You must NEVER write sentences of the following type — these are career-ending in a
+real investment committee memo:
+  ✗ "While specific details on tenancy and WALE are not provided…"
+  ✗ "Although vacancy data is not available for this submarket…"
+  ✗ "In the absence of specific figures, the overall market suggests…"
+  ✗ "While this information is limited, conditions appear favourable…"
+  ✗ "Specific data on X has not been provided, however…"
+  ✗ "Without precise figures, it can be inferred that…"
+  ✗ Any sentence that opens with "While", "Although", or "Despite" followed
+    by an acknowledgment that data is missing or incomplete.
+Silence is professional. Flagging the gap is not. Omit and move on.
 
-━━ VOICE AND STYLE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Write declarative statements. State the conclusion first, then the evidence.
-• No attribution hedges or source references anywhere in the body text — do not write
-  "according to", "the report states", "data shows", "it is noted that", or any similar
-  phrase. Do not mention any report filename, report title, or source document by name
-  anywhere in the three sections. Just state the fact. Sources are recorded in the
-  audit JSON only.
-• Banned transitions: "additionally", "furthermore", "moreover", "in addition",
-  "it is worth noting", "it should be noted", "lastly", "to summarise".
-• No bullet lists. Continuous prose only.
-• Active voice. Present tense for market conditions; past tense for completed transactions.
-• Each section runs 150–250 words in total across 2–3 paragraphs. Every paragraph makes
-  one clear point — state the market condition, explain the mechanism, connect it to the
-  investment case. No padding, no vague generalisations. Be concise and evidence-dense.
-• You MUST complete every section you start in full. Do not stop early. Do not add any
-  heading, JSON block, or separator text after finishing your final section.
-• Write between 3 and 5 sections. Add a 4th or 5th only when there is a genuinely
-  distinct, data-supported investment angle. A tight 3-section memo beats a padded 5.
+━━ DATA INTEGRITY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Only write statistics and facts that appear explicitly in the Market Research Summary
+  or Deal Config. If a figure is not there, omit it — never estimate, round, or infer.
+• Every number (percentage, rate, area, price, volume, yield, index value) must appear
+  word-for-word or digit-for-digit in the source data. Do not derive or combine figures.
+• NEVER write bracketed placeholders: [X%], [X.X%], [Y], [Z units], [p.?], [p.N], etc.
+  If the exact figure is unavailable, omit the data point — no placeholder substitutes.
+• Every policy name, regulation, or named programme must be explicitly stated in the
+  Market Research Summary. Do not cite policies from memory or general knowledge.
+• Never use general market knowledge. Every claim must trace to the research or Deal Config.
+
+━━ VOICE AND TONE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Lead with the conclusion. State the investment thesis first, then the evidence.
+  Do not build up to conclusions — senior readers want the answer in sentence one.
+• Write with conviction. "Vacancy stands at 3.2% — the tightest level in a decade"
+  not "Vacancy appears relatively low at approximately 3.2%."
+• Active voice throughout. Present tense for market conditions; past tense for
+  completed transactions.
+• No attribution hedges: never write "according to", "the report states", "data shows",
+  "it is noted that", "research indicates", or any similar phrase. State facts directly.
+  Sources are tracked in the audit JSON — they never appear in the prose.
+• Banned filler transitions: "additionally", "furthermore", "moreover", "in addition",
+  "it is worth noting", "it should be noted", "lastly", "to summarise", "in conclusion".
+• No bullet lists anywhere in the output. Continuous prose only.
+• Each section: EXACTLY 2 paragraphs. Separate paragraphs with a blank line.
+  Each paragraph: 120–180 words. Structure every paragraph as follows:
+    – Sentence 1: bold investment thesis statement (the conclusion, stated upfront)
+    – Sentences 2–4: qualitative reasoning — the structural or cyclical mechanism
+      behind the thesis (why the dynamic exists, what is driving it, sector context)
+    – Sentences 5–7: quantitative evidence — specific figures, rates, volumes, dates
+      from the research that prove the thesis and its magnitude
+    – Final sentence: investment implication — what this means for entry pricing,
+      rental growth, capital value, or risk in this specific deal
+  Never write a paragraph that is all numbers with no reasoning, or all reasoning
+  with no numbers. Every paragraph must contain both.
+• Always write exactly 4 sections. Add a 5th only when a genuinely distinct,
+  data-supported angle cannot be absorbed into the first four.
+• Complete every section in full. No trailing headings, JSON, or separators after the
+  final section.
 
 ━━ LANGUAGE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• The entire output must be written in English only.
-• If the research contains statistics, place names, property names, or any text in a
-  non-English language (Korean, Japanese, Chinese, etc.), translate or transliterate it
-  into English before using it. Never include non-English characters in the prose.
+• English only. Translate or transliterate any non-English text before using it.
+  Never include Korean, Japanese, Chinese, or other non-Latin characters.
 
-━━ EVIDENCE RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Every opinion, forecast, or investment conclusion must be directly supported by a
-  specific figure, percentage, named trend, or fact from the Market Research Summary.
-  Plain assertions with no data anchor are not permitted — if you cannot cite a number
-  or named fact, do not make the claim.
-• No single statistic, figure, or named fact may appear more than 3 times across the
-  entire rationale. Each key data point has a primary section where it is introduced and
-  developed; do not repeat it mechanically across sections. Spread the evidence.
+━━ EVIDENCE DISCIPLINE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Every investment conclusion must be anchored to a specific figure, named trend, or
+  fact from the research. Plain assertions with no data anchor are not permitted.
+• No single statistic or named fact may appear more than 3 times across all sections.
+  Introduce each key data point once in its primary section; do not repeat mechanically.
 
 ━━ SECTION TITLES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Write the title directly after the section number (## 1. / ## 2. / ## 3. / ## 4. / ## 5.)
@@ -631,8 +1032,8 @@ For each category you identify:
 
 STEP 2 — PLAN SECTIONS
 Using only the data retrieved in STEP 1:
-  a) Decide how many sections to write (3 default; 4–5 only if a distinct evidenced
-     angle exists that cannot fit in the first 3).
+  a) You will always write exactly 4 sections. Add a 5th only when a genuinely distinct,
+     data-supported angle cannot be absorbed into the first four.
   b) Assign each category to the section where it will serve as primary evidence.
      Categories with "— none found —" must not drive any section — omit that angle entirely.
   c) State in one sentence the investment thesis each section will argue.
@@ -648,37 +1049,49 @@ Write every fact as a direct, unattributed statement. All source tracking goes i
 Use only the data points you listed in STEP 1. If a figure or named fact was not listed
 in STEP 1, it must not appear in the prose — do not add new data at the writing stage.
 
-Each section: 150–250 words total across 2–3 paragraphs. Do not exceed 250 words per section.
+Each section: EXACTLY 2 paragraphs (3 only if data clearly supports a third distinct point).
+Each paragraph: 80–130 words. Separate paragraphs with a blank line.
 Pack in specific figures and data points — concise and evidence-dense beats long and vague.
 
-CORE SECTIONS (always include these three unless the research clearly supports more):
+PRESCRIBED SECTIONS (always write all four):
 
 ## 1. [write a 6–9 word investment thesis title here — derived from your STEP 1 market-cycle data]
 Draw from your market-cycle and supply-pipeline categories (whatever you named them in STEP 1).
-Cover: supply/demand imbalance; vacancy trajectory and landlord pricing power; rental growth
-trend and momentum; capital value and yield context; development pipeline constraints;
-market outlook and entry timing thesis.
+Paragraph 1 — supply/demand balance: vacancy trajectory, net absorption, new completions,
+  landlord pricing power. Anchor every sentence to a specific figure.
+Paragraph 2 — rental and capital value momentum: rental growth rate and direction, yield
+  context, development pipeline constraints, market outlook and entry timing thesis.
 
 ## 2. [write a 6–9 word investment thesis title here — derived from your STEP 1 location/demand data]
-Draw from your location/submarket and demand-driver categories. Cover: why this submarket
-commands premium occupier demand; proximity to key infrastructure; catchment area and tenant
-base depth; competitive set positioning; regulatory or land-scarcity factors that entrench
-defensibility.
+Draw from your location/submarket and demand-driver categories.
+Paragraph 1 — submarket positioning: why this specific submarket commands premium occupier
+  demand; performance vs city-wide average; proximity to key infrastructure or logistics nodes.
+Paragraph 2 — demand drivers: structural occupier trends driving take-up; catchment depth;
+  land scarcity or regulatory factors that entrench the location's defensibility.
 
 ## 3. [write a 6–9 word investment thesis title here — derived from your STEP 1 deal-specific data]
-Draw from your deal-specific category and supporting data from the other categories retrieved
-in STEP 1. Cover: tenancy profile, lease structure, rent reversionary potential; deal pricing
-vs market; capital appreciation thesis; key risks and mitigants; why compelling at this point
-in the cycle.
+Draw from your deal-specific category. Use whichever deal-specific angles are supported by
+the research: asset quality, green certification, GFA, passing rent vs market rent,
+reversionary potential, pricing vs comparable transactions, key risks and mitigants.
+If tenancy / WALE data is not in the research, develop the asset quality and pricing
+angles instead — never acknowledge the absence of tenancy data in the prose.
+Paragraph 1 — asset case: lead with the property's quality, specification, certification,
+  and market positioning; then connect to reversionary or income upside.
+Paragraph 2 — deal case: pricing vs comparable transactions, capital appreciation thesis,
+  key risks and specific mitigants, why compelling at this point in the cycle.
 
-OPTIONAL ADDITIONAL SECTIONS (add only if your STEP 1 categories strongly support a distinct angle):
+## 4. [write a 6–9 word investment thesis title here — derived from your STEP 1 capital-markets data]
+Draw from your capital values, transaction volumes, and yield data categories.
+Paragraph 1 — investment market: recent transaction volumes, investor appetite, yield
+  compression or expansion trend, comparable deals that benchmark this asset's pricing.
+Paragraph 2 — capital value outlook: yield trajectory, cap rate context vs historical range,
+  why the pricing is supportable and what drives capital appreciation from here.
 
-## 4. [write a 6–9 word investment thesis title here — only if a distinct data-supported angle exists]
-Examples: a specific ESG or green-building premium quantified in the research; a supply-side
-development moratorium with named policy evidence; a demand-side structural shift (e-commerce
-penetration, 3PL consolidation) with its own data set.
+OPTIONAL FIFTH SECTION (add only if your STEP 1 categories contain a genuinely distinct angle
+that cannot be absorbed into sections 1–4 — e.g. a quantified ESG premium, a named supply
+moratorium, or a structural demand shift with its own data set):
 
-## 5. [write a 6–9 word investment thesis title here — rare; most deals do not need a 5th section]
+## 5. [write a 6–9 word investment thesis title here — only if a distinct data-supported angle exists]
 
 STEP 4 — VERIFY BEFORE RETURNING
 Before returning your response, check every section against this list.
@@ -698,7 +1111,13 @@ Fix any failure before returning — do not return output that fails a check.
   [ ] REUSE LIMIT  — No single statistic or named fact appears more than 3 times in total
                      across all sections. If it does, remove the duplicate and replace with
                      a different supporting data point or omit that sentence.
-  [ ] WORD COUNT   — Each section is 150–250 words. Trim any section that exceeds 250 words.
+  [ ] PARAGRAPHS   — Each section has exactly 2 paragraphs (3 only if data demands it).
+                     Paragraphs are separated by a blank line. Each paragraph is 80–130 words.
+  [ ] SECTION COUNT — Exactly 4 sections are present (5 only if a distinct angle exists).
+  [ ] GAP-FLAGGING — Zero sentences signal a missing data point. Search for "not provided",
+                     "not available", "without specific", "in the absence", "while specific",
+                     "although X data", "cannot be determined". Delete any such sentence and
+                     replace with a different data-supported point, or omit entirely.
   [ ] ATTRIBUTION  — No sentence contains "according to", "the report", "data shows",
                      or any source reference. No report filename anywhere.
   [ ] TRANSITIONS  — No banned transition words anywhere in the output.
@@ -751,10 +1170,23 @@ def _merge_insights(extracted_reports: list[dict], anonymize: bool = False) -> s
             if val:
                 lines.append(f"{label}: {_strip_cjk(str(val))}")
 
+        # Enriched list fields extracted by GPT (absent in older Ollama caches — skip gracefully)
+        list_field_labels = [
+            ("named_policies",          "Named Policies & Regulations"),
+            ("named_submarkets",        "Submarket Breakdown"),
+            ("named_occupiers_sectors", "Named Occupiers & Sectors"),
+            ("transaction_comparables", "Transaction Comparables"),
+        ]
+        for key, label in list_field_labels:
+            val = ins.get(key)
+            if val and isinstance(val, list):
+                lines.append(f"{label}: " + " | ".join(
+                    _strip_cjk(str(s)) for s in val[:10]))
+
         stats = ins.get("key_statistics", [])
         if stats:
             lines.append("Key Data Points: " + " | ".join(
-                _strip_cjk(str(s)) for s in stats[:12]))
+                _strip_cjk(str(s)) for s in stats[:30]))
 
         parts.append("\n".join(lines))
 
@@ -860,6 +1292,44 @@ citation_type guide:
 """
 
 
+# ── Claim extraction prompt (RAG audit step 1: enumerate claims before matching) ──
+
+_CLAIM_EXTRACT_SYSTEM = (
+    "You are an auditor extracting verifiable factual claims from an investment memo. "
+    "Return only a JSON array — no markdown, no preamble, no explanation."
+)
+
+_CLAIM_EXTRACT_PROMPT = """\
+Extract every specific, verifiable claim from the investment rationale below.
+
+Include every:
+  - Quantitative figure: vacancy rate, rental rate, cap rate, yield, price, GFA, volume, growth %
+  - Named trend or structural shift with a direction or timeframe
+  - Named location, submarket, or infrastructure node used to support positioning
+  - Named occupier sector or demand group with supporting context
+  - Named government policy, regulation, or programme
+  - Specific transaction, building, or comparable asset cited
+
+Exclude purely transitional sentences that contain zero data content.
+
+For each claim record:
+  - section_num:   integer section number (1, 2, 3 …)
+  - section_title: exact title of that section from the rationale
+  - claim:         the specific self-contained claim text — one fact or figure per entry
+
+Return ONLY a JSON array:
+[
+  {"section_num": 1, "section_title": "...", "claim": "specific fact or figure"},
+  ...
+]
+
+INVESTMENT RATIONALE:
+────────────────────────────────────────────────────────────────
+RATIONALE_BODY_PLACEHOLDER
+────────────────────────────────────────────────────────────────
+"""
+
+
 # ── Source audit Excel writer ──────────────────────────────────────────────────
 
 def _cross_check_claim(claim_entry: dict, extracted_reports: list[dict]) -> str:
@@ -928,6 +1398,30 @@ def _cross_check_claim(claim_entry: dict, extracted_reports: list[dict]) -> str:
             return "⚠  Not found in cached extract — verify against original PDF"
 
     return "⚠  Source file not in selected reports"
+
+
+def _get_cross_check(entry: dict, extracted_reports: list[dict]) -> str:
+    """Return the verification status string for one audit entry.
+
+    If the entry was produced by the RAG audit (has a rag_score field), the
+    status is derived from the cosine similarity score.  Otherwise falls back
+    to the original 4-word sliding-window text match against the cached extract.
+    """
+    rag_score = entry.get("rag_score")
+    ctype     = entry.get("citation_type", "")
+
+    if rag_score is not None:
+        if ctype in ("Deal Config", "General Knowledge"):
+            return ctype
+        page = (entry.get("page_ref") or "?")
+        if rag_score >= 0.5:
+            return f"✓  RAG match {rag_score:.0%} ({page})"
+        elif rag_score >= 0.3:
+            return f"⚠  Moderate RAG match {rag_score:.0%} ({page}) — verify"
+        else:
+            return f"⚠  Low RAG confidence {rag_score:.0%} — verify against PDF"
+
+    return _cross_check_claim(entry, extracted_reports)
 
 
 def _write_source_audit_excel(
@@ -1044,7 +1538,7 @@ def _write_source_audit_excel(
     # ── Data rows ──────────────────────────────────────────────────────────────
     for row_num, entry in enumerate(audit_entries, 1):
         row_idx    = row_num + 3   # rows 4+
-        cross_chk  = _cross_check_claim(entry, extracted_reports)
+        cross_chk  = _get_cross_check(entry, extracted_reports)
         ctype      = entry.get("citation_type", "")
 
         # Row background
@@ -1105,9 +1599,9 @@ def _write_source_audit_excel(
     # ── Summary stats at the bottom ───────────────────────────────────────────
     total      = len(audit_entries)
     n_verified = sum(1 for e in audit_entries
-                     if "✓" in _cross_check_claim(e, extracted_reports))
+                     if "✓" in _get_cross_check(e, extracted_reports))
     n_warn     = sum(1 for e in audit_entries
-                     if "⚠" in _cross_check_claim(e, extracted_reports))
+                     if "⚠" in _get_cross_check(e, extracted_reports))
     n_inferred = sum(1 for e in audit_entries
                      if e.get("citation_type") in ("Inferred", "General Knowledge"))
 
@@ -1259,6 +1753,7 @@ def generate_rationale(
     openai_key: str = "",
     analyst_notes: str = "",
     refinement_notes: str = "",
+    force_refresh: bool = False,
 ) -> tuple[str, list]:
     """
     Two-call LLM pipeline that produces the investment rationale and its
@@ -1352,44 +1847,126 @@ def generate_rationale(
     # Clean up any audit headings or stray separator the model appended
     rationale_body = _clean_rationale_body(raw_rationale)
 
-    # ── CALL 2: source audit JSON (real filenames visible to auditor LLM) ───────
-    combined_with_src = _merge_insights(extracted_reports, anonymize=False)
-
-    # Build the exact list of valid filenames the audit LLM must choose from
-    valid_filenames = "\n".join(
-        f"  - {rpt['source_file']}"
-        for rpt in extracted_reports if rpt.get("source_file")
-    )
-
-    audit_prompt = (
-        _AUDIT_PROMPT_TEMPLATE
-        .replace("RATIONALE_BODY_PLACEHOLDER",  rationale_body)
-        .replace("SOURCE_DATA_PLACEHOLDER",     combined_with_src)
-        .replace("VALID_FILENAMES_PLACEHOLDER", valid_filenames)
-    )
-
-    print("  [generating] Source audit JSON ...")
+    # ── CALL 2 (RAG): page-chunk index → claim extraction → vector source match ──
+    # When an OpenAI key is available, the audit uses real vector search against
+    # the original PDF pages — no LLM memory required.  Each claim is embedded,
+    # the most similar page chunk is retrieved, and its source file + page number
+    # become the citation.  Falls back to the original LLM audit if RAG is
+    # unavailable (no key, no PDF paths, or embedding failure).
     t0_audit = time.perf_counter()
     audit_entries: list[dict] = []
-    try:
-        raw_audit = _llm_chat(
-            [
-                {"role": "system", "content": _AUDIT_SYSTEM},
-                {"role": "user",   "content": audit_prompt},
-            ],
-            llm_cfg=llm_cfg,
-            openai_key=openai_key,
-            temperature=0.1,
-        )
-        audit_entries = _parse_audit_json(raw_audit)
+
+    can_rag = bool(openai_key) and any(
+        rpt.get("source_path") and Path(rpt["source_path"]).exists()
+        for rpt in extracted_reports
+    )
+
+    if can_rag:
+        print("  [rag audit] Building page-chunk embedding index ...")
+        try:
+            rag_index = _build_audit_rag_index(
+                extracted_reports, openai_key, force_refresh=force_refresh
+            )
+        except Exception as e:
+            print(f"  [warning] RAG index build failed: {e} — falling back to LLM audit")
+            rag_index = []
+
+        if rag_index:
+            # Step 1: extract the list of specific claims from the prose
+            print("  [rag audit] Extracting claims from rationale ...")
+            claims: list[dict] = []
+            try:
+                raw_claims = _llm_chat(
+                    [
+                        {"role": "system", "content": _CLAIM_EXTRACT_SYSTEM},
+                        {"role": "user",   "content":
+                            _CLAIM_EXTRACT_PROMPT.replace(
+                                "RATIONALE_BODY_PLACEHOLDER", rationale_body)},
+                    ],
+                    llm_cfg=llm_cfg,
+                    openai_key=openai_key,
+                    temperature=0.0,
+                )
+                claims = _parse_audit_json(raw_claims)
+            except Exception as e:
+                print(f"  [warning] Claim extraction failed: {e}")
+
+            if claims:
+                # Step 2: embed all claims in a single batch call
+                print(f"  [rag audit] Embedding {len(claims)} claims ...")
+                try:
+                    claim_texts      = [c.get("claim", "") for c in claims]
+                    claim_embeddings = _embed_batch(claim_texts, openai_key)
+
+                    # Step 3: for each claim, retrieve the best matching page chunk
+                    for claim_dict, claim_emb in zip(claims, claim_embeddings):
+                        match = _rag_find_source(
+                            claim_emb, rag_index, claim_dict.get("claim", "")
+                        )
+                        if match and match["score"] >= 0.3:
+                            audit_entries.append({
+                                "section_num":    claim_dict.get("section_num"),
+                                "section_title":  claim_dict.get("section_title", ""),
+                                "claim":          claim_dict.get("claim", ""),
+                                "source_file":    match["source_file"],
+                                "page_ref":       f"p.{match['page']}",
+                                "supporting_text": match["text"],
+                                "citation_type":  match["citation_type"],
+                                "rag_score":      round(match["score"], 3),
+                            })
+                        else:
+                            # Low similarity → claim likely originates from deal config
+                            audit_entries.append({
+                                "section_num":    claim_dict.get("section_num"),
+                                "section_title":  claim_dict.get("section_title", ""),
+                                "claim":          claim_dict.get("claim", ""),
+                                "source_file":    "Deal Config",
+                                "page_ref":       None,
+                                "supporting_text": None,
+                                "citation_type":  "Deal Config",
+                                "rag_score":      round(match["score"], 3) if match else 0.0,
+                            })
+                except Exception as e:
+                    print(f"  [warning] RAG claim matching failed: {e}")
+
         if not audit_entries:
-            print("  [fallback] Audit JSON parse failed -- trying inline markers")
-            audit_entries = _fallback_citations_from_text(rationale_body)
-    except Exception as e:
-        print(f"  [warning] Audit call failed: {e} -- continuing without audit")
+            print("  [fallback] RAG audit empty — falling back to LLM audit ...")
+            can_rag = False  # trigger LLM fallback below
+
+    if not can_rag:
+        # LLM-based audit (original approach — Ollama / no OpenAI key / RAG failure)
+        combined_with_src = _merge_insights(extracted_reports, anonymize=False)
+        valid_filenames   = "\n".join(
+            f"  - {rpt['source_file']}"
+            for rpt in extracted_reports if rpt.get("source_file")
+        )
+        audit_prompt = (
+            _AUDIT_PROMPT_TEMPLATE
+            .replace("RATIONALE_BODY_PLACEHOLDER",  rationale_body)
+            .replace("SOURCE_DATA_PLACEHOLDER",     combined_with_src)
+            .replace("VALID_FILENAMES_PLACEHOLDER", valid_filenames)
+        )
+        print("  [generating] Source audit JSON (LLM) ...")
+        try:
+            raw_audit = _llm_chat(
+                [
+                    {"role": "system", "content": _AUDIT_SYSTEM},
+                    {"role": "user",   "content": audit_prompt},
+                ],
+                llm_cfg=llm_cfg,
+                openai_key=openai_key,
+                temperature=0.1,
+            )
+            audit_entries = _parse_audit_json(raw_audit)
+            if not audit_entries:
+                print("  [fallback] Audit JSON parse failed — trying inline markers")
+                audit_entries = _fallback_citations_from_text(rationale_body)
+        except Exception as e:
+            print(f"  [warning] Audit call failed: {e} — continuing without audit")
+
     t1_audit = time.perf_counter()
-    print(f"  [timing]    Source audit JSON: {t1_audit - t0_audit:.1f}s")
-    print(f"  [timing]    Total generation : {t1_audit - t0_rationale:.1f}s")
+    print(f"  [timing]    Source audit       : {t1_audit - t0_audit:.1f}s")
+    print(f"  [timing]    Total generation   : {t1_audit - t0_rationale:.1f}s")
 
     # ── Build document header ──────────────────────────────────────────────────
     prop_name   = subject_cfg.get("property_name", subject_cfg.get("deal_name", "Property"))
@@ -1507,6 +2084,7 @@ def run(
         extracted, subj, llm_cfg, openai_key,
         analyst_notes=analyst_notes,
         refinement_notes=refinement_notes,
+        force_refresh=force_refresh,
     )
 
     # ── Save outputs ──────────────────────────────────────────────────────────

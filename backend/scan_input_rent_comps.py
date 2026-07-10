@@ -895,6 +895,31 @@ def run(config_path: str = "configs/deal_config.json",
     for i, r in enumerate(classified):
         r["map_marker"] = str(i + 1)
 
+    # Rent often has several leases in the SAME building, so their pins land on
+    # the same spot. Show only the smallest marker per property on the map (and
+    # the geo sidecar); the Excel table still lists every lease.
+    def _marker_int(m):
+        try:
+            return int(m)
+        except (TypeError, ValueError):
+            return 10 ** 9
+
+    _min_marker_by_prop = {}
+    for r in classified:
+        _pn = str(r.get("property") or r.get("property_name") or "").lower().strip()
+        if not _pn:
+            continue
+        _mi = _marker_int(r.get("map_marker"))
+        if _pn not in _min_marker_by_prop or _mi < _min_marker_by_prop[_pn]:
+            _min_marker_by_prop[_pn] = _mi
+
+    def _map_primary(r):
+        """True for the lowest-numbered marker at a given property (dedup pins)."""
+        _pn = str(r.get("property") or r.get("property_name") or "").lower().strip()
+        if not _pn:
+            return True
+        return _marker_int(r.get("map_marker")) == _min_marker_by_prop.get(_pn)
+
     # ── Location competitiveness (SG, URA proximity vs subject) ───────────────
     # OneMap-geocoded comps only; others left blank. SG-only (URA Master Plan).
     if s_lon is not None and s_lat is not None:
@@ -938,7 +963,7 @@ def run(config_path: str = "configs/deal_config.json",
              "property":   str(r.get("property") or r.get("property_name") or ""),
              "address":    str(r.get("address") or ""),
              "lon": r.get("lon"), "lat": r.get("lat")}
-            for r in classified
+            for r in classified if _map_primary(r)
         ]
         write_geo_sidecar(out_geo, s_lon, s_lat, _geo_comps, mb_cfg)
         print(f"  Geo   → {out_geo}")
@@ -983,7 +1008,7 @@ def run(config_path: str = "configs/deal_config.json",
     if generate_map and s_lon is not None and s_lat is not None:
         comps_geo = [
             (r["map_marker"], r["lon"], r["lat"])
-            for r in classified if r.get("lon") is not None
+            for r in classified if r.get("lon") is not None and _map_primary(r)
         ]
         render_map(
             subject_lonlat=(s_lon, s_lat),
