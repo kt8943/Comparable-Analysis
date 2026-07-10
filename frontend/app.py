@@ -2852,6 +2852,52 @@ def render_new_deal_form():
         )
     st.divider()
 
+    # ── Import an existing deal config (skip the form) ───────────────────────
+    with st.expander("📥  Import a deal config (JSON) — skip the form"):
+        st.caption("Already have a deal config file (exported earlier)? Upload it "
+                   "to create the deal directly. Otherwise fill the form below — or "
+                   "upload a brief PDF in Step 1 and let the LLM build the config.")
+        _imp = st.file_uploader("Upload a deal JSON", type=["json"],
+                                key="nd_import_upl")
+        if _imp is not None and st.session_state.get("_nd_last_import") != _imp.name:
+            import base64 as _b64
+            try:
+                _data = json.loads(_imp.getvalue().decode("utf-8"))
+                if "subject_property" not in _data:
+                    raise ValueError("missing 'subject_property'")
+                _bundle = _data.pop("_bundle", None)
+                _sp = _data["subject_property"]
+                _dn = (_sp.get("deal_name") or _sp.get("property_name")
+                       or Path(_imp.name).stem)
+                import re as _re
+                _slug = (_re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", _dn)
+                         .strip(" .").replace(" ", "_") or "deal")
+                (ROOT / "configs").mkdir(exist_ok=True)
+                (ROOT / "configs" / f"deal_config_{_slug}.json").write_text(
+                    json.dumps(_data, indent=2), encoding="utf-8")
+                if _bundle:   # restore results (records / geo / Excel / map)
+                    _out_dir = ROOT / Path(_data.get("output_file",
+                                                     "output/x/x.xlsx")).parent
+                    _out_dir.mkdir(parents=True, exist_ok=True)
+                    for _name, _blob in _bundle.items():
+                        try:
+                            if "text" in _blob:
+                                (_out_dir / _name).write_text(_blob["text"], encoding="utf-8")
+                            elif "b64" in _blob:
+                                (_out_dir / _name).write_bytes(_b64.b64decode(_blob["b64"]))
+                        except Exception:
+                            pass
+                st.session_state["_nd_last_import"] = _imp.name
+                st.session_state["comp_deal"]       = _dn
+                st.session_state["deal_nav"]        = _dn
+                st.session_state["active_page"]     = "existing"
+                st.success(f"✅  Imported **{_dn}**"
+                           + (" with results" if _bundle else "")
+                           + " — opening it in Existing Deals…")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"Not a valid deal JSON: {_e}")
+
     # ── Step 1 ─────────────────────────────────────────────────────────────
     st.markdown("##### Step 1 — Deal essentials")
 
@@ -3192,85 +3238,44 @@ def render_comparable_analysis(deal_name=None, config_path=None):
                 config_path = None
                 cfg = subj = None
 
-    # ── Export / Import deal (portable per-user storage; no server DB needed) ──
+    # ── Export deal (portable per-user storage; no server DB needed) ──────────
     # On the cloud the filesystem is wiped on restart, so users keep their own deal
-    # as a JSON file on their machine: Export downloads it, Import restores it.
-    # Rendered BEFORE the "enter a subject" gate so Import is reachable on first
-    # entry (no deals, no subject typed). Auto-expanded in that empty state.
-    with st.expander("📤 Export / 📥 Import deal (save or restore as a file)",
-                     expanded=(subj is None)):
+    # as a JSON file on their machine. Export downloads it here; Import lives on the
+    # New Deal page (upload a config JSON, or a brief PDF for the LLM to extract).
+    with st.expander("📤 Export deal (save as a file)"):
         import base64 as _b64
-        _ec, _ic = st.columns(2)
-        with _ec:
-            _scope = st.radio(
-                "Export scope",
-                ["Subject only", "Subject + results (full restore)"],
-                key="export_scope",
-                help="'Subject only' saves just the deal setup (re-run comps after "
-                     "import). 'Subject + results' also bundles the generated comps, "
-                     "Excel and map so importing restores the finished analysis.")
-            try:
-                if config_path is None:
-                    raise ValueError("no subject yet")
-                _cfg_data = load_config(config_path)
-                _full = _scope.startswith("Subject +")
-                if _full:
-                    _out_dir = ROOT / Path(_cfg_data.get("output_file",
-                                                         "output/x/x.xlsx")).parent
-                    _bundle = {}
-                    if _out_dir.exists():
-                        for _f in _out_dir.iterdir():
-                            if not _f.is_file():
-                                continue
-                            if _f.suffix.lower() == ".json":
-                                _bundle[_f.name] = {"text": _f.read_text(encoding="utf-8")}
-                            elif _f.suffix.lower() in (".xlsx", ".png"):
-                                _bundle[_f.name] = {"b64": _b64.b64encode(_f.read_bytes()).decode()}
-                    _cfg_data["_bundle"] = _bundle
-                _out_name = Path(config_path).stem + ("_full" if _full else "") + ".json"
-                st.download_button("⬇️  Export", json.dumps(_cfg_data, indent=2),
-                                   file_name=_out_name, mime="application/json",
-                                   use_container_width=True)
-            except Exception:
-                st.caption("Nothing to export yet.")
-        with _ic:
-            _up = st.file_uploader("⬆️  Import a deal JSON", type=["json"],
-                                   key="import_deal_upl")
-        if _up is not None and st.session_state.get("_last_import_name") != _up.name:
-            try:
-                _data = json.loads(_up.getvalue().decode("utf-8"))
-                if "subject_property" not in _data:
-                    raise ValueError("missing 'subject_property'")
-                _bundle = _data.pop("_bundle", None)
-                _sp   = _data["subject_property"]
-                _dn   = (_sp.get("deal_name") or _sp.get("property_name")
-                         or Path(_up.name).stem)
-                import re as _re
-                _slug = (_re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", _dn)
-                         .strip(" .").replace(" ", "_") or "deal")
-                (ROOT / "configs").mkdir(exist_ok=True)
-                (ROOT / "configs" / f"deal_config_{_slug}.json").write_text(
-                    json.dumps(_data, indent=2), encoding="utf-8")
-                if _bundle:   # restore results (records / geo / Excel / map)
-                    _out_dir = ROOT / Path(_data.get("output_file",
+        _scope = st.radio(
+            "Export scope",
+            ["Subject only", "Subject + results (full restore)"],
+            key="export_scope",
+            help="'Subject only' saves just the deal setup (re-run comps after "
+                 "import). 'Subject + results' also bundles the generated comps, "
+                 "Excel and map so importing restores the finished analysis.")
+        try:
+            if config_path is None:
+                raise ValueError("no subject yet")
+            _cfg_data = load_config(config_path)
+            _full = _scope.startswith("Subject +")
+            if _full:
+                _out_dir = ROOT / Path(_cfg_data.get("output_file",
                                                      "output/x/x.xlsx")).parent
-                    _out_dir.mkdir(parents=True, exist_ok=True)
-                    for _name, _blob in _bundle.items():
-                        try:
-                            if "text" in _blob:
-                                (_out_dir / _name).write_text(_blob["text"], encoding="utf-8")
-                            elif "b64" in _blob:
-                                (_out_dir / _name).write_bytes(_b64.b64decode(_blob["b64"]))
-                        except Exception:
-                            pass
-                st.session_state["_last_import_name"] = _up.name
-                st.session_state["comp_deal"]         = _dn
-                st.success(f"✅  Imported **{_dn}**"
-                           + (" with results" if _bundle else "")
-                           + " — switch the toggle above to **📁 Existing deal** and select it.")
-                st.rerun()
-            except Exception as _e:
-                st.error(f"Not a valid deal JSON: {_e}")
+                _bundle = {}
+                if _out_dir.exists():
+                    for _f in _out_dir.iterdir():
+                        if not _f.is_file():
+                            continue
+                        if _f.suffix.lower() == ".json":
+                            _bundle[_f.name] = {"text": _f.read_text(encoding="utf-8")}
+                        elif _f.suffix.lower() in (".xlsx", ".png"):
+                            _bundle[_f.name] = {"b64": _b64.b64encode(_f.read_bytes()).decode()}
+                _cfg_data["_bundle"] = _bundle
+            _out_name = Path(config_path).stem + ("_full" if _full else "") + ".json"
+            st.download_button("⬇️  Export", json.dumps(_cfg_data, indent=2),
+                               file_name=_out_name, mime="application/json",
+                               use_container_width=True)
+        except Exception:
+            st.caption("Nothing to export yet — pick a deal above, or import one "
+                       "on the **New Deal** page.")
 
     # Subject gate — must come AFTER the Import panel so importing is always reachable.
     if subj is None:
