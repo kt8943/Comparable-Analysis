@@ -615,6 +615,11 @@ def _read_excel_preview(excel_path: str) -> "pd.DataFrame | None":
             if isinstance(v, bool):
                 return str(v)
             if isinstance(v, (int, float)):
+                # Map Marker is a plain index (1, 2, 3…), not a measured quantity —
+                # keep it a clean integer, never "1.0" (some sources store it as a
+                # real number rather than text).
+                if "marker" in col_name.lower():
+                    return str(int(v)) if float(v).is_integer() else str(v)
                 if col_name in _pct_col_names:
                     return f"{float(v) * 100:,.2f}%"
                 return f"{float(v):,.1f}"
