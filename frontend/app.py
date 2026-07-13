@@ -517,6 +517,12 @@ def _read_excel_preview(excel_path: str) -> "pd.DataFrame | None":
     """
     Read the formatted output Excel and return a clean DataFrame for preview.
     Handles the two-table layout (subject row + comps section).
+
+    DISPLAY ONLY formatting (the underlying Excel cell is untouched — see
+    _save_edited_preview/_coerce for the matching reverse-parse on save):
+      - plain numeric cells  → "1,200,000.0"  (comma thousands + 1 decimal)
+      - percentage-formatted cells (cap rate / yield, detected from the source
+        cell's own Excel number_format containing "%") → "4.50%"
     """
     try:
         import openpyxl
@@ -529,10 +535,16 @@ def _read_excel_preview(excel_path: str) -> "pd.DataFrame | None":
             if ws.column_dimensions.get(get_column_letter(i),
                type("_", (), {"hidden": False})()).hidden
         }
-        rows = [
-            tuple(c.value for i, c in enumerate(row, 1) if i not in hidden)
-            for row in ws.iter_rows()
-        ]
+        rows, fmts = [], []
+        for row in ws.iter_rows():
+            vals, fmt = [], []
+            for i, c in enumerate(row, 1):
+                if i in hidden:
+                    continue
+                vals.append(c.value)
+                fmt.append(c.number_format)
+            rows.append(tuple(vals))
+            fmts.append(tuple(fmt))
 
         # Find first header row (has ≥3 cells + contains 'property' + 'marker')
         header_row, header_idx = None, None
@@ -560,8 +572,8 @@ def _read_excel_preview(excel_path: str) -> "pd.DataFrame | None":
         if len(_keep_cols) < len(headers):
             headers = [headers[i] for i in _keep_cols]
 
-        data_rows = []
-        for row in rows[header_idx + 1:]:
+        data_rows, data_fmts = [], []
+        for row, fmt in zip(rows[header_idx + 1:], fmts[header_idx + 1:]):
             # Skip fully empty rows
             if all(c in (None, "") for c in row):
                 continue
@@ -577,9 +589,18 @@ def _read_excel_preview(excel_path: str) -> "pd.DataFrame | None":
             if any(str(v or "").strip().lower() == "average" for v in row):
                 continue
             data_rows.append([row[i] for i in _keep_cols if i < len(row)])
+            data_fmts.append([fmt[i] for i in _keep_cols if i < len(fmt)])
 
         if not data_rows:
             return None
+
+        # A column is percentage-type if ANY data cell's own Excel number_format
+        # contains "%" — checked by column NAME (unique post-dedup) so the lookup
+        # survives the "drop unnamed columns" filter below regardless of position.
+        _pct_col_names = {
+            headers[j] for j in range(len(headers))
+            if any(j < len(f) and "%" in str(f[j]) for f in data_fmts)
+        }
 
         df = pd.DataFrame(data_rows, columns=headers)
         # Drop only columns with no header (truly unnamed/invisible helper columns).
@@ -587,7 +608,22 @@ def _read_excel_preview(excel_path: str) -> "pd.DataFrame | None":
         # (Price psf, Adj Cap Rate) legitimately have None values when read by
         # openpyxl, but should still appear in the preview with "—" placeholders.
         df = df.loc[:, [bool(h.strip()) for h in df.columns]]
-        df = df.fillna("—").astype(str).replace("None", "—")
+
+        def _fmt_cell(col_name, v):
+            if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
+                return "—"
+            if isinstance(v, bool):
+                return str(v)
+            if isinstance(v, (int, float)):
+                if col_name in _pct_col_names:
+                    return f"{float(v) * 100:,.2f}%"
+                return f"{float(v):,.1f}"
+            return str(v)
+
+        df = pd.DataFrame(
+            {col: [_fmt_cell(col, v) for v in df[col]] for col in df.columns},
+            columns=df.columns,
+        )
         return df
 
     except Exception:
@@ -698,11 +734,24 @@ def _save_edited_preview(excel_path: str, edited_df: "pd.DataFrame") -> bool:
         # receives a numpy.int64 / numpy.float64 — those trip openpyxl's
         # internal style handling which expects str or native Python numerics.
         def _coerce(v):
+            import re as _re
             sv = str(v).strip()
             if sv in ("—", "None", "nan", ""):
                 return None
             if hasattr(v, "item"):
                 return v.item()
+            # Reverse the DISPLAY-ONLY formatting from _read_excel_preview so the
+            # cell is written back as a REAL number, not text — Excel's own
+            # AVERAGEIF / Price psf / Adj Cap Rate formulas need genuine numeric
+            # cells, and "1,200,000.0" or "4.50%" as literal text would silently
+            # break every downstream calculation.
+            if sv.endswith("%") and _re.fullmatch(r"-?[\d,]+(\.\d+)?%", sv):
+                f = float(sv[:-1].replace(",", "")) / 100
+                return f
+            _num_str = sv.replace(",", "")
+            if _re.fullmatch(r"-?\d+(\.\d+)?", _num_str):
+                f = float(_num_str)
+                return int(f) if f.is_integer() else f
             return v
 
         n_data = 0
@@ -2390,14 +2439,31 @@ def _apply_docx_font(doc, name: str = "Arial Narrow", size_pt: float = 10):
                 _set_runs(cell.paragraphs)
 
 
+# Space reserved below every section title (Pt) — used both to actually set the
+# paragraph's spacing AND, via _title_block_height_pt(), to compute how much of
+# the page a title consumes so a map placed right under it isn't sized as if it
+# had the whole page (which would overflow past the title / onto the next page).
+_TITLE_SPACE_BEFORE_PT = 6
+_TITLE_SPACE_AFTER_PT  = 10
+
+
+def _title_block_height_pt(size_pt: float = 11) -> float:
+    """Approximate total vertical space one section title occupies (its own
+    line height + the before/after spacing set in _style_section_title)."""
+    return _TITLE_SPACE_BEFORE_PT + _TITLE_SPACE_AFTER_PT + size_pt * 1.3
+
+
 def _style_section_title(paragraph, name: str = "Arial", size_pt: float = 11,
                          color_hex: str = _PGIM_NAVY):
     """Force a comp-section title (e.g. 'Rent Comparables') to Arial 11pt navy
-    bold. Call AFTER _apply_docx_font() — that pass force-sets Normal/Heading
-    styles + every run to the document-wide font, which would otherwise
-    overwrite this section title's font name/size right back."""
+    bold, with visible space after it before whatever follows (table or map).
+    Call AFTER _apply_docx_font() — that pass force-sets Normal/Heading styles +
+    every run to the document-wide font, which would otherwise overwrite this
+    section title's font name/size right back."""
     from docx.shared import Pt, RGBColor
     from docx.oxml.ns import qn
+    paragraph.paragraph_format.space_before = Pt(_TITLE_SPACE_BEFORE_PT)
+    paragraph.paragraph_format.space_after  = Pt(_TITLE_SPACE_AFTER_PT)
     hexv = color_hex.lstrip("#")
     rgb  = RGBColor(int(hexv[0:2], 16), int(hexv[2:4], 16), int(hexv[4:6], 16))
     for r in paragraph.runs:
@@ -2428,17 +2494,24 @@ def _png_size(path):
 
 
 def _add_map_fit(doc, map_path, usable_w, usable_h):
-    """Insert a map scaled to the largest size that fits the content box
-    (usable_w × usable_h), preserving aspect ratio."""
+    """Insert a map, CENTERED, scaled to the largest size that fits the given box
+    (usable_w × usable_h), preserving aspect ratio. Pass the box for the space the
+    map actually has available (e.g. usable_h minus a preceding title's height,
+    via _title_block_height_pt()) — not the full page — so it doesn't overflow
+    past whatever is above it."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     _pw, _ph = _png_size(str(map_path))
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run()
     try:
         if _pw and _ph and (_pw / _ph) < (usable_w / usable_h):
-            doc.add_picture(str(map_path), height=usable_h)   # tall image → cap height
+            run.add_picture(str(map_path), height=usable_h)   # tall image → cap height
         else:
-            doc.add_picture(str(map_path), width=usable_w)    # wide image → fill width
+            run.add_picture(str(map_path), width=usable_w)    # wide image → fill width
     except Exception:
         try:
-            doc.add_picture(str(map_path), width=usable_w)
+            run.add_picture(str(map_path), width=usable_w)
         except Exception:
             pass
 
@@ -2483,7 +2556,12 @@ def _build_combined_docx(deal_name: str, cfg: dict):
             # labelled (e.g. "Transaction Comparables (Asset Sales)") even if it
             # lands on its own page, separated from the table above it.
             _section_titles.append(doc.add_heading(title, level=1))
-            _add_map_fit(doc, maps[-1], _usable_w, _usable_h)
+            # Size the map to the space actually LEFT UNDER the title, not the
+            # whole page — otherwise a full-page-height map would overflow past
+            # the title it just sits below.
+            from docx.shared import Pt as _Pt
+            _map_usable_h = _usable_h - _Pt(_title_block_height_pt())
+            _add_map_fit(doc, maps[-1], _usable_w, _map_usable_h)
 
     rat = out_dir / "Investment_Rationale.md"
     if rat.exists():
