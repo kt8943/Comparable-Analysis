@@ -1254,6 +1254,17 @@ def run(config_path: str = "configs/deal_config.json",
 
         print(f"      → {len(records)} eligible transactions found (combined).")
 
+        # Backfill blank dates from each input file's report period (title / cover page),
+        # e.g. a comp with no row-level date in a "…Q2 2025…" report → "~Q2 2025".
+        try:
+            from tools.report_period import backfill_missing_dates
+            _nfill = backfill_missing_dates(records, "sale_date",
+                                            input_excel_files, input_pdf_files, input_image_files)
+            if _nfill:
+                print(f"      → filled {_nfill} blank sale date(s) from the report period")
+        except Exception as _e:
+            print(f"      [date-backfill] skipped: {_e}")
+
         # ── Save records to JSON sidecar ──────────────────────────────────────
         if records:
             with open(out_records, "w", encoding="utf-8") as rf:

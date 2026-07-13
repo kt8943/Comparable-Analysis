@@ -58,11 +58,12 @@ For one deal, from raw inputs to a single Word file:
 
 ## 5. The agentic components (what each one decides)
 
-### a) `comp_classifier` (backend/comp_classifier.py) — “what type is this file?”
-Auto-sorts each uploaded file into **sales / rent / land** so the analyst can drop everything into one box.
-- **Method:** extract text (PDF/Excel), score type-specific keywords (strong = 3 pts, weak = 1 pt), take the arg-max.
+### a) `comp_classifier` (backend/comp_classifier.py) — “what type(s) is this file?”
+Auto-sorts each uploaded file so the analyst can drop everything into one box. **Multi-label:** one file may contain more than one comp type (a broker PDF with a land table *and* a sales table) → it is routed to **each** matching scan, whose reject-markers keep each type's tables separate.
+- **Method:** extract text (PDF/Excel), score type-specific keywords (strong = 3 pts, weak = 1 pt), and mark a type **present** when it has ≥1 strong marker or ≥5 weak points (lean toward *including* — a scan for an absent type just returns nothing, while missing one loses comps).
 - **Signals:** **land** → “successful tenderer”, “psf ppr”, “per plot ratio”, “date of award”, “GLS”, “tender”; **sales** → “buyer”, “purchaser”, “vendor”, “cap rate”, “NPI yield”, “capitalisation rate”, “en bloc”; **rent** → “tenant”, “occupier”, “asking/gross/face/passing rent”, “lease term”, “vacancy”, “psf pm”.
-- **LLM tie-break:** only when scores are tied or all-zero (bounded, one call). Images/unreadable → **`unknown`** for the analyst to assign. A per-file **override dropdown** means no file is ever silently mis-filed.
+- **Market-report flag:** a file that reads like a research/outlook report (prose, forecasts) is flagged `is_report` → the UI nudges it to the **Market reports** box instead of forcing it into a comp type.
+- **LLM pass:** bounded, multi-label, only when the keyword signal is inconclusive (returns the set of present types + `is_report`). Images/unreadable → no types (analyst assigns). A per-file **multiselect** (pre-checked with the detected types) is the human override — nothing is ever silently mis-filed.
 
 ### b) `comp_acquisition_agent` (backend/comp_acquisition_agent.py) — “did it work, and what next?”
 A bounded **acquire → verify → evaluate → reflect → fallback** loop per comp type. It never invents numbers; it grades the deterministic extraction and decides the next source.

@@ -2,10 +2,14 @@
 """
 comp_classifier.py
 ==================
-Deterministic-first classifier that decides whether an uploaded file is a set of
-**Asset Sales**, **Leasing (Rent)**, or **Land Sales** comparables — so the user
-can drop every PDF/Excel into one box and the orchestrator routes each to the
-right scan tool (scan_input_sales_comps.py / _rent_ / _land_).
+Deterministic-first classifier that detects which comparable-table types an uploaded
+file contains — **Asset Sales**, **Leasing (Rent)**, and/or **Land Sales** — so the
+user can drop every PDF/Excel into one box and the orchestrator routes each file to
+the right scan tool(s). Classification is **multi-label**: one file may hold more than
+one type (a broker PDF with a land table AND a sales table), and it is routed to EACH
+matching scan (their reject-markers keep each type's tables separate). A file that
+reads like a market research/outlook report (not a comp table) is flagged is_report so
+the UI can nudge it to the Market reports box.
 
 Design (mirrors the project's principle: deterministic where the path is known):
   • Primary signal — keyword scoring on the file's text. The scan scripts already
@@ -68,6 +72,20 @@ _SIGNALS = {
 _STRONG_PTS, _WEAK_PTS = 3, 1
 _MARGIN = 3            # winner must beat runner-up by ≥ this to be "confident"
 _MIN_SIGNAL = 3        # below this total the text is treated as signal-free
+
+# Multi-label inclusion: a type's table is judged PRESENT when the file has ≥1 strong
+# marker for it, or enough weak points. Lean toward INCLUDING — a scan for an absent
+# type just returns nothing (harmless), while missing one loses comps.
+_PRESENT_STRONG = 1    # ≥1 strong marker ⇒ present
+_PRESENT_WEAK   = 5    # …or ≥5 weak-only points
+
+# A market research / outlook report discusses every sector, so it trips comp keywords;
+# these flag "prose, not a comp table" so the UI can nudge it to the Market reports box.
+_REPORT_MARKERS = [
+    "outlook", "market report", "research report", "marketbeat", "market commentary",
+    "executive summary", "forecast", "our view", "market overview", "market pulse",
+    "research & forecast", "quarterly report", "market insights", "economic overview",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,18 +163,41 @@ def score_text(text: str) -> dict:
     return {"scores": scores, "hits": hits}
 
 
+def _present_types(scores: dict, hits: dict) -> list:
+    """Every comp type whose table looks PRESENT (multi-label), best-scored first."""
+    present = []
+    for t in ("sales", "rent", "land"):
+        strong = sum(1 for h in hits.get(t, []) if h in _SIGNALS[t]["strong"])
+        if strong >= _PRESENT_STRONG or scores.get(t, 0) >= _PRESENT_WEAK:
+            present.append(t)
+    present.sort(key=lambda t: scores.get(t, 0), reverse=True)
+    return present
+
+
+def _looks_like_report(text: str, name: str) -> bool:
+    """True when the file reads like a market research / outlook report (prose,
+    forecasts) rather than a table of named transactions."""
+    blob = (name + " " + (text or "")).lower()
+    return sum(1 for m in _REPORT_MARKERS if m in blob) >= 2
+
+
 _LLM_SYSTEM = (
-    "You classify a real-estate comparables document into exactly one of: "
-    "\"sales\" (asset / building sale transactions, with buyers, cap rates, NPI yields), "
-    "\"rent\" (leasing deals, tenants, asking/effective rents), or "
-    "\"land\" (land / GLS site sales, tenderers, price psf ppr). "
-    "Reply ONLY as JSON: {\"type\": \"sales|rent|land|unknown\", \"reason\": \"<8 words\"}. "
-    "Use \"unknown\" if the excerpt is not a comparables table."
+    "You label a real-estate document by WHICH comparable-transaction table types it "
+    "contains — a single document may contain MORE THAN ONE. Types: "
+    "\"sales\" (asset/building sale transactions — buyers, cap rates, NPI yields), "
+    "\"rent\" (leasing deals — tenants, asking/effective rents), "
+    "\"land\" (land/GLS site sales — tenderers, price psf ppr). "
+    "Also set is_report=true if it is a market research / outlook REPORT (prose, "
+    "forecasts) rather than a table of named transactions. "
+    "Reply ONLY as JSON: {\"types\": [\"sales\"|\"rent\"|\"land\", ...], "
+    "\"is_report\": true|false, \"reason\": \"<10 words\"}. "
+    "Use an empty types list when no comparable table is present."
 )
 
 
 def _llm_classify(text: str, llm_cfg: dict, openai_key: str = "") -> dict | None:
-    """One bounded LLM tie-break. Returns {type, reason} or None on any failure."""
+    """One bounded, multi-label LLM pass. Returns {types:[...], is_report:bool, reason}
+    or None on any failure."""
     excerpt = re.sub(r"\s+", " ", text or "")[:4000]
     if not excerpt.strip():
         return None
@@ -181,12 +222,11 @@ def _llm_classify(text: str, llm_cfg: dict, openai_key: str = "") -> dict | None
             return None
         m = re.search(r"\{.*\}", raw, re.S)
         obj = json.loads(m.group(0) if m else raw)
-        t = str(obj.get("type", "")).lower().strip()
-        if t in ("sales", "rent", "land", "unknown"):
-            return {"type": t, "reason": str(obj.get("reason", "")).strip()}
+        types = [t for t in (obj.get("types") or []) if t in ("sales", "rent", "land")]
+        return {"types": types, "is_report": bool(obj.get("is_report")),
+                "reason": str(obj.get("reason", "")).strip()}
     except Exception:
         return None
-    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,48 +235,61 @@ def _llm_classify(text: str, llm_cfg: dict, openai_key: str = "") -> dict | None
 _LABEL = {"sales": "Asset Sales", "rent": "Rent", "land": "Land", "unknown": "Unknown"}
 
 
+def _result(p, types, is_report, confidence, scores, reason, method) -> dict:
+    """Assemble the return. Keeps single-label keys (type/label) for backward-compat
+    while adding `types` (multi-label list) and `is_report`."""
+    return {
+        "path": str(p), "name": p.name,
+        "types": list(types),                       # multi-label (may be [], 1, or many)
+        "type": types[0] if types else "unknown",   # primary — back-compat
+        "label": " + ".join(_LABEL[t] for t in types) if types else _LABEL["unknown"],
+        "is_report": bool(is_report),
+        "confidence": confidence, "scores": scores,
+        "reason": reason, "method": method,
+    }
+
+
 def classify_file(path, llm_cfg: dict | None = None, openai_key: str = "",
                   allow_llm: bool = True) -> dict:
-    """Classify one file.
+    """Classify one file (MULTI-LABEL). A file may contain more than one comp-table
+    type, or be a market report.
 
-    Returns {path, name, type ∈ {sales,rent,land,unknown}, label, confidence
-    ∈ {high,low,none}, scores, reason, method}. Keyword-first; LLM only breaks a
-    genuine tie / signal-free text when an LLM is configured."""
+    Returns {path, name, types:[…], type (primary), label, is_report, confidence
+    ∈ {high,low,none}, scores, reason, method}. Keyword-first; the multi-label LLM pass
+    only runs when the keyword signal is inconclusive and an LLM is configured."""
     p = Path(path)
     text = extract_text(p)
     sc = score_text(text)
     scores, hits = sc["scores"], sc["hits"]
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    top_type, top_score = ranked[0]
-    second_score = ranked[1][1] if len(ranked) > 1 else 0
-    margin = top_score - second_score
+    present = _present_types(scores, hits)
+    is_report = _looks_like_report(text, p.name)
 
-    # Clear keyword winner
-    if top_score >= _MIN_SIGNAL and margin >= _MARGIN:
-        why = ", ".join(hits[top_type][:4]) or "keyword match"
-        return {"path": str(p), "name": p.name, "type": top_type,
-                "label": _LABEL[top_type], "confidence": "high",
-                "scores": scores, "reason": f"matched: {why}", "method": "keywords"}
+    # Clear keyword signal — one or more types present
+    if present:
+        conf = "high" if (len(present) == 1 and not is_report) else "low"
+        why = ", ".join(hits[present[0]][:4]) or "keyword match"
+        reason = ("matched: " + why
+                  + ("; also reads like a market report" if is_report else ""))
+        return _result(p, present, is_report, conf, scores, reason, "keywords")
 
-    # Ambiguous or signal-free → optional single LLM tie-break
+    # Inconclusive keywords → one bounded multi-label LLM pass if available
     if allow_llm and (llm_cfg or openai_key):
         llm = _llm_classify(text, llm_cfg or {}, openai_key)
-        if llm and llm["type"] != "unknown":
-            return {"path": str(p), "name": p.name, "type": llm["type"],
-                    "label": _LABEL[llm["type"]], "confidence": "low",
-                    "scores": scores,
-                    "reason": llm.get("reason") or "LLM tie-break", "method": "llm"}
+        if llm and (llm["types"] or llm["is_report"]):
+            return _result(p, llm["types"], llm["is_report"] or is_report, "low",
+                           scores, llm.get("reason") or "LLM", "llm")
 
-    # Fall back to the best keyword guess if there was *any* signal, else unknown
-    if top_score >= _MIN_SIGNAL:
-        why = ", ".join(hits[top_type][:4]) or "weak keyword match"
-        return {"path": str(p), "name": p.name, "type": top_type,
-                "label": _LABEL[top_type], "confidence": "low",
-                "scores": scores, "reason": f"best guess: {why}", "method": "keywords"}
-    return {"path": str(p), "name": p.name, "type": "unknown",
-            "label": _LABEL["unknown"], "confidence": "none",
-            "scores": scores,
-            "reason": "no comp-type signal found — please assign", "method": "none"}
+    # Weak single guess if there was any signal; else report / unknown
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    if ranked[0][1] >= _MIN_SIGNAL:
+        t = ranked[0][0]
+        why = ", ".join(hits[t][:4]) or "weak keyword match"
+        return _result(p, [t], is_report, "low", scores, f"best guess: {why}", "keywords")
+    if is_report:
+        return _result(p, [], True, "none", scores,
+                       "looks like a market report — use the Market reports box", "report")
+    return _result(p, [], False, "none", scores,
+                   "no comp-type signal found — please assign", "none")
 
 
 def classify_files(paths, llm_cfg: dict | None = None, openai_key: str = "",
@@ -251,5 +304,6 @@ def classify_files(paths, llm_cfg: dict | None = None, openai_key: str = "",
 if __name__ == "__main__":
     for f in sys.argv[1:]:
         r = classify_file(f, allow_llm=False)
-        print(f"{r['label']:<12} [{r['confidence']:<4}] {Path(f).name}"
+        tag = r["label"] + ("  +report" if r["is_report"] else "")
+        print(f"{tag:<24} [{r['confidence']:<4}] {Path(f).name}"
               f"  scores={r['scores']}  — {r['reason']}")

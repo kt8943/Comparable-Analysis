@@ -925,6 +925,16 @@ def run(config_path: str = "configs/deal_config.json",
 
         print(f"      → {len(records)} valid records extracted (combined)")
 
+        # Backfill blank dates from each input file's report period (title / cover page).
+        try:
+            from tools.report_period import backfill_missing_dates
+            _nfill = backfill_missing_dates(records, "launch_date",
+                                            input_excel_files, input_pdf_files, input_image_files)
+            if _nfill:
+                print(f"      → filled {_nfill} blank launch date(s) from the report period")
+        except Exception as _e:
+            print(f"      [date-backfill] skipped: {_e}")
+
         if records:
             with open(out_records, "w", encoding="utf-8") as rf:
                 json.dump(records, rf, indent=2, default=str)

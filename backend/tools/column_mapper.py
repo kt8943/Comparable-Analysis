@@ -387,11 +387,16 @@ def map_columns(
     """
     Map input Excel/PDF headers to schema field keys.
 
-    Tier 1 — Exact match  : normalised header == known synonym (fast, zero false-positives)
-    Tier 2 — Embedding    : cosine similarity vs per-field synonym corpus (all-MiniLM-L6-v2)
-                            Skipped gracefully if sentence-transformers is not installed.
-    Tier 3 — LLM          : GPT / Ollama for columns still unresolved after embedding.
-                            Only called when Tier 1+2 leave gaps.
+    Stage A — Prepare (deterministic): value-based disambiguation, exact-synonym match,
+                          and the strong-keyword price rule. Zero false-positives.
+    Stage B — Match (fuzzy): embedding cosine similarity (all-MiniLM-L6-v2), then
+                          GPT / Ollama for whatever is still unresolved. Skipped when
+                          nothing is left, or in rule-based mode.
+    Stage C — Verify & reflect: a deterministic value-plausibility check flags mappings
+                          whose column VALUES don't fit the field (plus shaky embeddings);
+                          an LLM (GPT or Ollama) then re-maps ONLY the flagged fields, with
+                          the confident ones locked. In rule-based mode the flags are
+                          emitted as warnings and mappings are left unchanged.
 
     Returns
     -------
@@ -405,12 +410,14 @@ def map_columns(
     col_map:  dict[str, int | None] = {k: None for k in all_keys}
     unit_map: dict[str, float]      = {k: 1.0  for k in all_keys}
     claimed:  dict[int, str]        = {}  # col_idx → field_key that claimed it
+    methods:  dict[str, str]        = {}  # field_key → how it was resolved (provenance)
 
     def _assign(field_key: str, col_idx: int, method: str) -> None:
         col_map[field_key]  = col_idx
         unit_map[field_key] = (1.0 if passthrough_units
                                else detect_unit_multiplier(headers[col_idx], field_key))
         claimed[col_idx]    = field_key
+        methods[field_key]  = method
         mult_tag = f" ×{unit_map[field_key]:.4g}" if unit_map[field_key] != 1.0 else ""
         print(f"    {field_key:<22} → col {col_idx} ({headers[col_idx]!r}){mult_tag}  [{method}]")
 
@@ -443,7 +450,143 @@ def map_columns(
             if 0 <= col_idx < n and col_idx not in claimed:
                 _assign(field_key, col_idx, method)
 
-    # ── Tier 1: Exact match ────────────────────────────────────────────────────
+    def _verify_reflect() -> None:
+        """STAGE C — flag mappings whose column VALUES don't fit the field (method-
+        agnostic, currency-safe) + shaky embeddings, then let the LLM (GPT/Ollama)
+        re-map ONLY the flagged fields with the confident ones locked. Rule-based mode
+        prints warnings and changes nothing. Snapshot-restores on any error so verify
+        can never worsen a mapping."""
+        _snap = (dict(col_map), dict(unit_map), dict(claimed), dict(methods))
+        try:
+            def _vals(idx):
+                return [r[idx] for r in (sample_rows or [])
+                        if idx is not None and idx < len(r) and r[idx] not in (None, "")]
+            def _num(v):
+                s = re.sub(r"[^\d.\-]", "", str(v))
+                try:
+                    return float(s) if s not in ("", "-", ".", "--") else None
+                except ValueError:
+                    return None
+            def _datelike(v):
+                s = str(v).lower()
+                return bool(re.search(r"(19|20)\d\d", s) or re.search(r"\bq[1-4]\b", s)
+                            or re.search(r"\d{1,2}[/-]\d{1,2}", s)
+                            or any(m in s for m in ("jan", "feb", "mar", "apr", "may", "jun",
+                                                    "jul", "aug", "sep", "oct", "nov", "dec")))
+            def _median(nums):
+                s = sorted(nums)
+                return s[len(s) // 2] if s else None
+            def _kind(key):
+                k = key.lower()
+                if "date" in k:
+                    return "date"
+                if "rate" in k or "yield" in k:
+                    return "rate"
+                if "tenure" in k or k.endswith("_yrs") or "remaining" in k:
+                    return "years"
+                if any(t in k for t in ("name", "address", "buyer", "seller", "tenant", "tenderer")):
+                    return "label"
+                if any(t in k for t in ("price", "rent", "psf", "psm", "ppr", "amount", "cost")):
+                    return "money"
+                if any(t in k for t in ("area", "gfa", "nla", "gla", "site")) or k.endswith("_sf"):
+                    return "area"
+                return "any"
+
+            # 1) deterministic value-plausibility flags
+            flags: dict[str, str] = {}
+            for fk, idx in col_map.items():
+                if idx is None:
+                    continue
+                vals = _vals(idx)
+                if not vals:
+                    continue
+                kind = _kind(fk)
+                hdr  = headers[idx]
+                df   = sum(1 for v in vals if re.search(r"\d", str(v))) / len(vals)
+                pure = sum(1 for v in vals if not re.search(r"[A-Za-z]", str(v))) / len(vals)
+                if kind in ("money", "area") and df < 0.5:
+                    flags[fk] = f"expects numbers, col {idx} ({hdr!r}) is mostly text"
+                elif kind == "label" and pure > 0.7:
+                    flags[fk] = f"expects a name/address, col {idx} ({hdr!r}) is pure numbers (geocoding risk)"
+                elif kind == "rate":
+                    nums = [x for x in (_num(v) for v in vals) if x is not None]
+                    med  = _median(nums)
+                    if med is not None and med > 30:
+                        flags[fk] = f"col {idx} ({hdr!r}) values too large for a rate/yield (median {med:g})"
+                elif kind == "years":
+                    nums = [x for x in (_num(v) for v in vals) if x is not None]
+                    med  = _median(nums)
+                    if med is not None and med > 999:
+                        flags[fk] = f"col {idx} ({hdr!r}) values out of range for tenure/years"
+                elif kind == "date":
+                    if sum(1 for v in vals if _datelike(v)) / len(vals) < 0.5:
+                        flags[fk] = f"col {idx} ({hdr!r}) values are not date-like"
+                if fk not in flags:                          # provenance: shaky embedding
+                    m = re.match(r"embed\(([0-9.]+)\)", methods.get(fk, ""))
+                    if m and float(m.group(1)) < 0.45:
+                        flags[fk] = f"low-confidence embedding match ({m.group(1)})"
+
+            if not flags:
+                return
+            print("    [verify] flagged mapping(s):")
+            for fk, why in flags.items():
+                print(f"      ⚑ {fk}: {why}")
+
+            # 2) reflect — LLM re-maps ONLY the flagged fields (rule mode: warnings only)
+            provider = (llm_cfg or {}).get("provider", "ollama")
+            if provider in ("none", "rules") or not (provider == "openai" or base_url):
+                print("      (rule-based / no LLM — left unchanged; review manually)")
+                return
+            locked = {fk: idx for fk, idx in col_map.items()
+                      if idx is not None and fk not in flags}
+            all_cols, all_descs, sample_str = _build_llm_inputs(list(flags))
+            flagged_desc = {fk: f"{all_descs.get(fk, '')} [flagged: {flags[fk]}]" for fk in flags}
+            system = (
+                "You fix a few likely-wrong column mappings in a real-estate comparables "
+                "table. Decide from the SAMPLE VALUES, not just header words. Re-map ONLY the "
+                "flagged fields; never reuse a locked column. Return ONLY a JSON object "
+                "{\"field_key\": column_index_or_null}.")
+            user = (
+                f"All columns (index: header):\n{json.dumps(all_cols, indent=2)}\n\n"
+                f"Sample rows:\n{sample_str}\n\n"
+                f"Locked (correct — do not touch, do not reuse their columns):\n{json.dumps(locked)}\n\n"
+                "FLAGGED fields to re-map (key: description [why]):\n"
+                + "\n".join(f'  "{k}": {d}' for k, d in flagged_desc.items())
+                + "\n\nFor each flagged field pick the best column index by its values, or null if none fits.")
+            messages = [{"role": "system", "content": system},
+                        {"role": "user", "content": user}]
+            try:
+                raw = (openai_chat(llm_cfg, messages, json_mode=True) if provider == "openai"
+                       else ollama_post(base_url, model, messages))
+                raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+                raw = re.sub(r"\n?```$", "", raw)
+                result = json.loads(raw)
+            except Exception as e:
+                print(f"      [verify] LLM remap skipped: {e} — mappings unchanged")
+                return
+            # free flagged fields, then apply the corrected mapping (locked cols stay claimed)
+            orig = {fk: col_map[fk] for fk in flags}
+            for fk in flags:
+                ci = col_map[fk]
+                if ci is not None and claimed.get(ci) == fk:
+                    del claimed[ci]
+                col_map[fk] = None
+                methods.pop(fk, None)
+            _apply_llm_result(result, list(flags), "verify")
+            # if the LLM left a shaky-embedding field unmapped, restore the original guess
+            for fk in flags:
+                if col_map[fk] is None and flags[fk].startswith("low-confidence embedding"):
+                    ci = orig[fk]
+                    if ci is not None and ci not in claimed:
+                        _assign(fk, ci, "embed(kept)")
+        except Exception as e:
+            col_map.clear();  col_map.update(_snap[0])
+            unit_map.clear(); unit_map.update(_snap[1])
+            claimed.clear();  claimed.update(_snap[2])
+            methods.clear();  methods.update(_snap[3])
+            print(f"  [column_mapper] verify step skipped ({e}); mapping unchanged")
+
+    # ── STAGE A · Prepare (deterministic: value rules → exact synonyms → price rule) ──
     # Normalize synonyms the same way headers are normalized so that headers
     # like 'PRICE (S$ Million)' → 'price s million' match the synonym
     # "price s million" even though the raw synonym has no special chars.
@@ -500,9 +643,10 @@ def map_columns(
 
     unresolved = [k for k in all_keys if col_map[k] is None]
     if not unresolved:
+        _verify_reflect()
         return col_map, unit_map
 
-    # ── Tier 2: Embedding similarity ──────────────────────────────────────────
+    # ── STAGE B · Match — embedding similarity ────────────────────────────────
     if unresolved and _EMBED_AVAILABLE:
         emb_model  = _get_embed_model()
         field_vecs = _build_field_embeddings(unresolved, output_fields, extra_fields)
@@ -524,16 +668,19 @@ def map_columns(
 
     unresolved = [k for k in all_keys if col_map[k] is None]
     if not unresolved:
+        _verify_reflect()
         return col_map, unit_map
 
-    # ── Tier 3: LLM — only for columns still unresolved after embedding ────────
+    # ── STAGE B · Match — LLM (only for columns still unresolved) ──────────────
     provider = (llm_cfg or {}).get("provider", "ollama")
 
-    # Rule-based mode: no LLM tier. Any columns Tier 1/2 couldn't resolve stay None.
+    # Rule-based mode: no LLM match tier. Unresolved columns stay None; Stage C still
+    # runs (as warnings only) so a wrong deterministic mapping is still flagged.
     if provider in ("none", "rules"):
         for field_key in all_keys:
             if col_map[field_key] is None:
                 print(f"    {field_key:<22} → not found")
+        _verify_reflect()
         return col_map, unit_map
 
     all_cols, all_descs, sample_str = _build_llm_inputs(unresolved)
@@ -589,6 +736,7 @@ def map_columns(
         if col_map[field_key] is None:
             print(f"    {field_key:<22} → not found")
 
+    _verify_reflect()
     return col_map, unit_map
 
 

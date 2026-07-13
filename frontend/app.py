@@ -4470,7 +4470,8 @@ def _classify_uploads(files):
     """Auto-detect the comp type (sales / rent / land) of each staged upload using
     backend/comp_classifier.py. Keyword-only (instant, offline) — the analyst can
     override in the UI. Cached per (name,size) so Streamlit reruns don't reclassify.
-    Returns [{name, type, label, confidence, reason, scores}]."""
+    Multi-label: each result carries `types` (list) + `is_report` (see comp_classifier).
+    Returns [{name, types, type, label, is_report, confidence, reason, scores}]."""
     import comp_classifier as clf
     cache = st.session_state.setdefault("_ov_cls_cache", {})
     out = []
@@ -4485,7 +4486,8 @@ def _classify_uploads(files):
                 tmp.close()
                 res = clf.classify_file(tmp.name, allow_llm=False)
             except Exception as _e:
-                res = {"type": "unknown", "label": "Unknown", "confidence": "none",
+                res = {"type": "unknown", "types": [], "label": "Unknown",
+                       "is_report": False, "confidence": "none",
                        "reason": f"could not read ({_e})", "scores": {}}
             finally:
                 try:
@@ -4663,43 +4665,56 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
                 accept_multiple_files=True, key="ov_up_multi",
                 label_visibility="collapsed")
 
-            # Auto-detect each staged file's comp type; let the analyst override.
-            _assign = []                     # [(uploaded_file, comp_type)]
+            # Auto-detect each staged file's comp type(s); analyst overrides via the
+            # multiselect (a file may hold more than one → routed to each type's scan).
+            _assign = []                     # [(uploaded_file, [comp_types])]
             _labels_by_type = {t: v[0] for t, v in _TYPE_TO_COMP.items()}
             _type_labels = list(_labels_by_type.values())
+            _label_to_type = {lb: t for t, lb in _labels_by_type.items()}
             if ov_comp_files:
                 _cls = {c["name"]: c for c in _classify_uploads(ov_comp_files)}
-                st.caption("🪄 Detected type per file — override if wrong:")
+                st.caption("🪄 Detected type(s) per file — tick/untick to override "
+                           "(a file may hold more than one):")
                 for _uf in ov_comp_files:
                     _c = _cls.get(_uf.name, {})
-                    _dlabel = _labels_by_type.get(_c.get("type", "unknown"))
-                    _idx = _type_labels.index(_dlabel) if _dlabel in _type_labels else 0
+                    _dtypes = _c.get("types")
+                    if _dtypes is None:      # back-compat if classifier returned single
+                        _dtypes = [_c["type"]] if _c.get("type") in _labels_by_type else []
+                    _defaults = [_labels_by_type[t] for t in _dtypes if t in _labels_by_type]
                     _badge = ("✅" if _c.get("confidence") == "high"
                               else "🟡" if _c.get("confidence") == "low" else "❓")
                     _cc1, _cc2 = st.columns([3, 2])
                     _cc1.markdown(f"{_badge} `{_uf.name}`")
                     _cc1.caption(_c.get("reason", ""))
-                    _sel = _cc2.selectbox(
-                        "type", _type_labels, index=_idx,
-                        key=f"ov_sort_{_uf.name}", label_visibility="collapsed")
-                    _seltype = next(t for t, lb in _labels_by_type.items() if lb == _sel)
-                    _assign.append((_uf, _seltype))
+                    if _c.get("is_report"):
+                        _cc1.caption("🟡 reads like a market report — consider the "
+                                     "**📄 Market reports** box instead.")
+                    _sel = _cc2.multiselect(
+                        "types", _type_labels, default=_defaults,
+                        key=f"ov_sort2_{_uf.name}", label_visibility="collapsed",
+                        placeholder="Choose comp type(s)…")
+                    _assign.append((_uf, [_label_to_type[lb] for lb in _sel]))
 
             if st.button("💾  Save & sort", key="ov_comp_save",
                          use_container_width=True, disabled=not ov_comp_files):
                 _c = load_config(config_path)
                 _byt = {}
-                for _uf, _t in _assign:
-                    _byt.setdefault(_t, []).append(_uf)
-                for _t, _grp in _byt.items():
-                    _lbl, _ek, _pk, _ik, _scr, _pfx = _TYPE_TO_COMP[_t]
-                    _c = _save_uploads_append(_c, _ek, _pk, _ik, _grp)
-                Path(config_path).write_text(
-                    json.dumps(_c, indent=2, ensure_ascii=False), encoding="utf-8")
-                st.success("Saved & sorted (by comp_classifier): "
-                           + ", ".join(f"{len(g)}→{_TYPE_TO_COMP[t][0].strip()}"
-                                       for t, g in _byt.items()))
-                st.rerun()
+                for _uf, _ts in _assign:
+                    for _t in _ts:                       # one file → each chosen type
+                        _byt.setdefault(_t, []).append(_uf)
+                if not _byt:
+                    st.warning("No comp type selected — nothing saved. Tick a type, or "
+                               "use the 📄 Market reports box for research reports.")
+                else:
+                    for _t, _grp in _byt.items():
+                        _lbl, _ek, _pk, _ik, _scr, _pfx = _TYPE_TO_COMP[_t]
+                        _c = _save_uploads_append(_c, _ek, _pk, _ik, _grp)
+                    Path(config_path).write_text(
+                        json.dumps(_c, indent=2, ensure_ascii=False), encoding="utf-8")
+                    st.success("Saved & sorted (by comp_classifier): "
+                               + ", ".join(f"{len(g)}→{_TYPE_TO_COMP[t][0].strip()}"
+                                           for t, g in _byt.items()))
+                    st.rerun()
 
             # Saved files, grouped by type, each independently removable.
             for _t, (_lbl, _ek, _pk, _ik, _scr, _pfx) in _TYPE_TO_COMP.items():
