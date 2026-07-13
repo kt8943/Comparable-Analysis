@@ -426,6 +426,15 @@ def _try_parse_date(s):
     import re as _re
     from datetime import datetime as _dt
     s = str(s).strip()
+    # Strip the "~" circa-marker that report_period.backfill_missing_dates prefixes
+    # onto a date INFERRED from the report title/cover page (e.g. "~Q4 2023") when a
+    # comp had no row-level date. Without this, the leading "~" breaks every format
+    # below AND the quarter regex (re.match anchors at position 0) — the value then
+    # falls through to a plain string compare, and a year/date filter silently keeps
+    # it forever instead of comparing it (both filter primitives treat "unparseable"
+    # as "keep", so this exact bug is what let ~-dated comps survive a "keep only
+    # year 2024" filter).
+    s = s.lstrip("~").strip()
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%Y", "%b %Y", "%B %Y", "%Y"):
         try:
             return _dt.strptime(s[:10], fmt)

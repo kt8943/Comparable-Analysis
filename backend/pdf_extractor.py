@@ -1230,6 +1230,7 @@ def _gpt_extract_full_pdf(
           f"at detail='high' ...")
 
     all_items: list = []
+    _failed_batches: list = []   # (b, start, end, messages) — still-failing after retries
     for b in range(n_batches):
         start = b * batch_size
         end   = min(start + batch_size, n_pages)
@@ -1292,8 +1293,39 @@ def _gpt_extract_full_pdf(
                     _time.sleep(wait)
                 else:
                     print(f"  [GPT-4o] batch {b + 1} failed: {e}")
+                    if "429" in err:
+                        _failed_batches.append((b, start, end, messages))
                     break
     doc.close()
+
+    # ── Delayed retry sweep for batches still failing after their normal retries ──
+    # A batch that hits 429 through all 3 immediate attempts doesn't necessarily mean
+    # the pages are unreadable — it usually means the org's per-minute token budget
+    # was still saturated by the OTHER batches/files this run just sent. By the time
+    # every other batch has been tried, real time has passed and the rolling window
+    # has very likely cleared, so give each still-failed batch one more shot after a
+    # longer cooldown rather than silently losing that page range's transactions.
+    if _failed_batches:
+        print(f"  [GPT-4o] {len(_failed_batches)} batch(es) still rate-limited — "
+              f"cooling down 20s before a final retry sweep ...")
+        _time.sleep(20)
+        for b, start, end, messages in _failed_batches:
+            try:
+                print(f"  [GPT-4o] retry sweep — batch {b + 1}/{n_batches} "
+                      f"— pages {start + 1}-{end} …")
+                raw = _openai_chat(llm_cfg, messages, timeout=300)
+                raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+                raw = re.sub(r"\n?```$", "", raw)
+                m   = re.search(r"\[[\s\S]*\]", raw)
+                if m:
+                    extracted = json.loads(m.group(0))
+                    if isinstance(extracted, list):
+                        all_items.extend(x for x in extracted if isinstance(x, dict))
+                        print(f"  [GPT-4o] retry sweep — batch {b + 1} recovered "
+                              f"{len(extracted)} item(s)")
+            except Exception as e:
+                print(f"  [GPT-4o] retry sweep — batch {b + 1} still failed: {e} "
+                      f"— this page range's transactions are lost")
 
     result = []
     for item in all_items:

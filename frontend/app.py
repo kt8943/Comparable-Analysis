@@ -2390,6 +2390,30 @@ def _apply_docx_font(doc, name: str = "Arial Narrow", size_pt: float = 10):
                 _set_runs(cell.paragraphs)
 
 
+def _style_section_title(paragraph, name: str = "Arial", size_pt: float = 11,
+                         color_hex: str = _PGIM_NAVY):
+    """Force a comp-section title (e.g. 'Rent Comparables') to Arial 11pt navy
+    bold. Call AFTER _apply_docx_font() — that pass force-sets Normal/Heading
+    styles + every run to the document-wide font, which would otherwise
+    overwrite this section title's font name/size right back."""
+    from docx.shared import Pt, RGBColor
+    from docx.oxml.ns import qn
+    hexv = color_hex.lstrip("#")
+    rgb  = RGBColor(int(hexv[0:2], 16), int(hexv[2:4], 16), int(hexv[4:6], 16))
+    for r in paragraph.runs:
+        r.font.name  = name
+        r.font.size  = Pt(size_pt)
+        r.font.bold  = True
+        r.font.color.rgb = rgb
+        rpr = r._element.get_or_add_rPr()
+        rfonts = rpr.find(qn("w:rFonts"))
+        if rfonts is None:
+            rfonts = rpr.makeelement(qn("w:rFonts"), {})
+            rpr.append(rfonts)
+        for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+            rfonts.set(qn(attr), name)
+
+
 def _png_size(path):
     """(width, height) in pixels from a PNG header, else (None, None)."""
     try:
@@ -2445,15 +2469,20 @@ def _build_combined_docx(deal_name: str, cfg: dict):
         doc.add_paragraph(subj["address"])
 
     any_content = False
+    _section_titles = []          # heading paragraphs to style Arial/11pt/navy at the end
     for prefix, _heading, title, _sub_banner, _comp_banner, _avg_kw in _COMP_TYPES:
         xls, used = _latest_comp_excel(out_dir, prefix)
         if not xls:
             continue
         any_content = True
-        doc.add_heading(title, level=1)
+        _section_titles.append(doc.add_heading(title, level=1))
         _add_pgim_table_to_doc(doc, str(xls), _sub_banner, _comp_banner, _avg_kw)
         maps = sorted(out_dir.glob(f"{used}*_map.png"))
         if maps:
+            # Repeat the SAME section title above the map — so the map is clearly
+            # labelled (e.g. "Transaction Comparables (Asset Sales)") even if it
+            # lands on its own page, separated from the table above it.
+            _section_titles.append(doc.add_heading(title, level=1))
             _add_map_fit(doc, maps[-1], _usable_w, _usable_h)
 
     rat = out_dir / "Investment_Rationale.md"
@@ -2469,6 +2498,8 @@ def _build_combined_docx(deal_name: str, cfg: dict):
     if not any_content:
         return None
     _apply_docx_font(doc, "Arial Narrow", 10)
+    for _p in _section_titles:            # override AFTER the doc-wide font pass
+        _style_section_title(_p)
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)

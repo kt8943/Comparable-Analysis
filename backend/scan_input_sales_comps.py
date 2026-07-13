@@ -1234,6 +1234,13 @@ def run(config_path: str = "configs/deal_config.json",
             print(f"      → {len(_excel_records)} records from Excel{_tag}")
 
         for _pdf_i, _pdf_path in enumerate(input_pdf_files, 1):
+            # Pace BETWEEN files too, not just between batches within one file —
+            # each PDF's GPT vision batches share the same org TPM budget, and
+            # starting the next file's batches immediately after the previous
+            # file's is what actually exhausted the per-minute cap here.
+            if _pdf_i > 1 and (llm_cfg or {}).get("provider") == "openai":
+                import time as _time
+                _time.sleep(2.5)
             _src_label = f"pdf_{_pdf_i}" if len(input_pdf_files) > 1 else "pdf"
             _tag = f" {_pdf_i}" if len(input_pdf_files) > 1 else ""
             print(f"  [PDF{_tag}] {Path(_pdf_path).name}")
