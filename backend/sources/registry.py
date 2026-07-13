@@ -30,15 +30,22 @@ def _ensure_loaded(market: str) -> None:
     if market in _LOADED:
         return
     _LOADED.add(market)
+    # Broker-report connector is market-agnostic (CBRE/Savills/C&W/JLL across APAC) —
+    # load once so it is available for EVERY market, keyed off the deal's country_code.
+    if "_broker" not in _LOADED:
+        _LOADED.add("_broker")
+        try:
+            __import__("sources.sg.broker_reports_sg")   # registers a market="" connector
+        except Exception as e:                           # pragma: no cover — fail soft
+            print(f"  [sources] broker_reports not loaded: {e}")
     if market == "sg":
-        for _mod in ("ura_pmi", "ura_pmi_rental", "ura_gls", "broker_reports_sg"):
+        for _mod in ("ura_pmi", "ura_pmi_rental", "ura_gls"):
             try:
                 __import__(f"sources.sg.{_mod}")   # side-effect: register()
             except Exception as e:                 # pragma: no cover — fail soft
                 print(f"  [sources] sg.{_mod} not loaded: {e}")
-    # future markets:
-    # elif market == "kr":
-    #     from .kr import ...
+    # Non-SG APAC (kr/jp/hk/au/tw/cn) use the market-agnostic broker_reports connector
+    # loaded above; add a market branch here to plug in a country's registry later.
 
 
 def available(market: str, comp_type: str) -> list:

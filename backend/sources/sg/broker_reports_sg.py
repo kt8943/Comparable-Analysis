@@ -1,8 +1,11 @@
 """
 backend/sources/sg/broker_reports_sg.py
 =======================================
-Broker market-report connector (Singapore): Savills, Cushman & Wakefield
-(MarketBeat), CBRE. Reads each broker's research/insights page, lists every report
+Broker market-report connector (**APAC-wide**, market-agnostic): CBRE, Savills,
+Cushman & Wakefield (MarketBeat), JLL. The broker research pages are chosen by the
+deal's ``country_code`` (see ``_BROKER_PAGES`` — SG/KR/JP/HK/AU/CN/TW), so the SAME
+connector serves every APAC market with **no API key** (only the OpenAI client already
+used for web search). Reads each broker's research/insights page, lists every report
 (**title + first-paragraph snippet + link**), lets the LLM judge which are relevant
 to the subject (asset type / location / transaction type / recency), then downloads
 the chosen reports (PDF or article page), extracts the text, and LLM-extracts named
@@ -29,11 +32,59 @@ from ..registry import register
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/122.0 Safari/537.36")
 
-_DEFAULT_PAGES = [
-    "https://www.cushmanwakefield.com/en/singapore/insights/singapore-marketbeat",
-    "https://www.savills.com.sg/insight-and-opinion/research.aspx?rc=Singapore&f=date&page=1",
-    "https://www.cbre.com.sg/insights",
-]
+# Broker research / insights landing pages per market (country_code → URLs). We scrape
+# these for report links. Broker sites change their URLs occasionally and some gate
+# scrapers (Cloudflare) — so override per deal with `broker_pages` in the search config,
+# or update here. Web search (Tier 1) is the always-on fallback, so a stale page just
+# degrades gracefully rather than breaking the run.
+_BROKER_PAGES = {
+    "sg": [
+        "https://www.cushmanwakefield.com/en/singapore/insights/singapore-marketbeat",
+        "https://www.savills.com.sg/insight-and-opinion/research.aspx?rc=Singapore&f=date&page=1",
+        "https://www.cbre.com.sg/insights",
+        "https://www.jll.com.sg/en/trends-and-insights/research",
+    ],
+    "kr": [
+        "https://www.cushmanwakefield.com/en/south-korea/insights",
+        "https://www.savills.co.kr/research/research.aspx",
+        "https://www.cbre.co.kr/insights",
+        "https://www.jll.co.kr/en/trends-and-insights/research",
+    ],
+    "jp": [
+        "https://www.cushmanwakefield.com/en/japan/insights",
+        "https://www.savills.co.jp/research/",
+        "https://www.cbre.co.jp/en/insights",
+        "https://www.jll.co.jp/en/trends-and-insights",
+    ],
+    "hk": [
+        "https://www.cushmanwakefield.com/en/hong-kong/insights",
+        "https://www.savills.com.hk/insight-and-opinion/research.aspx",
+        "https://www.cbre.com.hk/insights",
+        "https://www.jll.com.hk/en/trends-and-insights/research",
+    ],
+    "au": [
+        "https://www.cushmanwakefield.com/en/australia/insights",
+        "https://www.savills.com.au/insight-and-opinion/research.aspx",
+        "https://www.cbre.com.au/insights",
+        "https://www.jll.com.au/en/trends-and-insights/research",
+    ],
+    "cn": [
+        "https://www.cushmanwakefield.com/en/greater-china/insights",
+        "https://www.savills.com.cn/insight-and-opinion/research.aspx",
+        "https://www.cbre.com.cn/en/insights",
+        "https://www.jll.com.cn/en/trends-and-insights",
+    ],
+    "tw": [
+        "https://www.cushmanwakefield.com/en/taiwan/insights",
+        "https://www.savills.com.tw/research/",
+        "https://www.cbre.com.tw/insights",
+        "https://www.jll.com.tw/en/trends-and-insights",
+    ],
+}
+
+
+def _pages_for(country_code: str) -> list:
+    return _BROKER_PAGES.get((country_code or "sg").lower(), _BROKER_PAGES["sg"])
 
 # Only anchors whose URL looks like a report/insight are considered candidates.
 _REPORT_HINTS = ("research", "insight", "marketbeat", "market-report",
@@ -186,11 +237,11 @@ def _llm_extract(text: str, client, model: str, comp_type: str) -> list:
         return []
 
 
-class BrokerReportsSGConnector(SourceConnector):
+class BrokerReportsConnector(SourceConnector):
     name = "broker_reports"
-    market = "sg"
+    market = ""          # APAC-wide: pages chosen by the deal's country_code (see _BROKER_PAGES)
     comp_types = {"sales", "land", "rent"}
-    label = "Broker market reports (Savills / C&W / CBRE)"
+    label = "Broker market reports (CBRE / Savills / C&W / JLL)"
 
     def fetch(self, subject_cfg: dict, params: dict) -> tuple:
         client = params.get("client")
@@ -199,7 +250,8 @@ class BrokerReportsSGConnector(SourceConnector):
             print("    [broker] no OpenAI client — skipping")
             return [], []
         comp_type = params.get("comp_type", "sales")
-        pages = params.get("broker_pages") or _DEFAULT_PAGES
+        cc = (params.get("country_code") or subject_cfg.get("country_code") or "sg").lower()
+        pages = params.get("broker_pages") or _pages_for(cc)
         max_reports = int(params.get("broker_max_pdfs", 4) or 4)
 
         items = []
@@ -218,8 +270,9 @@ class BrokerReportsSGConnector(SourceConnector):
             txt = _fetch_text(it["url"])
             n_chars = len(txt.strip())
             recs = _llm_extract(txt, client, model, comp_type)
+            _country = subject_cfg.get("country_name") or "Singapore"
             for r in recs:
-                r.setdefault("country", "Singapore")
+                r.setdefault("country", _country)
                 r["sources"] = [{"title": it["title"], "url": it["url"],
                                  "source_name": self.name}]
             records.extend(recs)
@@ -236,4 +289,4 @@ class BrokerReportsSGConnector(SourceConnector):
         return records, sources
 
 
-register(BrokerReportsSGConnector())
+register(BrokerReportsConnector())

@@ -862,6 +862,11 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     # Grounded data sources to combine with (or instead of) OpenAI web search.
     # Defaults to web-search only → identical behaviour to before.
     sources_cfg     = sc_cfg.get("sources") or ["web_search"]
+    # Recency filter (applies to BOTH web-search and grounded connectors): keep only
+    # sales within recency_months (default 24 — the firm house policy). Unparseable
+    # dates are KEPT.
+    from sources.base import months_ago as _months_ago
+    _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
 
     if not api_key:
         raise ValueError(
@@ -992,6 +997,12 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                 cleaned  = validate_dedup(raw, subject_name=prop_name,
                                           subject_country=country_name,
                                           subject_asset_class=subject_cfg.get("asset_class", ""))
+                _b = len(cleaned)
+                cleaned  = [r for r in cleaned
+                            if (_months_ago(str(r.get("sale_date") or "")) or 0) <= _rec_m]
+                if len(cleaned) != _b:
+                    print(f"    [recency] dropped {_b - len(cleaned)} sale(s) older than "
+                          f"{_rec_m}mo; kept {len(cleaned)}")
                 geocoded = geocode_records(cleaned, mapbox_tok, country_code,
                                            country_name=country_name)
                 level_new += _merge_geocoded(geocoded, q_sources, max_km,
@@ -1060,10 +1071,8 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                                       subject_country=country_name,
                                       subject_asset_class=subject_cfg.get("asset_class", ""))
             # ── Comparability rules on grounded records ──────────────────────
-            # Recency: keep only recent sales (default 12 months; set recency_months
-            # in the search config to tighten, e.g. 6). Unparseable dates are kept.
-            from sources.base import months_ago as _months_ago
-            _rec_m = int(sc_cfg.get("recency_months", 12) or 12)
+            # Recency: keep only recent sales (recency_months, default 24). Unparseable
+            # dates are kept. _rec_m / _months_ago are defined once at run scope above.
             _before = len(_cleaned)
             _cleaned = [r for r in _cleaned
                         if (_months_ago(str(r.get("sale_date") or "")) or 0) <= _rec_m]

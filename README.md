@@ -1,6 +1,175 @@
 # PGIM Deal Analysis Platform
 
-An AI-powered deal analysis platform for institutional real estate underwriting. Covers three workflows — **Comparable Analysis** (asset sales, land sales, rent comps), **Investment Rationale** generation, and **New Deal** setup — all driven by a per-deal JSON config and a Streamlit dashboard.
+An AI-powered deal-analysis platform for institutional real-estate underwriting, branded in-app as **“IC Preparation @ PGIM.”** It turns scattered broker documents into IC-ready **comparable-analysis tables + maps** (asset sales, land sales, leasing) and a **draft Investment Rationale**, coordinated by a lightweight **agentic pipeline** (an orchestrator + narrow, bounded agents) with an IC-grade **audit trail** and a human sign-off at the end. Everything is driven by a per-deal JSON config and a Streamlit dashboard.
+
+> **This section (below) is a self-contained brief.** It is written so it can be read cold — e.g. uploaded on its own to generate a presentation, deck, or onboarding doc. Deeper implementation detail lives in the later sections (Full Pipeline Flow, Prompting Techniques, Bala Table, Deal Config Reference).
+
+---
+
+# System Overview (Agentic Pipeline) — read this first
+
+## 1. The problem it solves
+Preparing for an Investment Committee (IC) today is **slow, manual, and hard to audit**:
+- **Comparables are scattered** across brokers and formats — Excel, PDF, scanned images — with inconsistent headers, wrapped names, and shredded tables.
+- Assembling **sales / leasing / land comps**, geocoding them, computing per-unit metrics, and formatting a house-standard table is hours of repetitive work per deal.
+- The **investment write-up** is manual, and its figures are not systematically tied back to a source.
+- Results are **inconsistent** analyst-to-analyst and **not easily verifiable**.
+
+## 2. What it produces (the outputs)
+For one deal, from raw inputs to a single Word file:
+1. **Comparable-analysis tables** (PGIM house format) for up to three types: **Asset Sales**, **Land Sales**, **Leasing** — subject row + comparables + a computed **Average** row.
+2. A **location map** per comp type (Mapbox), with numbered pins matching the table markers.
+3. A **draft Investment Rationale** (IC memo prose) that now **benchmarks the subject’s pricing against the comparable averages**, plus a **Source Audit** (every claim cited to a report + page).
+4. A **one-click combined Word export** (US Letter, landscape, house typography).
+
+## 3. Guiding principle — right-sized agency
+> **Use an agent where the path is uncertain; a deterministic tool where the path is known.**
+
+- **Deterministic tools** (reproducible, cheap, auditable): document extraction, column mapping, metric calculation, geocoding, table + map rendering, Word export.
+- **Agents** (LLM judgment, bounded): classify a file’s comp type, decide whether an extraction is trustworthy and what source to try next, and write the rationale prose.
+- This is **decision-support, not autonomy** — an analyst reviews, edits, and **signs off** every deal.
+
+## 4. Architecture
+
+```
+ LEGEND   ▣ agent (LLM / judgment)   ▢ deterministic tool   ⬡ orchestrator (rules)   📄 data artifact
+
+  UI · "IC Preparation @ PGIM" (Streamlit, frontend/app.py)
+    ┌ 📁 Comparable files box → ▣ comp_classifier → type badge + override → config JSON 📄
+    └ 📄 Market reports box → Input_files/market_reports/*.pdf 📄
+                                   │  ▶ Generate all
+                                   ▼
+  ⬡ ORCHESTRATOR (backend/orchestrator.py) — build_plan(): classify → acquire(per type) → write_rationale
+                                   │  runs each step in order
+        ┌──────────────────────────┴───────────────────────────┐
+        ▼ task=acquire (per comp type)                          ▼ task=write_rationale
+  ▣ comp_acquisition_agent (bounded loop)                 ▣ rationale_writer
+     acquire → verify → evaluate → reflect → fallback         generate_investment_rationale.py
+        │                                                      reads reports + comp_summary
+        ▼ deterministic tools                                  call 1: prose  ·  call 2: source audit
+  ▢ scan_input_<type>_comps.py  ▢ search_online_<type>_comps.py            │
+        │                                                                  ▼
+        ▼                                              📄 Investment_Rationale.md + Source_Audit.xlsx
+  📄 <Type>_Comps*.xlsx + *_records.json + *_map.png ──(_comp_summary.txt bridge)──┘
+                                   │
+                                   ▼
+  UI · Output view → PGIM tables + maps + rationale → one-click Word export
+```
+
+## 5. The agentic components (what each one decides)
+
+### a) `comp_classifier` (backend/comp_classifier.py) — “what type is this file?”
+Auto-sorts each uploaded file into **sales / rent / land** so the analyst can drop everything into one box.
+- **Method:** extract text (PDF/Excel), score type-specific keywords (strong = 3 pts, weak = 1 pt), take the arg-max.
+- **Signals:** **land** → “successful tenderer”, “psf ppr”, “per plot ratio”, “date of award”, “GLS”, “tender”; **sales** → “buyer”, “purchaser”, “vendor”, “cap rate”, “NPI yield”, “capitalisation rate”, “en bloc”; **rent** → “tenant”, “occupier”, “asking/gross/face/passing rent”, “lease term”, “vacancy”, “psf pm”.
+- **LLM tie-break:** only when scores are tied or all-zero (bounded, one call). Images/unreadable → **`unknown`** for the analyst to assign. A per-file **override dropdown** means no file is ever silently mis-filed.
+
+### b) `comp_acquisition_agent` (backend/comp_acquisition_agent.py) — “did it work, and what next?”
+A bounded **acquire → verify → evaluate → reflect → fallback** loop per comp type. It never invents numbers; it grades the deterministic extraction and decides the next source.
+- **verify (grounding):** for each comp, check that its **key figure appears verbatim in the source** (exact-number match). Flag-only, never edit.
+- **evaluate (deterministic score):**
+  - `n_valid` = comps with at least one required field present.
+  - `pct_grounded` = share of comps whose key figure was found in the source.
+  - `confidence = 0.5·coverage + 0.5·pct_grounded − 0.2·(hard flag)`, where `coverage = min(1, n_valid / min_comps)`.
+  - `ok = (n_valid ≥ min_comps) AND (pct_grounded ≥ 0.5) AND no hard flags`.
+  - **Thresholds:** `min_comps` = **sales 3 / rent 5 / land 3**; `GROUNDED_MIN = 0.5`; `LOW_CONF = 0.5` (below → flagged for analyst review).
+  - **Hard flags:** 0 records, 0 valid, geocoded to country centroid, “looks like a market report, not a comp table”.
+- **reflect (one bounded LLM step):** diagnose *why* in one sentence and pick the next source from a **fixed set** (`files` → `online` → stop). Falls back to deterministic rules with no LLM.
+
+### c) `orchestrator` (backend/orchestrator.py) — “who runs what, in what order?”
+A **deterministic** coordinator (not an LLM picking steps — the routing is a known path). `build_plan()` inspects available inputs and emits ordered, typed steps; `describe_plan()` renders the visible **“Orchestration plan”** panel (`task — agent · tool — why`).
+- **Task → agent map:** `classify → comp_classifier`, `acquire → comp_acquisition_agent`, `write_rationale → rationale_writer`.
+- **Plan:** (optional classify) → **acquire** each comp type that has files and/or web fallback → **write_rationale** (if market reports exist), enriched with the comps just produced.
+
+### d) `rationale_writer` (backend/generate_investment_rationale.py) — the IC memo
+See §9 for the two-call method and the comparable-evidence injection.
+
+## 6. End-to-end process (one deal)
+1. **Set up the deal** — import a config JSON, or upload a PDF and let an LLM extract the config; or fill the New-Deal form.
+2. **Provide inputs** — drop broker files into the single **Comparable files** box (auto-sorted) and market-report PDFs into the **Market reports** box.
+3. **Generate all** — the orchestrator shows the plan, then for each comp type runs the acquisition agent (scan the files → verify/grade → web fallback if weak), and finally writes the rationale.
+4. **Review & edit** — tables, maps, addresses, and rationale are editable in the detail views; low-confidence results and centroid-geocode issues are flagged.
+5. **Export** — one Word file in house format.
+
+## 7. Methods & calculations (exact)
+All prices are normalised to **millions** internally (`price_m = price / 1,000,000`).
+
+| Metric | Formula / rule | Notes / assumptions |
+|---|---|---|
+| **Asset price psf (GFA)** | `price_psf_gfa = (price_m / stake_pct) × 1e6 / gfa_sf` | `stake_pct` parsed from text (“49%”, “(1/3 stake)”); **default 100%**. Grosses partial stakes up to whole-asset basis. |
+| **FTM cap rate** | `ftm_cap_rate = npi_yield` | Forward-twelve-month stabilised NOI/NPI yield as transacted. |
+| **Adj. cap rate (SG)** | `adj = ftm × bala_factor(comp_rem_yrs) / bala_factor(subject_rem_yrs)` | Leasehold adjustment via the **Singapore Bala Table**. **Non-Singapore deals skip it** (`adj = ftm`). |
+| **Land price psf ppr** | `price_psf_ppr = price_m × 1e6 / max_gfa_sf` (when not given) | “per sq ft per plot ratio”; `max_gfa` = max allowable GFA. Adj. psf ppr uses the same Bala ratio. |
+| **Effective rent** | `eff_rent = asking_rent × (lease_mths − rent_free_mths) / lease_mths` | Straight-lines the rent-free incentive over the term; used only when effective rent isn’t provided. |
+| **Average row** | Excel `=AVERAGEIF`; UI fallback averages columns matching keywords (`psf`, `cap rate`, `tenure`) | Preserves `%` when the column is a percentage; blanks are skipped. |
+| **Bala factor** | `n ≤ 0` or `n ≥ 999` → **1.0 (freehold)`; `1–99` → SLA/SISV table; `100–998` → linear interp (96% @ 99 yrs → 100% @ 999 yrs) | Singapore-specific leasehold-to-freehold value ratio. |
+| **Distance** | `haversine_km` great-circle between comp and subject | Drives proximity/sub-market/market radius filtering. |
+| **Recency** | keep comps with `months_ago(date) ≤ recency_months` | **House policy: 24 months** for every comp type (sales `sale_date`, rent `lease_date`, land `launch_date`). Unparseable dates are **kept**, not dropped; every drop is logged. |
+
+**Assumptions worth stating on a slide:**
+- **Verify/flag only — the system never invents or “corrects” a number.** A value is either grounded to a source or flagged.
+- Tenure: **Freehold / ≥ 999-yr → 0 remaining years** (treated as freehold in the Bala lookup).
+- The **Bala adjustment is Singapore-only**; foreign deals use the unadjusted cap rate.
+- Partial-stake sales are **grossed to a whole-asset psf** so they compare like-for-like.
+- Comps are only as good as the deal config’s **submarket keywords + address** (a wrong submarket sends the search off-target — see §11).
+
+## 8. Comp-type cheat-sheet
+| | Asset Sales | Land Sales | Leasing (Rent) |
+|---|---|---|---|
+| Scan tool | `scan_input_sales_comps.py` | `scan_input_land_comps.py` | `scan_input_rent_comps.py` |
+| Web tool | `search_online_sales_comps.py` | `search_online_land_comps.py` | `search_online_rent_comps.py` |
+| Output prefix | `Transaction_Comparables` | `Land_Sale_Comps` | `Rent_Comps` |
+| Key metric | price psf GFA, cap rate | price psf ppr, tenure | asking & effective rent |
+| Min comps | 3 | 3 | 5 |
+| Date field | `sale_date` | `launch_date` | `lease_date` |
+
+## 9. Investment Rationale — method
+A cache-backed, **two-call** LLM pipeline that separates *writing* from *auditing*:
+- **Stage 1 — Extract** insights from each market-report PDF (cached by filename + size + mtime; unchanged files cost nothing).
+- **Stage 2, Call 1 — Prose** (anonymised sources “Research Report 1/2/…”, so the model physically cannot echo internal filenames). Produces the 4-section IC memo.
+- **Stage 2, Call 2 — Source Audit** (real filenames): a **RAG** step embeds each claim, retrieves the most-similar PDF page chunk (with an exact-number pre-match), and cites `source_file + p.N`. Falls back to an LLM audit when no OpenAI key/PDF is available.
+- **Comparable-evidence injection (new):** the comps just produced are summarised (`_comp_summary.txt`, passed via `--comps-file`) into a **Comparable Evidence** block, so the memo can state e.g. *“priced at an X% discount to the S$Y psf average of five comparable sales.”*
+- **Guardrails:** never signal a data gap, no invented/derived figures, English-only, banned filler/attribution phrases, fixed section structure, and a self-verification checklist the model must pass before returning.
+
+## 10. Frontend / UX (Streamlit)
+- **Pages:** New Deal (import config JSON **or** PDF→LLM extraction, or a form) · Existing Deals · **Deal Analysis Overview** (the hub) · Comparable Analysis (detail edit) · Investment Rationale (detail edit).
+- **Overview page:** the single auto-sort comp box + market-reports box → **Generate all** (orchestrated, with the visible plan) → static **PGIM-format** tables + maps + rationale → **Word export**. Edits in detail views reflect back automatically (every render re-reads `output/<Deal>/`).
+- **Word export:** US Letter, **landscape**, **Arial Narrow 10** throughout, **navy banner rows** (Subject / Comparable) with white text, **grey-bold Average** row, **horizontal rules only** (no vertical cell lines), all non-banner cells **centered**, location map proportionally fit to the page margins.
+- **Session hygiene:** a fresh browser session starts blank (per-deal inputs + generated outputs + shared market reports are cleared once per session), so nothing bleeds between sessions.
+
+## 11. Recency & data-quality controls
+- **24-month recency policy** on every comp search (web + grounded connectors); older transactions are dropped and logged. Overridable per deal via `recency_months`.
+- **Config correctness matters:** a deal cloned from another market can carry the wrong `location` / `submarket_keywords` / `broader_market_query`, which misdirects the search (a real example we caught: a Singapore CBD tower still labelled with a **Sydney** submarket). Fixing the submarket + the 24-month filter is what makes comps genuinely comparable.
+- **Geocoding safety:** comps geocoded to the **country centroid** are flagged (“ON COUNTRY CENTROID”) as likely-invalid coordinates for the analyst to correct.
+- **Honest sparsity:** for a built prime-CBD asset there may be **few or zero recent land tenders** — the system returns that truthfully rather than padding with stale/irrelevant comps.
+
+## 11b. Online-search sources (two tiers, APAC)
+Every deal can draw comps from two tiers, both flowing through the same dedup → geocode → recency → grounding pipeline:
+- **Tier 1 — web search** (default, all markets): OpenAI `gpt-4o-mini-search-preview` steered by broker/authority query hints (JLL, CBRE, Savills, Colliers…). Broad *discovery*, but low recall — it finds only deals that appear in articles, not a full registry. Verify-then-use.
+- **Tier 2 — grounded registry connectors** (opt-in via the `sources` list, per market): authoritative primary data with exact figures. Built on an extensible registry (`backend/sources/<market>/`).
+
+| Market | Grounded connectors (live) | Source | Access |
+|---|---|---|---|
+| **All APAC** | **`broker_reports`** (sales / land / rent) | **CBRE · Savills · Cushman & Wakefield · JLL** research pages, chosen by the deal's `country_code` | **No key** (reuses the OpenAI client) |
+| **Singapore** `sg` | `ura_pmi` (sales), `ura_gls` (land), `ura_pmi_rental` (rent) | URA PMI + data.gov.sg GLS | Free / public |
+| **JP / KR / TW / HK / AU / CN** | `broker_reports` today; gov registries can be added later | MLIT / MOLIT RTMS / 實價登錄 / RVD / state Valuer-General / landchina; RCA (paid) to unify | Mixed |
+
+**Default for non-Singapore markets = `broker_reports`** — one market-agnostic connector reads each broker's research/insights page for the deal's country, lets the LLM pick the transaction-bearing reports, downloads them, and extracts named comps (cited to the report). **No new API key** — it uses the same OpenAI client as web search. Broker sites occasionally change URLs or gate scrapers, so pages are overridable per deal via `broker_pages`, and web search remains the always-on fallback. (A country's free government *registry* can be added later via the same `sources/<market>/` registry pattern — as done for Singapore's URA — but is not required.)
+
+## 12. Tech stack & deployment
+- **Frontend:** Streamlit. **Backend:** Python scripts invoked as tools (subprocess), each returning files + structured records.
+- **LLMs:** local **Ollama** (e.g. `qwen2.5`, `deepseek-r1`) for offline/private runs; **OpenAI** (GPT-4o-mini / embeddings / web-search-preview) for online comp search and RAG audit. Model choice is a sidebar setting injected per run.
+- **Geocoding/maps:** Mapbox. **Docs:** openpyxl (Excel), pypdf/pdfplumber + optional GPT-4o vision (PDF), python-docx (Word).
+- **Deployment:** runs locally, and is deployed to **Streamlit Cloud** for cross-platform testing (cloud build uses cloud-compatible features only).
+
+## 13. Positioning & impact (for the pitch)
+- **Value:** collapses hours of manual comp-gathering + formatting + first-draft writing into **minutes**, with **consistent** house-format output and a **verifiable** audit trail.
+- **Trust:** grounding (verify-only), per-claim source audit, confidence scores + flags, recency/quality controls, and **human sign-off** — designed to be IC-grade.
+- **Right-sized agency:** narrow bounded agents only where the path is uncertain; deterministic everywhere the numbers matter. This is the correct architecture for **high-stakes, human-reviewed** work — not full autonomy.
+
+## 14. Roadmap & deliberate limits
+- **Near-term:** a pre-flight **config sanity-check** (catch location↔country mismatches, missing GFA/price, implausible dates before a search runs); wire the classify step into the visible plan; broaden markets/asset classes (config-driven).
+- **Deliberate limits:** no autonomous investment decisions; bounded agent iterations and a fixed action set; every figure traceable to a source; a human always signs off.
 
 ---
 
@@ -46,6 +215,10 @@ PGIM/
 │   ├── generate_bala_table_excel.py     # One-time: PDF → Excel (Bala Table)
 │   ├── pdf_extractor.py                 # Shared PDF comp extraction (pdfplumber multi-page)
 │   │
+│   ├── orchestrator.py                  # Deterministic coordinator — plans agent/tool/task order
+│   ├── comp_classifier.py               # Auto-sort an uploaded file → sales / rent / land
+│   ├── comp_acquisition_agent.py        # Bounded acquire→verify→evaluate→reflect→fallback loop
+│   │
 │   ├── tools/                           # Shared utility library (all scan scripts import from here)
 │   │   ├── calculations.py              # Pure math: haversine, bala_factor, parse_num, parse_date
 │   │   ├── llm_client.py                # Ollama wrappers + agent loop (run_agent_loop, apply_refinement)
@@ -55,13 +228,22 @@ PGIM/
 │   │   ├── vision_llm.py                # Image → comp records (wraps llm_client)
 │   │   └── geo_utils.py                 # Geo sidecar writer
 │   │
+│   ├── sources/                         # Grounded online-search connectors (registry pattern)
+│   │   ├── base.py                      # SourceConnector base + shared coercers
+│   │   ├── registry.py                  # Market → connector registry (available / get_grounded)
+│   │   └── sg/                          # Singapore registries + the APAC broker connector
+│   │       ├── ura_pmi.py               #   URA commercial transactions (sales)
+│   │       ├── ura_pmi_rental.py        #   URA commercial rentals (rent)
+│   │       ├── ura_gls.py               #   URA Government Land Sales (land, data.gov.sg)
+│   │       └── broker_reports_sg.py     #   APAC-wide broker reports (CBRE/Savills/C&W/JLL)
+│   │
 │   ├── scan_input_sales_comps.py        # Asset sales comps from input Excel / PDF / image
 │   ├── scan_input_rent_comps.py         # Rent comps from input Excel / PDF / image
 │   ├── scan_input_land_comps.py         # Land sales comps from input Excel / PDF / image
 │   │
-│   ├── search_online_sales_comps.py     # Asset sales comps — AI web search
-│   ├── search_online_rent_comps.py      # Rent comps — AI web search
-│   ├── search_online_land_comps.py      # Land sales comps — AI web search
+│   ├── search_online_sales_comps.py     # Asset sales comps — AI web search + grounded connectors
+│   ├── search_online_rent_comps.py      # Rent comps — AI web search + grounded connectors
+│   ├── search_online_land_comps.py      # Land sales comps — AI web search + grounded connectors
 │   │
 │   ├── generate_sales_comps_table.py    # Excel schema + formatter — asset sales
 │   ├── generate_rent_comps_table.py     # Excel schema + formatter — rent comps
@@ -91,6 +273,8 @@ PGIM/
 │       ├── Transaction_Comparables_<DealName>_map.png
 │       ├── Land_Sale_Comps_<DealName>.xlsx
 │       ├── Rent_Comps_<DealName>.xlsx
+│       ├── Online_Comparables_* / Online_Land_Comps_* / Online_Rent_Comps_*  # web + connector comps
+│       ├── _comp_summary.txt           # comp figures injected into the rationale (--comps-file)
 │       ├── Investment_Rationale.md
 │       ├── Investment_Rationale_meta.json
 │       └── Source_Audit.xlsx
@@ -725,17 +909,28 @@ Leave `api_key` as `null` to use the `OPENAI_API_KEY` environment variable.
 
 ### `online_search`
 
-Controls the proximity-first, submarket-fallback search strategy:
+Controls the proximity-first, submarket-fallback search strategy. The same block shape
+is used by `rent_search` and (optionally) `land_search`; the land script falls back to
+`online_search` when no `land_search` is set.
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `sources` | `["web_search"]` | Which sources to use. Add grounded connectors here, e.g. `["web_search","broker_reports"]` (any APAC market) or `["web_search","ura_pmi","ura_gls"]` (SG). |
+| `recency_months` | 24 | **House policy:** drop comps older than this many months (web + connectors). Unparseable dates are kept. |
 | `proximity_km` | 1.0 | Level 1 radius — nearest comps |
 | `submarket_km` | 5.0 | Level 2 radius — submarket fallback |
-| `min_results` | 3 | Min comps before escalating to next level |
+| `market_km` | = submarket | Level 3 (broader market) radius cap |
+| `min_results` | 3 | Min comps before escalating to the next level |
 | `max_results` | 10 | Hard cap on returned comps |
 | `years_back` | 2 | Initial lookback window (years) |
-| `years_back_max` | 8 | Maximum lookback before stopping |
+| `years_back_max` | 2 | Max lookback before stopping (kept ≈ recency window) |
 | `years_back_step` | 2 | Years added per temporal expansion |
+| `broker_pages` | *(auto)* | Optional: pin exact broker research URLs for `broker_reports` (else per-country defaults). |
+
+**Grounded connectors are opt-in** via `sources` (default is web-search only). See
+[Online-search sources](#11b-online-search-sources-two-tiers-apac) for the full per-market
+table: `broker_reports` (CBRE/Savills/C&W/JLL, all APAC, no key), the SG URA connectors,
+and the optional KR MOLIT registry.
 
 ### `mapbox`
 
@@ -853,7 +1048,11 @@ ollama pull gemma3:4b
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | OpenAI API key — used for online comp search and GPT models. Falls back to `openai.api_key` in deal config. |
+| `OPENAI_API_KEY` | OpenAI API key — used for web search, the RAG source audit, `broker_reports`, and GPT models. Falls back to `openai.api_key` in the deal config. |
+| `MAPBOX_TOKEN` | Mapbox token for geocoding + maps. Falls back to `mapbox.token` in the deal config / Shared Settings. |
+| `URA_ACCESS_KEY` | *(SG, optional)* URA Data Service API key. Falls back to `ura_access_key` in Shared Settings. |
+
+> **Keys, at a glance:** only `OPENAI_API_KEY` + a Mapbox token are needed for full functionality across **all APAC markets** (web search + `broker_reports` + maps). `URA_ACCESS_KEY` is an *optional* upgrade for Singapore's keyed URA API; the broker connector needs no extra key.
 
 ---
 

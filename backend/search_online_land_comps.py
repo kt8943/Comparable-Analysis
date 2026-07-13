@@ -719,6 +719,12 @@ def run(config_path: str = "configs/deal_config.json",
     # Grounded data sources to combine with (or instead of) OpenAI web search.
     # Defaults to web-search only → identical behaviour to before.
     sources_cfg   = sc_cfg.get("sources") or ["web_search"]
+    # Recency: keep only comps within the last recency_months (default 24 — the firm
+    # house policy for every comp search). Land tenders are sparse, so this may
+    # legitimately yield few/none for a built site; add land_search.recency_months to
+    # widen per deal. Unparseable dates are KEPT.
+    from sources.base import months_ago as _months_ago
+    _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
 
     if not api_key:
         raise ValueError("OpenAI API key not found.  Set openai.api_key in config or "
@@ -824,6 +830,12 @@ def run(config_path: str = "configs/deal_config.json",
                 cleaned  = validate_dedup_land(raw, subject_name=prop_name,
                                                subject_country=country_name,
                                                subject_asset_class=subject_cfg.get("asset_class", ""))
+                _b = len(cleaned)
+                cleaned  = [r for r in cleaned
+                            if (_months_ago(str(r.get("launch_date") or "")) or 0) <= _rec_m]
+                if len(cleaned) != _b:
+                    print(f"    [recency] dropped {_b - len(cleaned)} land comp(s) older "
+                          f"than {_rec_m // 12}y{_rec_m % 12}m; kept {len(cleaned)}")
                 geocoded = geocode_land_records(cleaned, mapbox_tok, country_code,
                                                 country_name=country_name)
                 level_new += _merge_geocoded(geocoded, q_sources, max_km,

@@ -883,15 +883,17 @@ real investment committee memo:
 Silence is professional. Flagging the gap is not. Omit and move on.
 
 ━━ DATA INTEGRITY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Only write statistics and facts that appear explicitly in the Market Research Summary
-  or Deal Config. If a figure is not there, omit it — never estimate, round, or infer.
+• Only write statistics and facts that appear explicitly in the Market Research Summary,
+  the Comparable Evidence, or Deal Config. If a figure is not there, omit it — never
+  estimate, round, or infer.
 • Every number (percentage, rate, area, price, volume, yield, index value) must appear
   word-for-word or digit-for-digit in the source data. Do not derive or combine figures.
 • NEVER write bracketed placeholders: [X%], [X.X%], [Y], [Z units], [p.?], [p.N], etc.
   If the exact figure is unavailable, omit the data point — no placeholder substitutes.
 • Every policy name, regulation, or named programme must be explicitly stated in the
   Market Research Summary. Do not cite policies from memory or general knowledge.
-• Never use general market knowledge. Every claim must trace to the research or Deal Config.
+• Never use general market knowledge. Every claim must trace to the research, the
+  Comparable Evidence, or Deal Config.
 
 ━━ VOICE AND TONE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 • Lead with the conclusion. State the investment thesis first, then the evidence.
@@ -969,7 +971,8 @@ asset class, and the actual numbers from the research.  Original titles only."""
 
 _RATIONALE_PROMPT = """\
 Write an investment committee rationale for the subject property below.
-Use only the Market Research Summary and Subject Property details as your evidence base.
+Use only the Market Research Summary, the Comparable Evidence, and the Subject Property
+details as your evidence base.
 
 ═══ SUBJECT PROPERTY ════════════════════════════════════════════
 Deal Name     : DEAL_NAME
@@ -988,6 +991,7 @@ EXTRA_FIELDS
 COMBINED_INSIGHTS
 ════════════════════════════════════════════════════════════════
 
+COMPARABLE_EVIDENCE_BLOCK
 ═══ ANALYST NOTES ══════════════════════════════════════════════
 ANALYST_NOTES
 ════════════════════════════════════════════════════════════════
@@ -1016,6 +1020,10 @@ GUIDANCE (examples of typical categories — not an exhaustive list, not all req
   • Deal-specific details — e.g. tenancy profile, WALE, lease expiry schedule,
     anchor tenant, occupancy rate, passing rent vs market rent, pricing, GFA,
     remaining leasehold, reversionary potential
+  • Comparable pricing evidence — price psf and cap rates of comparable asset sales,
+    asking or effective rents of leasing comparables, land price psf ppr of comparable
+    land sales, and how the subject's pricing sits versus those comparable averages
+    (all drawn from the Comparable Evidence block, when present)
   • Other categories the research supports — e.g. investment market activity,
     ESG premium evidence, structural sector shifts with their own data set
 
@@ -1077,13 +1085,15 @@ If tenancy / WALE data is not in the research, develop the asset quality and pri
 angles instead — never acknowledge the absence of tenancy data in the prose.
 Paragraph 1 — asset case: lead with the property's quality, specification, certification,
   and market positioning; then connect to reversionary or income upside.
-Paragraph 2 — deal case: pricing vs comparable transactions, capital appreciation thesis,
-  key risks and specific mitigants, why compelling at this point in the cycle.
+Paragraph 2 — deal case: pricing vs comparable transactions (cite the Comparable Evidence —
+  the subject's price psf / cap rate versus the comparable average and range), capital
+  appreciation thesis, key risks and specific mitigants, why compelling at this cycle point.
 
 ## 4. [write a 6–9 word investment thesis title here — derived from your STEP 1 capital-markets data]
 Draw from your capital values, transaction volumes, and yield data categories.
 Paragraph 1 — investment market: recent transaction volumes, investor appetite, yield
-  compression or expansion trend, comparable deals that benchmark this asset's pricing.
+  compression or expansion trend, and the comparable deals in the Comparable Evidence that
+  benchmark this asset's pricing (name the price psf / cap-rate spread versus the average).
 Paragraph 2 — capital value outlook: yield trajectory, cap rate context vs historical range,
   why the pricing is supportable and what drives capital appreciation from here.
 
@@ -1104,7 +1114,8 @@ Fix any failure before returning — do not return output that fails a check.
                      follows a specific figure, percentage, or named fact. No plain assertions.
   [ ] SOURCE CHECK — Every number (vacancy rate, cap rate, rental rate, yield, price, volume,
                      GFA, growth %, index value) must appear explicitly in the Market Research
-                     Summary or Deal Config. Delete any figure you cannot locate there.
+                     Summary, the Comparable Evidence, or Deal Config. Delete any figure you
+                     cannot locate there.
   [ ] POLICY CHECK — Every policy name, regulation, government initiative, or named programme
                      must be explicitly named in the Market Research Summary. Delete any policy
                      reference you cannot locate there.
@@ -1754,6 +1765,7 @@ def generate_rationale(
     analyst_notes: str = "",
     refinement_notes: str = "",
     force_refresh: bool = False,
+    comp_summary: str = "",
 ) -> tuple[str, list]:
     """
     Two-call LLM pipeline that produces the investment rationale and its
@@ -1817,6 +1829,11 @@ def generate_rationale(
         .replace("COUNTRY_NAME",      subject_cfg.get("country_name",  "—"))
         .replace("EXTRA_FIELDS",      "\n".join(extra) if extra else "")
         .replace("COMBINED_INSIGHTS", combined_anon)
+        .replace("COMPARABLE_EVIDENCE_BLOCK", (
+            "═══ COMPARABLE EVIDENCE (verified comparable transactions / rents) ═\n"
+            f"{comp_summary.strip()}\n"
+            "════════════════════════════════════════════════════════════════\n"
+        ) if comp_summary.strip() else "")
         .replace("ANALYST_NOTES",     analyst_notes.strip() if analyst_notes else "(none)")
         .replace("REFINEMENT_BLOCK",  (
             "═══ REFINEMENT INSTRUCTIONS (highest priority) ══════════════════\n"
@@ -1996,6 +2013,52 @@ def generate_rationale(
     return rationale_md, audit_entries
 
 
+def _summarize_comp_excels(out_dir: Path) -> str:
+    """Fallback comparable-evidence summary for standalone CLI runs (the Streamlit
+    orchestrator passes a richer, analyst-visible summary via --comps-file).
+
+    Reads the latest comp Excel per type from the deal's output dir and dumps its
+    header + rows as compact text so the rationale can cite comparable pricing.
+    Verify-only: it echoes the numbers already in the Excel, never derives new ones.
+    Returns "" when no comp output exists."""
+    specs = [
+        ("Comparable Asset Sales", ["Transaction_Comparables", "Online_Comparables"]),
+        ("Leasing Comparables",    ["Rent_Comps",              "Online_Rent_Comps"]),
+        ("Comparable Land Sales",  ["Land_Sale_Comps",         "Online_Land_Comps"]),
+    ]
+    if not out_dir.exists():
+        return ""
+    try:
+        import openpyxl
+    except ImportError:
+        return ""
+    blocks = []
+    for title, prefixes in specs:
+        files = []
+        for pfx in prefixes:
+            files += [f for f in out_dir.glob(f"{pfx}*.xlsx")
+                      if not f.name.startswith("~")]
+        if not files:
+            continue
+        latest = max(files, key=lambda f: f.stat().st_mtime)
+        try:
+            ws = openpyxl.load_workbook(latest, data_only=True).active
+        except Exception:
+            continue
+        rows = []
+        for r in ws.iter_rows(values_only=True):
+            vals = [("" if c is None else str(c).replace("\n", " ").strip()) for c in r]
+            if any(vals):
+                rows.append([v for v in vals if v.lower() != "source"] or vals)
+        if len(rows) < 2:
+            continue
+        lines = [f"### {title} — {len(rows) - 1} data row(s)"]
+        for r in rows[:20]:
+            lines.append(" | ".join(v for v in r if v))
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRY POINT  (called from CLI or via run.py)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2006,6 +2069,7 @@ def run(
     force_refresh: bool = False,
     analyst_notes: str = "",
     refinement_notes: str = "",
+    comp_summary: str = "",
 ) -> str:
     """
     Full pipeline orchestrator: extract insights → generate rationale → save outputs.
@@ -2049,6 +2113,20 @@ def run(
     openai_key = (cfg.get("openai", {}).get("api_key")
                   or os.environ.get("OPENAI_API_KEY", ""))
 
+    # Comparable evidence — the orchestrator passes a rich, analyst-visible summary
+    # via --comps-file; when run standalone we fall back to reading the deal's comp
+    # Excel outputs directly.  Verify-only: no numbers are derived here.
+    _out_dir = ROOT / Path(cfg.get("output_file", "output/deal/deal.xlsx")).parent
+    if not comp_summary:
+        try:
+            comp_summary = _summarize_comp_excels(_out_dir)
+        except Exception as e:
+            print(f"  [note] Comp-summary auto-read skipped: {e}")
+            comp_summary = ""
+    if comp_summary:
+        print(f"  Comps       : injected into rationale evidence "
+              f"({len(comp_summary)} chars)")
+
     # Resolve report paths — auto-discover if caller did not specify any
     if not report_paths:
         report_paths = sorted(
@@ -2085,6 +2163,7 @@ def run(
         analyst_notes=analyst_notes,
         refinement_notes=refinement_notes,
         force_refresh=force_refresh,
+        comp_summary=comp_summary,
     )
 
     # ── Save outputs ──────────────────────────────────────────────────────────
@@ -2130,6 +2209,10 @@ if __name__ == "__main__":
                     help="Path to a plain-text file with analyst notes")
     ap.add_argument("--refinement-file", default="",
                     help="Path to a plain-text file with refinement/feedback instructions")
+    ap.add_argument("--comps-file", default="",
+                    help="Path to a text/markdown file summarising the comparable "
+                         "transactions/rents to inject as evidence (from the orchestrator). "
+                         "If omitted, comps are auto-read from the deal's output dir.")
     args = ap.parse_args()
 
     notes = ""
@@ -2146,12 +2229,20 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[warning] Could not read refinement file: {e}")
 
+    comps = ""
+    if args.comps_file:
+        try:
+            comps = Path(args.comps_file).read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"[warning] Could not read comps file: {e}")
+
     result = run(
         config_path=args.config,
         report_paths=args.reports or None,
         force_refresh=args.refresh,
         analyst_notes=notes,
         refinement_notes=refinement,
+        comp_summary=comps,
     )
 
     print("\n" + "=" * 70)

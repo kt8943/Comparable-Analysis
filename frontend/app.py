@@ -4461,6 +4461,69 @@ _PREFIX_TO_TYPE = {
     "Land_Sale_Comps":         "land",
 }
 
+# comp type ("sales"/"rent"/"land") → (label, excel_key, pdf_key, image_key, script, prefix)
+_TYPE_TO_COMP = {_PREFIX_TO_TYPE[_r[4]]: (_lbl, *_r)
+                 for _lbl, _r in _OV_COMP_ROUTES.items()}
+
+
+def _classify_uploads(files):
+    """Auto-detect the comp type (sales / rent / land) of each staged upload using
+    backend/comp_classifier.py. Keyword-only (instant, offline) — the analyst can
+    override in the UI. Cached per (name,size) so Streamlit reruns don't reclassify.
+    Returns [{name, type, label, confidence, reason, scores}]."""
+    import comp_classifier as clf
+    cache = st.session_state.setdefault("_ov_cls_cache", {})
+    out = []
+    for uf in files:
+        data = uf.getvalue()
+        key = f"{uf.name}:{len(data)}"
+        if key not in cache:
+            suf = Path(uf.name).suffix or ".bin"
+            tmp = tempfile.NamedTemporaryFile(suffix=suf, delete=False)
+            try:
+                tmp.write(data)
+                tmp.close()
+                res = clf.classify_file(tmp.name, allow_llm=False)
+            except Exception as _e:
+                res = {"type": "unknown", "label": "Unknown", "confidence": "none",
+                       "reason": f"could not read ({_e})", "scores": {}}
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            res["name"] = uf.name          # show the real name, not the temp path
+            cache[key] = res
+        out.append(cache[key])
+    return out
+
+
+def _comp_summary_for_rationale(out_dir):
+    """Compact comparable-evidence text for the rationale writer, built from the
+    SAME PGIM grids shown on the Overview (exact numbers, incl. the computed Average
+    row). Passed via --comps-file so the write-up can benchmark the subject's pricing
+    against the comps. Returns '' when no comp output exists."""
+    blocks = []
+    for prefix, _heading, title, _sb, _cb, avg_kw in _COMP_TYPES:
+        latest, _used = _latest_comp_excel(out_dir, prefix)
+        if not latest:
+            continue
+        grid = _read_pgim_grid(str(latest), avg_kw)
+        if not grid or not grid.get("comps"):
+            continue
+        header = grid["header"]
+        lines = [f"### {title} — {len(grid['comps'])} comparable(s)",
+                 "Columns: " + " | ".join(h for h in header if h)]
+        for srow in (grid.get("subject") or []):
+            if any(srow):
+                lines.append("SUBJECT: " + " | ".join(srow))
+        for i, row in enumerate(grid["comps"], 1):
+            lines.append(f"{i}. " + " | ".join(row))
+        if grid.get("average"):
+            lines.append("AVERAGE: " + " | ".join(grid["average"]))
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
 
 def _run_comp_agent(comp_type, prefix, config_path, cfg, has_files, online_enabled,
                     max_iters=3):
@@ -4592,29 +4655,69 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
     #    Per-type uploader key means files never bleed across types. ──────────
     with box_c:
         with st.container(border=True):
-            st.markdown("**📁 Comparable files** — Excel / PDF / image")
-            ov_ct = st.radio("Comp type", list(_OV_COMP_ROUTES.keys()),
-                             horizontal=True, key="ov_comp_type")
-            ek, pk, ik, script, prefix = _OV_COMP_ROUTES[ov_ct]
+            st.markdown("**📁 Comparable files** — drop mixed Excel / PDF / image; "
+                        "the classifier auto-sorts them into Rent / Asset Sales / Land")
             ov_comp_files = st.file_uploader(
-                f"Upload {ov_ct} comps",
+                "Upload comparable files (any type)",
                 type=["xlsx", "pdf", "png", "jpg", "jpeg"],
-                accept_multiple_files=True, key=f"ov_up_{ek}",   # distinct per type
+                accept_multiple_files=True, key="ov_up_multi",
                 label_visibility="collapsed")
-            _saved_c = (_input_list(cfg.get(ek)) + _input_list(cfg.get(pk))
-                        + _input_list(cfg.get(ik)))
-            if _saved_c:
-                st.caption(f"✅ Saved for **{ov_ct}**: "
+
+            # Auto-detect each staged file's comp type; let the analyst override.
+            _assign = []                     # [(uploaded_file, comp_type)]
+            _labels_by_type = {t: v[0] for t, v in _TYPE_TO_COMP.items()}
+            _type_labels = list(_labels_by_type.values())
+            if ov_comp_files:
+                _cls = {c["name"]: c for c in _classify_uploads(ov_comp_files)}
+                st.caption("🪄 Detected type per file — override if wrong:")
+                for _uf in ov_comp_files:
+                    _c = _cls.get(_uf.name, {})
+                    _dlabel = _labels_by_type.get(_c.get("type", "unknown"))
+                    _idx = _type_labels.index(_dlabel) if _dlabel in _type_labels else 0
+                    _badge = ("✅" if _c.get("confidence") == "high"
+                              else "🟡" if _c.get("confidence") == "low" else "❓")
+                    _cc1, _cc2 = st.columns([3, 2])
+                    _cc1.markdown(f"{_badge} `{_uf.name}`")
+                    _cc1.caption(_c.get("reason", ""))
+                    _sel = _cc2.selectbox(
+                        "type", _type_labels, index=_idx,
+                        key=f"ov_sort_{_uf.name}", label_visibility="collapsed")
+                    _seltype = next(t for t, lb in _labels_by_type.items() if lb == _sel)
+                    _assign.append((_uf, _seltype))
+
+            if st.button("💾  Save & sort", key="ov_comp_save",
+                         use_container_width=True, disabled=not ov_comp_files):
+                _c = load_config(config_path)
+                _byt = {}
+                for _uf, _t in _assign:
+                    _byt.setdefault(_t, []).append(_uf)
+                for _t, _grp in _byt.items():
+                    _lbl, _ek, _pk, _ik, _scr, _pfx = _TYPE_TO_COMP[_t]
+                    _c = _save_uploads_append(_c, _ek, _pk, _ik, _grp)
+                Path(config_path).write_text(
+                    json.dumps(_c, indent=2, ensure_ascii=False), encoding="utf-8")
+                st.success("Saved & sorted (by comp_classifier): "
+                           + ", ".join(f"{len(g)}→{_TYPE_TO_COMP[t][0].strip()}"
+                                       for t, g in _byt.items()))
+                st.rerun()
+
+            # Saved files, grouped by type, each independently removable.
+            for _t, (_lbl, _ek, _pk, _ik, _scr, _pfx) in _TYPE_TO_COMP.items():
+                _saved_c = (_input_list(cfg.get(_ek)) + _input_list(cfg.get(_pk))
+                            + _input_list(cfg.get(_ik)))
+                if not _saved_c:
+                    continue
+                st.caption(f"✅ **{_lbl.strip()}**: "
                            + ", ".join(f"`{Path(s).name}`" for s in _saved_c))
-                with st.expander("🗑️  Remove saved files"):
+                with st.expander(f"🗑️  Remove {_lbl.strip()} files"):
                     _rm = st.multiselect(
                         "Files to remove", [Path(s).name for s in _saved_c],
-                        key=f"ov_rm_{ek}", label_visibility="collapsed",
+                        key=f"ov_rm_{_ek}", label_visibility="collapsed",
                         placeholder="Choose file(s) to remove…")
-                    if st.button("Remove selected", key=f"ov_rm_btn_{ek}",
+                    if st.button("Remove selected", key=f"ov_rm_btn_{_ek}",
                                  disabled=not _rm, use_container_width=True):
                         _c = load_config(config_path)
-                        for _k in (ek, pk, ik):
+                        for _k in (_ek, _pk, _ik):
                             _lst = [p for p in _input_list(_c.get(_k))
                                     if Path(p).name not in _rm]
                             if _lst:
@@ -4624,32 +4727,24 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
                         Path(config_path).write_text(
                             json.dumps(_c, indent=2, ensure_ascii=False),
                             encoding="utf-8")
-                        # If no inputs remain for this type, also clear its stale
-                        # output so the table disappears from the view below.
-                        if not any(_input_list(_c.get(_k)) for _k in (ek, pk, ik)):
-                            for _of in out_dir.glob(f"{prefix}*"):
+                        # If no inputs remain for this type, clear its stale output.
+                        if not any(_input_list(_c.get(_k)) for _k in (_ek, _pk, _ik)):
+                            for _of in out_dir.glob(f"{_pfx}*"):
                                 try:
                                     _of.unlink()
                                 except Exception:
                                     pass
-                        st.success(f"Removed {len(_rm)} file(s) from {ov_ct}.")
+                        st.success(f"Removed {len(_rm)} file(s) from {_lbl.strip()}.")
                         st.rerun()
-            if st.button(f"💾  Save {ov_ct} files", key="ov_comp_save",
-                         use_container_width=True, disabled=not ov_comp_files):
-                _updated = _save_uploads_append(load_config(config_path),
-                                                ek, pk, ik, ov_comp_files)
-                Path(config_path).write_text(
-                    json.dumps(_updated, indent=2, ensure_ascii=False),
-                    encoding="utf-8")
-                st.success(f"Saved {len(ov_comp_files)} file(s) to {ov_ct}.")
-                st.rerun()
-            st.checkbox(
-                f"🌐 Allow web fallback for {ov_ct}",
-                key=f"ov_online_{prefix}",
-                help="On Generate all, if the uploaded files don't yield enough "
-                     "grounded comps, the agent falls back to an online search "
-                     "using the deal's search keywords (needs an OpenAI key). "
-                     "With no files uploaded, online search becomes the source.")
+
+            # Web fallback — per type (used when a type's files are missing / weak).
+            with st.expander("🌐 Web fallback per type"):
+                st.caption("If a type's files don't yield enough grounded comps (or "
+                           "no files were uploaded for it), the agent searches online "
+                           "using the deal's keywords (needs an OpenAI key).")
+                for _t, (_lbl, _ek, _pk, _ik, _scr, _pfx) in _TYPE_TO_COMP.items():
+                    st.checkbox(f"Allow web fallback for {_lbl.strip()}",
+                                key=f"ov_online_{_pfx}")
 
     # ── Market reports — upload, SAVE (persist only, no run) ─────────────────
     with box_r:
@@ -4688,44 +4783,68 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
                 st.success(f"Saved {len(ov_rpt_files)} report(s).")
                 st.rerun()
 
-    # ── Generate ALL — agent-checked acquisition per type, then the rationale ─
+    # ── Generate ALL — the ORCHESTRATOR plans which agent + tool runs each task,
+    #    then drives them: comp-acquisition agents per type, then the rationale
+    #    writer (enriched with the comparable evidence just produced). ──────────
+    import orchestrator as orch
     _rdir = ROOT / "Input_files" / "market_reports"
     _has_reports = _rdir.exists() and any(_rdir.glob("*.pdf"))
-    _todo = []   # (prefix, title, has_files, online_enabled)
-    for _pfx, _hd, _ttl, _sb, _cb, _kw in _COMP_TYPES:
-        _hf = any(cfg.get(k) for k in _PREFIX_INPUT_KEYS[_pfx])
-        _on = bool(st.session_state.get(f"ov_online_{_pfx}"))
-        if _hf or _on:
-            _todo.append((_pfx, _ttl, _hf, _on))
-    _labels = [t[1] + (" 🌐" if t[3] else "") for t in _todo] \
-              + (["Investment Rationale"] if _has_reports else [])
+    _comp_inputs  = {_PREFIX_TO_TYPE[_p]: any(cfg.get(k) for k in _PREFIX_INPUT_KEYS[_p])
+                     for _p in _PREFIX_TO_TYPE}
+    _online_flags = {_PREFIX_TO_TYPE[_p]: bool(st.session_state.get(f"ov_online_{_p}"))
+                     for _p in _PREFIX_TO_TYPE}
+    _plan = orch.build_plan(comp_inputs=_comp_inputs, online_flags=_online_flags,
+                            has_reports=_has_reports)
 
     st.write("")
-    if _labels:
-        st.caption("Will generate (agent-checked): " + " · ".join(_labels))
+    if _plan:
+        with st.expander("📋 Orchestration plan — which agent runs which tool",
+                         expanded=True):
+            st.caption("The orchestrator routes each task to an agent + a "
+                       "deterministic tool, in order:")
+            for _ln in orch.describe_plan(_plan):
+                st.markdown(f"- {_ln}")
     else:
         st.caption("Save at least one comparable type or market reports above, "
                    "then Generate.")
+
     if st.button("▶  Generate all", type="primary", key="ov_generate_all",
-                 use_container_width=True, disabled=not _labels):
+                 use_container_width=True, disabled=not _plan):
         with st.status("Running analysis…", expanded=True) as _st:
-            for _pfx, _ttl, _hf, _on in _todo:
-                st.markdown(f"**{_ttl}**")
-                try:
-                    _summary, _ = _run_comp_agent(_PREFIX_TO_TYPE[_pfx], _pfx,
-                                                  config_path, cfg, _hf, _on)
-                    if _summary and _summary.get("confidence", 1) < 0.5:
-                        st.warning(f"⚠ Low confidence ({_summary['confidence']}) "
-                                   f"for {_ttl} — please review before use.")
-                except Exception as _e:
-                    st.error(f"{_ttl} failed: {_e}")
-            if _has_reports:
-                st.markdown("**Investment Rationale**")
-                try:
-                    _run_script("generate_investment_rationale.py", config_path, [],
-                                stream_live=False)
-                except Exception as _e:
-                    st.error(f"Investment Rationale failed: {_e}")
+            for _step in _plan:
+                if _step["task"] == "acquire":
+                    _t = _step["type"]
+                    _pfx = _TYPE_TO_COMP[_t][5]
+                    st.markdown(f"**{_step['title']}** · _{_step['agent']}_")
+                    try:
+                        _summary, _ = _run_comp_agent(
+                            _t, _pfx, config_path, cfg,
+                            bool(_comp_inputs.get(_t)), bool(_online_flags.get(_t)))
+                        if _summary and _summary.get("confidence", 1) < 0.5:
+                            st.warning(f"⚠ Low confidence ({_summary['confidence']}) "
+                                       f"for {_step['title']} — please review before use.")
+                    except Exception as _e:
+                        st.error(f"{_step['title']} failed: {_e}")
+                elif _step["task"] == "write_rationale":
+                    st.markdown(f"**{_step['title']}** · _{_step['agent']}_")
+                    # Feed the comps just produced into the write-up (via --comps-file).
+                    _cf = []
+                    try:
+                        _cs = _comp_summary_for_rationale(out_dir)
+                        if _cs:
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            _cs_path = out_dir / "_comp_summary.txt"
+                            _cs_path.write_text(_cs, encoding="utf-8")
+                            _cf = ["--comps-file", str(_cs_path)]
+                            st.write("   📎 Injecting comparable pricing evidence "
+                                     "into the write-up")
+                    except Exception as _e:
+                        st.write(f"   ⚠ comp-summary skipped: {_e}")
+                    try:
+                        _run_script("generate_investment_rationale.py", config_path,
+                                    _cf, stream_live=False)
+                    except Exception as _e:
+                        st.error(f"Investment Rationale failed: {_e}")
             _st.update(label="✅ Analysis complete — output updated below.",
                        state="complete", expanded=True)
         # No st.rerun(): the static output section below re-reads the freshly

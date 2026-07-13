@@ -503,6 +503,10 @@ def run(config_path: str = "configs/deal_config.json",
     years_back_max  = sc_cfg.get("years_back_max",  8)
     years_back_step = sc_cfg.get("years_back_step", 2)
     max_level       = sc_cfg.get("max_level",       3)
+    # Recency filter (web-search + connectors): keep only leases within recency_months
+    # (default 24 — the firm house policy). Unparseable dates are KEPT.
+    from sources.base import months_ago as _months_ago
+    _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
 
     if not api_key:
         raise ValueError("OpenAI API key not found. "
@@ -582,6 +586,12 @@ def run(config_path: str = "configs/deal_config.json",
                 cleaned  = validate_dedup_rent(raw, subject_name=prop_name,
                                                subject_country=country_name,
                                                subject_asset_class=subject_cfg.get("asset_class", ""))
+                _b = len(cleaned)
+                cleaned  = [r for r in cleaned
+                            if (_months_ago(str(r.get("lease_date") or "")) or 0) <= _rec_m]
+                if len(cleaned) != _b:
+                    print(f"    [recency] dropped {_b - len(cleaned)} lease(s) older than "
+                          f"{_rec_m}mo; kept {len(cleaned)}")
                 geocoded = geocode_records(cleaned, mapbox_tok, country_code, country_name)
                 for r in geocoded:
                     rent  = float(r.get("asking_rent") or r.get("eff_rent") or 0)
@@ -654,7 +664,7 @@ def run(config_path: str = "configs/deal_config.json",
                         "ura_max_rows": sc_cfg.get("ura_max_rows", 300),
                         "broker_pages": sc_cfg.get("broker_pages"),
                         "broker_max_pdfs": sc_cfg.get("broker_max_pdfs", 4)}
-        _rec_m = int(sc_cfg.get("recency_months", 18) or 18)
+        _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
         for _conn in get_grounded((country_code or "sg").lower(), "rent",
                                   sources_cfg, _conn_params):
             print(f"\n[Source] {_conn.label or _conn.name}")
