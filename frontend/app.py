@@ -5093,9 +5093,11 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
 
     if st.button("▶  Generate all", type="primary", key="ov_generate_all",
                  use_container_width=True, disabled=not _plan):
+        _any_acquire_ran = False   # gates the pre-rationale pause below
         with st.status("Running analysis…", expanded=True) as _st:
             for _step in _plan:
                 if _step["task"] == "acquire":
+                    _any_acquire_ran = True
                     _t = _step["type"]
                     _pfx = _TYPE_TO_COMP[_t][5]
                     st.markdown(f"**{_step['title']}** · _{_step['agent']}_")
@@ -5109,6 +5111,18 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
                     except Exception as _e:
                         st.error(f"{_step['title']} failed: {_e}")
                 elif _step["task"] == "write_rationale":
+                    # Comp acquisition can fire several GPT calls (vision extraction,
+                    # classification); the rationale write-up is another GPT call
+                    # sharing the same org per-minute token budget. Firing it
+                    # immediately after risks the same 429 rate-limit seen on
+                    # multi-file PDF uploads. Pause briefly first — GPT only, and
+                    # only when a comp step actually just ran in this same chain.
+                    _active_model = _parse_model_name(
+                        st.session_state.get("sb_analysis_model", ""))
+                    if _any_acquire_ran and _active_model in _OPENAI_ANALYSIS_MODELS:
+                        st.write("   ⏳ Pausing 15s so the AI rate limit can clear "
+                                 "before generating the rationale …")
+                        time.sleep(15)
                     st.markdown(f"**{_step['title']}** · _{_step['agent']}_")
                     # Feed the comps just produced into the write-up (via --comps-file).
                     _cf = []
