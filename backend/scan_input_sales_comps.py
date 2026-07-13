@@ -56,7 +56,7 @@ from generate_sales_comps_table import (
 )
 from generate_sales_comps_map import render_map
 import generate_global_sales_comps_table as _global_sales_tbl
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
 from tools.calculations import (
     haversine_km as _haversine_km,
     parse_num as _num,
@@ -1031,7 +1031,11 @@ def _geocode_comps(records: list, mapbox_tok: str,
             queries = _build_geocode_queries("", addr, _sfx)
             source  = "address"
         else:
-            queries = _build_geocode_queries(name, "", _sfx)
+            # Geocode by NAME, adding the submarket/district as a locality HINT
+            # (backend only — never shown) so a weak building name still resolves
+            # to the right area instead of failing or hitting the country centroid.
+            _hint = str(r.get("submarket") or "").strip()
+            queries = _build_geocode_queries(name, _hint, _sfx)
             source  = "name"
 
         try:
@@ -1256,6 +1260,21 @@ def run(config_path: str = "configs/deal_config.json",
             print(f"      → {len(_img_records)} records from Image{_tag}")
 
         print(f"      → {len(records)} eligible transactions found (combined).")
+
+        # Submarket hygiene: it is a BACKEND geocoding hint only — never shown in the
+        # Property, Address or Land-Zoning columns. Strip a stacked 'Name⏎Submarket'
+        # off the name, and blank an address / zoning cell that merely repeats the
+        # submarket. The submarket value is kept on the record (r["submarket"]) for the
+        # geocoder below.
+        for _r in records:
+            _sub = str(_r.get("submarket") or "").strip()
+            for _nk in ("property_name", "property"):
+                if _r.get(_nk):
+                    _r[_nk] = _clean_name(_r[_nk])
+            for _bad in ("address", "land_zoning"):
+                _v = str(_r.get(_bad) or "").strip()
+                if _sub and _v and _v.lower() == _sub.lower():
+                    _r[_bad] = ""
 
         # Backfill blank dates from each input file's report period (title / cover page),
         # e.g. a comp with no row-level date in a "…Q2 2025…" report → "~Q2 2025".

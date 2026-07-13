@@ -619,6 +619,29 @@ def map_columns(
                 print(f"    location(label)        → col {i} ({headers[i]!r})  "
                       f"[value:competitiveness — excluded from geocoding]")
 
+    # ── Tier 0b: submarket / locality columns ─────────────────────────────────
+    # A "Submarket"/"Micromarket"/"Precinct" column is a PLACE label. It has a home
+    # only where the schema explicitly wants it (a rent district/Location column);
+    # elsewhere (sales/land) there is NO template column for it, and it must not be
+    # grabbed by a fuzzy tier — landing on `address` corrupts the Property line and
+    # geocoding (every comp resolves to the submarket's area centroid), while landing
+    # on sale_type / land_zoning silently mislabels the row. Route it to a
+    # submarket-aware field if the schema has one, otherwise claim & exclude it.
+    _SUBMKT_TOKENS = ("submarket", "sub market", "micromarket", "micro market",
+                      "precinct", "locality", "subzone", "sub zone")
+    _submkt_field = next((fk for fk in all_keys
+                          if "submarket" in syns_norm.get(fk, set())), None)
+    for i, hn in enumerate(headers_norm):
+        if i in claimed or not hn:
+            continue
+        if any(tok in hn for tok in _SUBMKT_TOKENS):
+            if _submkt_field and col_map.get(_submkt_field) is None:
+                _assign(_submkt_field, i, "value:submarket")
+            else:
+                claimed[i] = "_submarket"
+                print(f"    submarket(excluded)    → col {i} ({headers[i]!r})  "
+                      f"[no template column — kept out of address/zoning/geocoding]")
+
     for field_key in all_keys:
         for i, hn in enumerate(headers_norm):
             if i in claimed or not hn:

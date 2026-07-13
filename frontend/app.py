@@ -2740,10 +2740,11 @@ with st.sidebar:
             st.rerun()
 
     with st.expander("📊  Analysis Output",
-                     expanded=_active in ("overview", "comps", "rationale")):
+                     expanded=_active in ("overview", "comps", "rationale", "ask")):
         _nav_item("📊  Overview",              "overview",  "nav_overview")
         _nav_item("📋  Comparable Analysis",   "comps",     "nav_comps")
         _nav_item("✍️  Investment Rationale",  "rationale", "nav_rationale")
+        _nav_item("💬  Ask this Deal",         "ask",       "nav_ask")
 
     with st.expander("📁  Deal List",
                      expanded=_active in ("new_deal", "existing")):
@@ -4370,6 +4371,237 @@ def render_existing_deals(deal_name: str | None, config_path: str | None):
 # ROUTE:  Deal Overview  →  aggregated read-only preview + orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════════════
+# "Ask this Deal"  — a grounded, deal-scoped chatbox
+# ─────────────────────────────────────────────────────────────────────────────
+# Deliberately simple ("right-sized agency"): the corpus is just ONE deal's
+# uploaded PDFs/Excels + its generated comp tables — a small, bounded set that
+# fits in a single model context, so there is NO vector database and NO
+# embeddings. We read the files, stuff their text into the prompt, and let the
+# LLM answer ONLY from that text. History lives in st.session_state.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Only text-extractable inputs go into the chat corpus (images are skipped for now).
+_CHAT_TEXT_EXTS = {".pdf", ".xlsx", ".xls", ".csv", ".txt", ".md"}
+# All config keys that may point at a deal's raw input files, across comp types.
+_CHAT_INPUT_KEYS = (
+    "input_file", "input_pdf_file", "input_image_file",
+    "rent_input_file", "rent_input_pdf_file", "rent_input_image_file",
+    "land_input_file", "land_input_pdf_file", "land_input_image_file",
+)
+# Generated comp-table prefixes (the outputs of the scans), so the chat can also
+# answer "why did comp X get dropped?" against what the pipeline actually produced.
+_CHAT_OUTPUT_PREFIXES = (
+    "Transaction_Comparables", "Rent_Comps", "Land_Sale_Comps",
+    "Online_Comparables", "Online_Rent_Comps", "Online_Land_Comps",
+)
+
+
+def _deal_corpus_files(config_path: str, out_dir: "Path") -> list:
+    """Every text-extractable document in scope for THIS deal's chat:
+    raw inputs (reloaded fresh from the config, so session uploads are included)
+    + shared market reports + generated comp tables. Deduped, existing files only."""
+    fresh = load_config(config_path)          # reload → pick up uploads appended this session
+    cand: list = []
+    for key in _CHAT_INPUT_KEYS:
+        for p in _input_list(fresh.get(key)):
+            cand.append(ROOT / p)
+    rdir = ROOT / "Input_files" / "market_reports"
+    if rdir.exists():
+        cand += sorted(rdir.glob("*.pdf"))
+    if out_dir.exists():
+        for pref in _CHAT_OUTPUT_PREFIXES:
+            cand += sorted(out_dir.glob(f"{pref}*.xlsx"))
+    seen, uniq = set(), []
+    for p in cand:
+        if p.suffix.lower() not in _CHAT_TEXT_EXTS or not p.exists():
+            continue
+        rp = str(p.resolve())
+        if rp in seen:
+            continue
+        seen.add(rp)
+        uniq.append(p)
+    return uniq
+
+
+def _extract_text_for_chat(path: "Path", max_chars: int = 24000,
+                           max_pdf_pages: int = 60) -> str:
+    """Best-effort plain-text extraction from a PDF / Excel / text file, capped at
+    ``max_chars`` (per-document budget). Never raises — returns a note on failure."""
+    suf = path.suffix.lower()
+    try:
+        if suf == ".pdf":
+            import fitz  # PyMuPDF
+            doc = fitz.open(str(path))
+            parts = []
+            for i, page in enumerate(doc):
+                if i >= max_pdf_pages:
+                    parts.append(f"\n[… {doc.page_count - max_pdf_pages} more page(s) omitted]")
+                    break
+                parts.append(page.get_text())
+            doc.close()
+            txt = "\n".join(parts)
+        elif suf in (".xlsx", ".xls"):
+            import pandas as pd
+            xls = pd.ExcelFile(path)
+            parts = []
+            for sh in xls.sheet_names:
+                df = xls.parse(sh, header=None, dtype=str).fillna("")
+                # drop fully-empty rows so the CSV dump stays compact
+                df = df[~(df == "").all(axis=1)]
+                parts.append(f"[sheet: {sh}]\n" + df.to_csv(index=False, header=False))
+            txt = "\n".join(parts)
+        else:  # .csv / .txt / .md
+            txt = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:  # pragma: no cover — corrupt file / missing lib
+        return f"(could not read {path.name}: {e})"
+    txt = txt.strip()
+    if len(txt) > max_chars:
+        txt = txt[:max_chars] + "\n[… document truncated]"
+    return txt
+
+
+def _build_deal_chat_context(deal: str, config_path: str, out_dir: "Path"):
+    """Return (docs, files) where docs = [(filename, text), …]. Extraction is
+    cached in session_state and only re-run when the in-scope file set / mtimes
+    change — so each chat message is cheap (no re-parsing on every rerun)."""
+    files = _deal_corpus_files(config_path, out_dir)
+    sig = tuple((str(p), p.stat().st_mtime, p.stat().st_size) for p in files)
+    ckey = f"_chat_ctx_{deal}"
+    cached = st.session_state.get(ckey)
+    if cached and cached.get("sig") == sig:
+        return cached["docs"], files
+    docs = [(p.name, _extract_text_for_chat(p)) for p in files]
+    st.session_state[ckey] = {"sig": sig, "docs": docs}
+    return docs, files
+
+
+def _build_chat_system_prompt(deal: str, subj: dict, docs: list,
+                              total_budget: int = 120000) -> str:
+    """Grounding prompt: identity + strict "answer only from these docs" rules,
+    followed by the concatenated document text (capped at ``total_budget`` chars)."""
+    parts, used = [], 0
+    for name, text in docs:
+        if used >= total_budget:
+            parts.append(f"\n[FILE: {name}]\n(omitted — context budget reached)")
+            continue
+        chunk = text[: max(0, total_budget - used)]
+        parts.append(f"\n[FILE: {name}]\n{chunk}")
+        used += len(chunk)
+    body = "\n".join(parts) if parts else "(no documents in scope)"
+    return (
+        f'You are a meticulous, helpful real-estate investment analyst assisting with the '
+        f'deal "{deal}" ({subj.get("address") or "address n/a"}, '
+        f'{subj.get("country_name", "") or "country n/a"}).\n'
+        "Ground every answer in the deal documents below. Be genuinely useful — surface "
+        "what the documents DO say rather than defaulting to 'not found'.\n"
+        "Rules:\n"
+        "- Base facts only on the documents; do NOT invent figures or pull in outside "
+        "market knowledge. Cite the source file in square brackets after each fact, "
+        "e.g. [singapore-office-mb-2q2025.pdf].\n"
+        "- CLOSEST-MATCH, don't stonewall: if the EXACT period / metric / property asked "
+        "for isn't present but a RELATED one is, give the closest available figure and "
+        "explicitly note the difference (e.g. 'the report covers Q2 2025, not Q4 — the "
+        "Q2 figure was …'). Only say you can't find it when nothing relevant exists.\n"
+        "- You MAY reason and estimate FROM the documents when asked for a view (e.g. imply "
+        "a value range from the comparable transactions' cap rates / psf). Clearly label it "
+        "as an inference and show the comps you used — never present an estimate as a stated "
+        "fact.\n"
+        "- State the documents' coverage when relevant (which period / market / sector).\n"
+        "- Prefer exact numbers, dates and short quotes; be concise.\n"
+        "- The documents include this deal's raw inputs (PDF/Excel) AND the generated "
+        "comparable tables produced by the pipeline.\n"
+        f"\n=== DEAL DOCUMENTS ({deal}) ===\n{body}\n=== END DOCUMENTS ==="
+    )
+
+
+def _deal_chat_answer(system_prompt: str, prior_history: list, question: str) -> str:
+    """Send the grounded prompt + chat history to whichever LLM the sidebar
+    'Analysis model' selects (GPT → OpenAI, Ollama model → local, else GPT-4o if a
+    key is present). Returns the assistant's free-text answer."""
+    from tools.llm_client import openai_chat, _ollama_raw
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages += [{"role": t["role"], "content": t["content"]} for t in prior_history]
+    messages.append({"role": "user", "content": question})
+
+    active = _parse_model_name(st.session_state.get("sb_analysis_model", ""))
+    if active in _OPENAI_ANALYSIS_MODELS:
+        llm_cfg = {"openai_model": active,
+                   "openai_api_key": os.environ.get("OPENAI_API_KEY", "")}
+        return openai_chat(llm_cfg, messages, json_mode=False, timeout=120)
+    if active and active != _NO_LLM_OPTION:      # a local Ollama model
+        return _ollama_raw(_ollama_base_url(), active, messages, timeout=180)
+    # Rule-based / nothing selected → default to GPT-4o if a key exists, else guide.
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if key:
+        return openai_chat({"openai_model": "gpt-4o", "openai_api_key": key},
+                           messages, json_mode=False, timeout=120)
+    raise RuntimeError("Pick an Analysis model (a GPT model or an Ollama model) in "
+                       "⚙️ Shared Settings — the chat needs an LLM to answer.")
+
+
+def _render_deal_chat(deal: str, config_path: str, cfg: dict):
+    """The 💬 Ask this Deal panel — grounded Q&A over the current deal's documents."""
+    subj    = cfg["subject_property"]
+    out_dir = ROOT / Path(cfg.get("output_file", "output/x/x.xlsx")).parent
+
+    st.subheader("💬  Ask this Deal")
+    st.caption("Grounded Q&A over **this deal's** uploaded files (PDF / Excel) and its "
+               "generated comp tables. Answers come only from those documents — nothing "
+               "else, no other deals.")
+
+    docs, files = _build_deal_chat_context(deal, config_path, out_dir)
+    if not files:
+        st.info("No documents in scope yet. Upload comps / market reports for this deal "
+                "(in **Comparable Analysis**, **Overview**, or **Investment Rationale**), "
+                "then come back here.")
+        return
+
+    with st.expander(f"📎  {len(files)} document(s) in scope", expanded=False):
+        for p in files:
+            try:
+                kb = p.stat().st_size / 1024
+            except Exception:
+                kb = 0
+            st.write(f"• `{p.name}`  ·  {kb:,.0f} KB")
+
+    hkey    = f"_chat_hist_{deal}"
+    history = st.session_state.setdefault(hkey, [])
+
+    top = st.columns([1, 5])
+    with top[0]:
+        if st.button("🗑️  Clear chat", key=f"chat_clear_{deal}",
+                     use_container_width=True):
+            st.session_state[hkey] = []
+            st.rerun()
+    with top[1]:
+        _act = _parse_model_name(st.session_state.get("sb_analysis_model", "")) or "—"
+        st.caption(f"Model: **{_act}** · {len(files)} doc(s) in context. "
+                   "Change the model in ⚙️ Shared Settings.")
+
+    # Replay prior turns, then take a new question.
+    for turn in history:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+
+    q = st.chat_input("Ask something about this deal's documents…")
+    if q:
+        history.append({"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.markdown(q)
+        system_prompt = _build_chat_system_prompt(deal, subj, docs)
+        with st.chat_message("assistant"):
+            with st.spinner("Reading the deal's documents…"):
+                try:
+                    ans = _deal_chat_answer(system_prompt, history[:-1], q)
+                except Exception as e:
+                    ans = f"⚠️ {e}"
+            st.markdown(ans)
+        history.append({"role": "assistant", "content": ans})
+        st.session_state[hkey] = history
+
+
 def render_analysis_output(view: str = "overview"):
     """
     ROUTE — Analysis Output workspace.
@@ -4381,6 +4613,9 @@ def render_analysis_output(view: str = "overview"):
                      Sections with no output are skipped.
       • comps      — the editable Comparable Analysis detail page.
       • rationale  — the Investment Rationale generate / refine detail page.
+      • ask        — a grounded chatbox: Q&A over THIS deal's uploaded files
+                     (PDF / Excel) + generated comp tables, answered only from
+                     those documents (no database, no cross-deal knowledge).
 
     Edits made in the detail views are saved to output/<Deal>/, and the Overview
     view re-reads those files on every rerun — so any change reflects on the
@@ -4412,6 +4647,8 @@ def render_analysis_output(view: str = "overview"):
         render_comparable_analysis(deal, config_path)
     elif view == "rationale":
         render_investment_rationale(deal, config_path)
+    elif view == "ask":
+        _render_deal_chat(deal, config_path, cfg)
     else:                                 # overview
         _render_overview_preview(deal, config_path, cfg)
 

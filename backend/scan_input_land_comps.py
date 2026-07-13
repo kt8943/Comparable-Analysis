@@ -59,7 +59,7 @@ from pathlib import Path
 import openpyxl
 
 from generate_land_comps_map import render_map
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
 from generate_land_comps_table import (
     get_land_schema, bala_factor,
     subject_to_row, comp_to_row, build_workbook,
@@ -735,7 +735,10 @@ def _geocode_comps(records: list, mapbox_tok: str,
         _addr_words = set(re.sub(r"[^\w\s]", " ", addr.lower()).split())
         _real_addr  = addr if (re.search(r"\d", addr) and _addr_words & _STREET_TYPES) else ""
 
-        queries = _build_geocode_queries(name, _real_addr, "")
+        # No real street address → use the submarket as a locality HINT (backend only)
+        # so a weak site name still resolves to the right area.
+        _hint   = _real_addr or str(r.get("submarket") or "").strip()
+        queries = _build_geocode_queries(name, _hint, "")
         source  = "address" if _real_addr else "name"
 
         try:
@@ -926,6 +929,19 @@ def run(config_path: str = "configs/deal_config.json",
             print(f"      → {len(_img_records)} records from Image{_tag}")
 
         print(f"      → {len(records)} valid records extracted (combined)")
+
+        # Submarket hygiene: backend geocoding hint only — never shown in the Property,
+        # Address or Land-Zoning columns. Strip a stacked 'Name⏎Submarket' off the name
+        # and blank an address / zoning cell that merely repeats the submarket.
+        for _r in records:
+            _sub = str(_r.get("submarket") or "").strip()
+            for _nk in ("site_name", "property_name", "property"):
+                if _r.get(_nk):
+                    _r[_nk] = _clean_name(_r[_nk])
+            for _bad in ("address", "land_zoning"):
+                _v = str(_r.get(_bad) or "").strip()
+                if _sub and _v and _v.lower() == _sub.lower():
+                    _r[_bad] = ""
 
         # Backfill blank dates from each input file's report period (title / cover page).
         try:

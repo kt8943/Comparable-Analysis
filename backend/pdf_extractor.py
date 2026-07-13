@@ -1164,8 +1164,10 @@ def _gpt_extract_full_pdf(
     pages/request) rather than one giant request. Batching (a) keeps each request
     within size/token limits so large PDFs don't silently fail — the failure mode
     that made a 2nd/large PDF return nothing — and (b) lets us send higher-detail
-    images so borderless / dense tables are actually read. Rows from all batches
-    are aggregated (dedup happens in the caller).
+    images so borderless / dense tables are actually read. A short pacing delay
+    between batches (even on success) spreads load across the rolling TPM window
+    so the pipeline doesn't burst through the whole per-minute budget in the first
+    two calls. Rows from all batches are aggregated (dedup happens in the caller).
     """
     try:
         import fitz
@@ -1179,6 +1181,12 @@ def _gpt_extract_full_pdf(
     n_pages = min(len(doc), max_pages)
 
     field_list  = "\n".join(f'  "{k}": {d}' for _, k, d in field_schema)
+    # Give the submarket/district/area column an explicit BACKEND-ONLY sink so the
+    # model never glues it onto the property name / address / zoning to "use" it.
+    field_list += ('\n  "submarket": the submarket / district / micromarket / area / '
+                   'location label if the table has such a column (e.g. "Bugis", '
+                   '"Raffles Place"). Used ONLY to help locate the property on the map — '
+                   'NEVER merge it into the property name, address, or land zoning.')
     keyword_str = ", ".join(f'"{kw}"' for kw in section_keywords[:10])
 
     exclude_note = ""
@@ -1201,6 +1209,14 @@ def _gpt_extract_full_pdf(
         "- Output ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
         "- One JSON object per transaction row.\n"
         "- Copy property names exactly as printed — do not paraphrase or abbreviate.\n"
+        "- The property/building name is the ASSET NAME ONLY. NEVER append a submarket, "
+        "district, precinct, area or location to it — write \"Shaw Tower\", not "
+        "\"Shaw Tower Bugis\".\n"
+        "- If a table has a Submarket / District / Micromarket / Area / Location column, "
+        "put that value in the \"submarket\" field. Do NOT put it in the property name, "
+        "the address, or the land_zoning / zoning field.\n"
+        "- Use \"address\" only for a real STREET address; if none is printed, leave it "
+        "blank — never fall back to a submarket or area name.\n"
         "- Extract raw numeric values exactly as shown in the table. "
         "Do NOT convert units — Python handles all unit conversion (e.g. sqm to sqft, "
         "SGD million to billion) after extraction."
@@ -1223,6 +1239,14 @@ def _gpt_extract_full_pdf(
             f"Extract every row and return as a JSON array.\n\n"
             f"Fields to extract:\n{field_list}"
         )}]
+        # Pacing: sleep briefly BEFORE every batch after the first (even if the
+        # previous one succeeded). A TPM cap is a rolling budget — bursting several
+        # large vision requests back-to-back exhausts it even when each individual
+        # request is well within a "reasonable" size, which is what produced
+        # repeated 429s here despite already-successful earlier batches.
+        if b > 0:
+            _time.sleep(2.5)
+
         for i in range(start, end):
             pix = doc[i].get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
             b64 = base64.b64encode(pix.tobytes("png")).decode()

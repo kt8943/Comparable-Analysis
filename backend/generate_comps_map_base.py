@@ -435,6 +435,22 @@ def country_code_from_name(country_name: str) -> str:
     return _NAME_TO_CC.get((country_name or "").strip().lower(), "")
 
 
+def clean_property_name(name: str) -> str:
+    """Deterministic safety net for a source cell that stacks 'Building Name⏎Submarket'
+    (e.g. 'Shaw Tower⏎Bugis'). Keep the first line as the property name; re-append a
+    later line ONLY if it looks like a genuine qualifier (has a digit or a parenthesis,
+    e.g. '(one-third partial interest)') rather than a bare place/submarket name. Keeps
+    the Property column clean and stops a submarket hijacking the geocoder."""
+    segs = [s.strip() for s in str(name or "").replace("\r", "\n").split("\n") if s.strip()]
+    if len(segs) <= 1:
+        return segs[0] if segs else ""
+    keep = [segs[0]]
+    for s in segs[1:]:
+        if any(ch.isdigit() for ch in s) or "(" in s or ")" in s:
+            keep.append(s)
+    return " ".join(keep).strip()
+
+
 def near_country_centroid(lon, lat, country_code: str, tol_km: float = 1.5) -> bool:
     """True if (lon,lat) sits ~on the country centroid → a likely failed geocode."""
     if lon is None or lat is None:

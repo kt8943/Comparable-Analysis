@@ -56,7 +56,7 @@ from generate_rent_comps_table import (
 )
 from generate_rent_comps_map import render_map
 import generate_global_rent_comps_table as _global_rent_tbl
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
 from tools.calculations import haversine_km as _haversine_km, parse_num as _num
 from tools.json_utils import fix_json as _fix_json, split_json_arrays as _split_json_arrays
 from tools.llm_client import ollama_post as _ollama_post, apply_refinement as _apply_refinement
@@ -587,7 +587,10 @@ def _geocode_comps(records: list, mapbox_tok: str,
         else:
             _real_addr = addr if (_has_digit and _addr_words & _STREET_TYPES) else ""
 
-        queries = _build_geocode_queries(name, _real_addr, "")
+        # No real street address → use the submarket/district as a locality HINT
+        # (backend only) so a weak building name still resolves to the right area.
+        _hint   = _real_addr or str(r.get("submarket") or r.get("district") or "").strip()
+        queries = _build_geocode_queries(name, _hint, "")
         source  = "address" if _real_addr else "name"
 
         try:
@@ -815,6 +818,19 @@ def run(config_path: str = "configs/deal_config.json",
             print(f"      → {len(_img_records)} records from Image{_tag}")
 
         print(f"      → {len(records)} valid records extracted (combined)")
+
+        # Submarket hygiene: backend geocoding hint only — never shown in the Property
+        # or Address columns. Strip a stacked 'Name⏎Submarket' off the name and blank an
+        # address that merely repeats the submarket. r["submarket"]/r["district"] is kept
+        # for the geocoder.
+        for _r in records:
+            _sub = str(_r.get("submarket") or _r.get("district") or "").strip()
+            for _nk in ("building_name", "property"):
+                if _r.get(_nk):
+                    _r[_nk] = _clean_name(_r[_nk])
+            _av = str(_r.get("address") or "").strip()
+            if _sub and _av and _av.lower() == _sub.lower():
+                _r["address"] = ""
 
         # Backfill blank dates from each input file's report period (title / cover page).
         try:
