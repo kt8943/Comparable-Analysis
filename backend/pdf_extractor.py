@@ -475,6 +475,14 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
     while _k < len(_name_rows):
         grp = [_name_rows[_k]]
         while (_k + 1 < len(_name_rows) and
+               # Never chain a continuation fragment INTO a row that is itself
+               # an anchor (has its own price) — an anchor always starts a NEW,
+               # complete transaction. Without this guard, a genuine tail like
+               # "…portfolio" (lowercase, correctly continuing the PRIOR
+               # anchor's name) also satisfies the lowercase-next heuristic
+               # against the FOLLOWING anchor's row, stealing that unrelated
+               # transaction's name fragments into the wrong record.
+               _name_rows[_k + 1] not in _anchor_set and
                _name_continues(_name_of(rows[_name_rows[_k]]),
                                _name_of(rows[_name_rows[_k + 1]]))):
             _k += 1
@@ -1241,7 +1249,16 @@ def _from_text(text: str, section_title: str, field_schema: list,
         "The text below is extracted from a PDF report page and may contain a table. "
         "Identify the table, detect its columns, and extract every data row as a JSON object. "
         "Return ONLY a valid JSON array — no markdown fences, no explanation. "
-        "One object per property/transaction row. Use the exact property name as written."
+        "One object per property/transaction row. Use the exact property name as written.\n"
+        "CRITICAL: only extract from a genuine TABULAR or ENUMERATED transaction listing — "
+        "rows/lines clearly presented as one entry per transaction (e.g. a table with columns "
+        "like Property/Price/Buyer, or a numbered/bulleted list). Do NOT extract from ordinary "
+        "narrative prose paragraphs that merely MENTION a deal in passing as supporting color "
+        "for market commentary (e.g. \"Other significant deals included X, sold to Y for "
+        "$Z...\" inside a paragraph of analysis) — that is not a transaction listing, and mining "
+        "named deals out of it produces noisy duplicates alongside the report's own formal "
+        "comp table elsewhere in the document. If the page is pure narrative commentary with no "
+        "genuine tabular/enumerated listing, return an empty array []."
     )
     user = (
         f"Section: {section_title}\n\n"
@@ -1436,8 +1453,6 @@ def map_to_schema(page_tables: list, field_schema: list,
     subj_tokens = (set(re.sub(r"\W+", " ", subject_name.lower()).split())
                    if subject_name else set())
 
-    has_any_table = any(e["source"] == "table" for e in page_tables)
-
     # Count tables per page for labelling
     from collections import Counter
     _page_tbl_count: Counter = Counter(
@@ -1449,10 +1464,14 @@ def map_to_schema(page_tables: list, field_schema: list,
     for entry in page_tables:
         pg = entry["page_num"]
         if entry["source"] == "text":
-            if has_any_table:
-                print(f"    Page {pg:>3}: text-only page skipped"
-                      f" (table data present on other pages)")
-                continue
+            # A "text" entry only ever exists for a page where camelot AND
+            # img2table BOTH already failed to find a table on THIS page (see
+            # extract_page_tables' found_any gating above) — so "another page
+            # has a table" says nothing about whether THIS page's prose is
+            # worth extracting. Skipping it document-globally caused a real
+            # bug: a page or two of misdetected chart/legend noise elsewhere
+            # in the report suppressed the one page holding the real
+            # transaction table, when that table only survives as page text.
             recs = _from_text(
                 entry["raw_text"], entry["section_title"],
                 field_schema, subj_tokens, llm_cfg,
@@ -1488,6 +1507,137 @@ def map_to_schema(page_tables: list, field_schema: list,
 
 
 # ─── PUBLIC API ───────────────────────────────────────────────────────────────
+
+def _page_tables_context(page_tables: list, max_chars: int = 14000) -> str:
+    """Compact text rendering of the raw page content (tables + prose) that fed
+    Stage 3+4 — used to ground the Stage 5 LLM verification pass against the
+    actual source, not the pipeline's own possibly-wrong reconstruction of it."""
+    parts = []
+    for e in page_tables:
+        if e["source"] == "table":
+            hdr      = " | ".join(str(h) for h in e.get("headers", []))
+            rows_txt = "\n".join(" | ".join(str(c) for c in row) for row in e.get("rows", []))
+            parts.append(f"[Page {e['page_num']} table]\n{hdr}\n{rows_txt}")
+        else:
+            parts.append(f"[Page {e['page_num']} text]\n{e.get('raw_text', '')}")
+    return "\n\n".join(parts)[:max_chars]
+
+
+def _llm_verify_records(records: list, context_text: str, field_schema: list,
+                        llm_cfg: dict) -> list:
+    """
+    Stage 5 — LLM verification pass over the assembled records, checking BOTH:
+      (1) CELL CORRECTNESS — does each field's value look like a genuine, complete
+          value (catches row-merge artifacts, e.g. a property name fused from two
+          different transactions' wrapped-text fragments), and
+      (2) COLUMN MAPPING ACCURACY — was the value assigned to the field it
+          actually represents (catches e.g. a price duplicated into a floor-area
+          field that has no real data).
+    Corrections are grounded ONLY in the provided source text — the model may not
+    invent a value that isn't stated there; when it can't determine the right
+    value it must blank the field and flag it, never guess. Returns the (possibly
+    corrected) records; on any failure this is a no-op — original records unchanged.
+    """
+    if not records:
+        return records
+    provider = (llm_cfg or {}).get("provider", "ollama")
+    if provider in ("none", "rules"):
+        return records  # rule-based mode — no LLM available for verification
+
+    field_descs = "\n".join(f'  "{k}": {d}' for _, k, d in field_schema)
+    compact = [
+        {"index": i, **{k: v for k, v in r.items()
+                        if v not in (None, "", 0) and not str(k).startswith("_")}}
+        for i, r in enumerate(records)
+    ]
+
+    system = (
+        "You are a data-quality auditor checking an automated PDF-extraction pipeline's "
+        "output against the ORIGINAL source text it was extracted from. For EACH record, "
+        "check two independent things:\n"
+        "1. CELL CORRECTNESS — does each field's value look like a genuine, complete value? "
+        "A property name fused from two different transactions (wrapped text from one row "
+        "bled into another) is WRONG. Cross-check the SOURCE TEXT to find the correct, "
+        "complete name/value for each transaction.\n"
+        "2. COLUMN MAPPING ACCURACY — does the value assigned to each field genuinely "
+        "represent what that field's description says (given below)? e.g. a floor-area "
+        "field must be a genuine area figure — if the source has no such data for that "
+        "transaction, the correct answer is BLANK, not a copied/duplicated number from a "
+        "different field.\n\n"
+        "STRICT RULES:\n"
+        "- Only correct a field when you can point to exact text in SOURCE supporting the "
+        "correction. NEVER invent, guess, or infer a value not stated in SOURCE.\n"
+        "- NEVER strip a unit/scale qualifier (e.g. 'million', 'per key', 'psf') from a value "
+        "as a 'cleanup' — that qualifier is often exactly what makes the value's TRUE meaning "
+        "correct. e.g. a hotel/hospitality 'Unit Price' of '0.94 million' is price PER KEY, not "
+        "psf — reducing it to a bare '0.94' would misrepresent it as a real per-sf price, which "
+        "is a WORSE error than leaving the full original phrase in place. If a value doesn't fit "
+        "the field's numeric expectation, leave the field's own downstream logic to handle it — "
+        "do not 'fix' the formatting yourself.\n"
+        "- If a value looks wrong but you cannot determine the correct one from SOURCE, set "
+        "it to null (blank) rather than guessing, and say why in \"flag\".\n"
+        "- Leave fields that are already correct untouched — do not \"fix\" things that aren't broken.\n"
+        "- Output ONLY a JSON array, one object per record needing any change: "
+        '{"index": int, "corrections": {"field_key": corrected_value_or_null, ...}, '
+        '"flag": "short note, or empty string"}. Omit records that need no changes entirely.'
+    )
+    user = (
+        f"Field descriptions:\n{field_descs}\n\n"
+        f"Extracted records (0-indexed):\n{json.dumps(compact, indent=2, default=str)}\n\n"
+        f"SOURCE TEXT (the original page content these records were extracted from):\n"
+        f"---\n{context_text}\n---"
+    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    try:
+        if provider == "openai":
+            from tools.llm_client import openai_chat as _openai_chat
+            raw = _openai_chat(llm_cfg, messages, timeout=120)
+        else:
+            ocfg     = (llm_cfg or {}).get("ollama", {})
+            base_url = ocfg.get("base_url", "http://localhost:11434")
+            model    = ocfg.get("model",    "qwen2.5:3b")
+            raw = _ollama_free(base_url, model, messages, timeout=90)
+        raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+        raw = re.sub(r"\n?```$", "", raw)
+        m = re.search(r"\[[\s\S]*\]", raw)
+        if not m:
+            return records
+        verdicts = json.loads(m.group(0))
+        if not isinstance(verdicts, list):
+            return records
+    except Exception as e:
+        print(f"      [verify] LLM check skipped: {e}")
+        return records
+
+    out = [dict(r) for r in records]
+    n_fixed, n_flagged = 0, 0
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        idx = v.get("index")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(out):
+            continue
+        corr = v.get("corrections") or {}
+        flag = str(v.get("flag") or "").strip()
+        if isinstance(corr, dict):
+            for fk, val in corr.items():
+                if fk not in out[idx]:
+                    continue  # never introduce a field the schema doesn't have
+                before = out[idx].get(fk)
+                if before == val:
+                    continue
+                out[idx][fk] = val
+                n_fixed += 1
+                print(f"      [verify] record {idx} ({out[idx].get('property_name', '')!r:.40}) "
+                      f"{fk}: {before!r} → {val!r}")
+        if flag:
+            out[idx]["_verify_flag"] = flag
+            n_flagged += 1
+    if n_fixed or n_flagged:
+        print(f"      [verify] {n_fixed} field correction(s), {n_flagged} flag(s)")
+    return out
+
 
 def extract_pdf_records(
     pdf_path: str,
@@ -1556,4 +1706,9 @@ def extract_pdf_records(
     print(f"\n  [PDF Stage 3+4] Assembling records ...")
     records = map_to_schema(page_tables, field_schema, subject_name, llm_cfg, dedup=dedup)
     print(f"  [PDF] {len(records)} record(s) extracted")
+
+    if records:
+        print(f"\n  [PDF Stage 5] Verifying cell correctness + column mapping ...")
+        records = _llm_verify_records(
+            records, _page_tables_context(page_tables), field_schema, llm_cfg)
     return records
