@@ -50,10 +50,14 @@ _SIGNALS = {
         "strong": [
             "cap rate", "npi yield", "capitalisation rate", "capitalization rate",
             "ftm noi", "net property income", "en bloc", "vendor", "purchaser",
+            # Plain investment-sales TABLE headers (broker reports don't always give
+            # cap rates — a "Seller/Buyer + Price" table is still a sales comp table).
+            "seller/buyer", "seller / buyer", "buyer/seller", "sales transaction",
         ],
         "weak": [
             "buyer", "acquirer", "sale price", "transacted price", "investment sales",
             "net yield", "psf gfa", "psf on gfa", "acquisition", "seller",
+            "capital markets", "key sales", "price (s$",
         ],
     },
     "rent": {
@@ -65,6 +69,7 @@ _SIGNALS = {
         "weak": [
             "tenant", "occupier", "lessee", "lease term", "lease commencement",
             "vacancy", "occupancy", "leasing", "rental", "take-up", "net lettable",
+            "lease transaction",
         ],
     },
 }

@@ -56,7 +56,7 @@ from generate_rent_comps_table import (
 )
 from generate_rent_comps_map import render_map
 import generate_global_rent_comps_table as _global_rent_tbl
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name
 from tools.calculations import haversine_km as _haversine_km, parse_num as _num
 from tools.json_utils import fix_json as _fix_json, split_json_arrays as _split_json_arrays
 from tools.llm_client import ollama_post as _ollama_post, apply_refinement as _apply_refinement
@@ -674,8 +674,11 @@ def run(config_path: str = "configs/deal_config.json",
     ollama_cfg   = llm_cfg.get("ollama", {})
     base_url     = ollama_cfg.get("base_url", "http://localhost:11434")
     model        = ollama_cfg.get("model",    "qwen2.5:3b")
-    country_code = cfg.get("country_code", "")
     country_name = subject_cfg.get("country_name", "")
+    # Prefer an explicit code, else derive it from country_name so geocoding restricts to
+    # the right country (a missing code sent common names to the wrong country).
+    country_code = (cfg.get("country_code") or subject_cfg.get("country_code")
+                    or _cc_from_name(country_name) or "")
     prop_name    = subject_cfg["property_name"]
     deal_name    = subject_cfg.get("deal_name", prop_name)
     # Strip characters Windows forbids in file paths (< > : " / \ | ? * and control

@@ -417,6 +417,23 @@ _COUNTRY_CENTROIDS = {
     "au": (133.7751, -25.2744),
 }
 
+# Country NAME → ISO code. A deal that sets only country_name still geocodes with the
+# correct country restriction — a missing/empty country_code is a common cause of comps
+# resolving to a same-named place in the WRONG country (e.g. "Capital Square" → USA).
+_NAME_TO_CC = {
+    "singapore": "sg", "south korea": "kr", "korea": "kr", "republic of korea": "kr",
+    "japan": "jp", "hong kong": "hk", "hongkong": "hk", "china": "cn",
+    "people's republic of china": "cn", "taiwan": "tw", "australia": "au",
+    "malaysia": "my", "indonesia": "id", "thailand": "th", "vietnam": "vn",
+    "philippines": "ph", "india": "in", "new zealand": "nz",
+    "united states": "us", "usa": "us", "united kingdom": "gb", "uk": "gb",
+}
+
+
+def country_code_from_name(country_name: str) -> str:
+    """ISO country code for a country name (e.g. 'Singapore' → 'sg'); '' if unknown."""
+    return _NAME_TO_CC.get((country_name or "").strip().lower(), "")
+
 
 def near_country_centroid(lon, lat, country_code: str, tol_km: float = 1.5) -> bool:
     """True if (lon,lat) sits ~on the country centroid → a likely failed geocode."""

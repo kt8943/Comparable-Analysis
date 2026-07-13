@@ -59,7 +59,7 @@ from pathlib import Path
 import openpyxl
 
 from generate_land_comps_map import render_map
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name
 from generate_land_comps_table import (
     get_land_schema, bala_factor,
     subject_to_row, comp_to_row, build_workbook,
@@ -784,9 +784,11 @@ def run(config_path: str = "configs/deal_config.json",
     ollama_cfg   = llm_cfg.get("ollama", {})
     base_url     = ollama_cfg.get("base_url", "http://localhost:11434")
     model        = ollama_cfg.get("model",    "qwen2.5:3b")
-    country_code = cfg.get("country_code",
-                           subject_cfg.get("country_code", "SG"))
     country_name = subject_cfg.get("country_name", "")
+    # Prefer an explicit code, else derive it from country_name (no Singapore hardcode)
+    # so geocoding restricts to the right country.
+    country_code = (cfg.get("country_code") or subject_cfg.get("country_code")
+                    or _cc_from_name(country_name) or "")
     prop_name    = subject_cfg["property_name"]
     deal_name    = subject_cfg.get("deal_name", prop_name)
     # Strip characters Windows forbids in file paths (< > : " / \ | ? * and control

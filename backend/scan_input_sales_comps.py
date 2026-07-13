@@ -56,7 +56,7 @@ from generate_sales_comps_table import (
 )
 from generate_sales_comps_map import render_map
 import generate_global_sales_comps_table as _global_sales_tbl
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name
 from tools.calculations import (
     haversine_km as _haversine_km,
     parse_num as _num,
@@ -970,7 +970,7 @@ _NON_ADDRESS_WORDS = {
     # Placeholder / "no address" values — geocoding these returns the country
     # centroid, stacking every such comp on one point. Fall back to the name.
     "n/a", "na", "n.a.", "n.a", "nil", "none", "tbd", "-", "--", "—",
-    "not available", "unknown", ".",
+    "not available", "not applicable", "not appl.", "unknown", ".",
 }
 
 
@@ -1095,9 +1095,12 @@ def run(config_path: str = "configs/deal_config.json",
     ollama_cfg   = llm_cfg.get("ollama", {})
     base_url     = ollama_cfg.get("base_url", "http://localhost:11434")
     model        = ollama_cfg.get("model",    "qwen2.5:3b")
-    country_code = cfg.get("country_code",
-                           subject_cfg.get("country_code", "SG"))
     country_name = subject_cfg.get("country_name", "")
+    # country_code drives the geocoder's country restriction. Prefer an explicit code,
+    # else DERIVE it from country_name (so a deal with only the name still geocodes to
+    # the right country instead of a same-named place abroad). No Singapore hardcode.
+    country_code = (cfg.get("country_code") or subject_cfg.get("country_code")
+                    or _cc_from_name(country_name) or "")
     prop_name    = subject_cfg["property_name"]
     deal_name    = subject_cfg.get("deal_name", prop_name)
     # Strip characters Windows forbids in file paths (< > : " / \ | ? * and control
