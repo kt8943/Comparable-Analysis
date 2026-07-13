@@ -87,6 +87,26 @@ _REQUIRE_GFA = False
 # When True, a comp qualifies on its property name alone — the price gate is skipped.
 _NAME_ONLY = False
 
+# A genuine per-sf price is never expressed "in millions/billions" — real psf values
+# are tens to low-thousands. A "Unit Price" column carrying a value like "0.94 million"
+# is something else entirely (commonly PRICE PER KEY for hotel/hospitality assets,
+# mislabeled under a generic 'Unit Price (psf)' report column) — parsing just the
+# leading digit would silently fabricate a nonsense psf figure (e.g. "$0.94 psf").
+_SCALED_AMOUNT_RE = re.compile(r"\b(million|mil|mn|billion|bn)\b", re.I)
+
+
+def _split_psf_value(raw_psf, sale_type: str) -> tuple:
+    """Return (price_psf_gfa_float_or_None, sale_type_with_note). If ``raw_psf``
+    is a genuine plain psf number, parse it normally. If it's a scaled absolute
+    amount instead, leave price_psf_gfa blank and preserve the ORIGINAL phrase
+    (unit qualifier included) as a visible note on sale_type, rather than either
+    fabricating a wrong psf number or silently dropping the figure."""
+    s = str(raw_psf or "").strip()
+    if s and _SCALED_AMOUNT_RE.search(s):
+        note = f"[Unit Price: {s}]"
+        return None, (f"{sale_type} {note}".strip() if sale_type else note)
+    return _num(raw_psf), sale_type
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXCEL PARSING  (Ollama-driven column mapping)
@@ -446,6 +466,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
         price_display = re.sub(r"[*†#]+", "", price_raw_str).strip() if _range_m else None
 
         sale_type = str(item.get("sale_type") or "").strip()
+        psf_val, sale_type = _split_psf_value(item.get("price_psf_gfa"), sale_type)
         combined  = f"{sale_type} {name} {addr}"
         pct_m     = re.search(r"(\d+(?:\.\d+)?)\s*%", combined)
         frac_m    = re.search(r"\((\d+)\s*/\s*(\d+)\s*stake", combined, re.I)
@@ -465,7 +486,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "address":             addr,
             "gfa_sf":              int(gfa) if gfa else None,
             "price_sgd_m":         price_m,
-            "price_psf_gfa":       _num(item.get("price_psf_gfa")),
+            "price_psf_gfa":       psf_val,
             "price_sgd_m_display": price_display,
             "remaining_yrs":   round(float(_parse_remaining_yrs(item.get("remaining_yrs")) or 0), 1),
             "adj_npi_yield":   _num(item.get("adj_npi_yield")),
@@ -653,6 +674,7 @@ def _parse_image_records(image_path: str, llm_cfg: dict, openai_key: str = "",
         price_display = re.sub(r"[*†#]+", "", price_raw_str).strip() if _range_m else None
 
         sale_type = str(item.get("sale_type") or "").strip()
+        psf_val, sale_type = _split_psf_value(item.get("price_psf_gfa"), sale_type)
         combined = f"{sale_type} {name} {addr}"
         pct_m  = re.search(r"(\d+(?:\.\d+)?)\s*%", combined)
         frac_m = re.search(r"\((\d+)\s*/\s*(\d+)\s*stake", combined, re.I)
@@ -671,7 +693,7 @@ def _parse_image_records(image_path: str, llm_cfg: dict, openai_key: str = "",
             "address":          addr,
             "gfa_sf":           int(gfa) if gfa else None,
             "price_sgd_m":      price_m,
-            "price_psf_gfa":    _num(item.get("price_psf_gfa")),
+            "price_psf_gfa":    psf_val,
             "price_sgd_m_display": price_display,  # "600-630" range string for Excel
             "remaining_yrs":   round(float(_parse_remaining_yrs(item.get("remaining_yrs")) or 0), 1),
             "adj_npi_yield":   _num(item.get("adj_npi_yield")),
