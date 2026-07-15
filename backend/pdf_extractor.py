@@ -27,6 +27,7 @@ Stage 4  RECORD ASSEMBLY  — structured rows → dicts via col_map + unit_map;
 
 import json
 import math
+import os
 import re
 import urllib.request
 from pathlib import Path
@@ -260,6 +261,44 @@ def _merge_h_fragments(tables: list) -> list:
     return [result[k] for k in sorted(result)]
 
 
+_COLLAPSED_NUM_RE = re.compile(r"^[\d,]+(?:\.\d+)?$")
+
+
+def _split_collapsed_price_cells(tables: list) -> list:
+    """
+    Repair camelot's borderless-table column collapse.
+
+    On rows whose property name (or another cell) wraps onto a second line,
+    camelot sometimes fuses two ADJACENT numeric columns into a single cell —
+    e.g. a 'Price' cell becomes '1,133.00\\n3,757' while the neighbouring
+    'Unit Price (SGD/psf)' cell is left blank. Downstream, price-parsing keeps
+    only the first line and the psf value ('3,757') is silently dropped.
+
+    Signature of the artefact: a single cell holding EXACTLY two newline-
+    separated NUMERIC tokens, with an EMPTY cell immediately to its right.
+    When found, keep the first number in place and move the second into that
+    empty right-neighbour. Non-numeric second tokens (a row-index + name like
+    '1\\nNorthpoint city', 'na', '1.59 million/per key') never match, and the
+    move only happens when the target cell is blank — so this never overwrites
+    real data. Narrow and reversible; a no-op on well-formed tables.
+    """
+    for tbl in tables:
+        for row in tbl[1:]:                       # skip the header row
+            for i in range(len(row) - 1):
+                cell = str(row[i] or "")
+                if "\n" not in cell:
+                    continue
+                parts = [p.strip() for p in cell.split("\n") if p.strip()]
+                if len(parts) != 2 or not all(_COLLAPSED_NUM_RE.match(p) for p in parts):
+                    continue
+                if str(row[i + 1] or "").strip():
+                    continue                      # right neighbour holds data — leave it
+                row[i], row[i + 1] = parts[0], parts[1]
+                print(f"      [unmerge] split collapsed numeric cell "
+                      f"{cell.replace(chr(10), '/')!r} → {parts[0]!r} | {parts[1]!r}")
+    return tables
+
+
 def _img2table_page_tables(pdf_path: str, page_num: int) -> list:
     """
     img2table + easyocr fallback for a single page.
@@ -460,10 +499,21 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
     # tables are unaffected.
     def _name_continues(prev: str, nxt: str) -> bool:
         prev, nxt = prev.strip(), nxt.strip()
+        # An UNCLOSED '(' means the name clearly runs onto the next line
+        # (e.g. 'Portfolio of two properties (9 Tai' → 'Seng Drive & ...)').
+        if prev.count('(') > prev.count(')'):
+            return True
         if prev.endswith((',', '&', '-', '/')):
             return True
+        # A CLOSED parenthetical qualifier is a COMPLETE name — do NOT treat the
+        # lowercase word inside it as 'unfinished'. Without this, names like
+        # 'CapitaSpring (55% interest)', '(50.1% stake)', '(office component)'
+        # look incomplete and greedily chain into the NEXT transaction's name,
+        # stealing it and dropping that deal (nameless rows are discarded).
+        if prev.endswith(')'):
+            return False
         toks = prev.split()
-        if toks and toks[-1].strip('.,;:)')[:1].islower():
+        if toks and toks[-1].strip('.,;:')[:1].islower():
             return True           # prev ends in a lowercase word → unfinished
         return nxt[:1].islower()  # nxt is a lowercase continuation tail
 
@@ -951,6 +1001,7 @@ def extract_page_tables(pdf_path: str, page_infos: list,
 
         raw_tbls = _camelot_raw_tables(pdf_path, page_num)
         raw_tbls = _merge_h_fragments(raw_tbls)
+        raw_tbls = _split_collapsed_price_cells(raw_tbls)
 
         # Decide whether to fall back to pdfplumber's line-based extraction, which
         # keeps multi-line cells intact. Two cases, both only adopt pdfplumber
@@ -986,6 +1037,7 @@ def extract_page_tables(pdf_path: str, page_infos: list,
         print(f"    Page {page_num:>3}: {len(raw_tbls)} table(s) found")
 
         found_any = False
+        _had_rejected_table = False   # a real table was found but out-of-scope
         _orphaned_hdr: list = []
 
         for tbl_idx, tbl in enumerate(raw_tbls):
@@ -1095,6 +1147,7 @@ def extract_page_tables(pdf_path: str, page_infos: list,
                 if any(kw in _hjoin for kw in reject_table_headers):
                     print(f"      table {tbl_idx+1}: skipped — out-of-scope table "
                           f"(header matched reject list): {headers[:4]}")
+                    _had_rejected_table = True
                     continue
 
             print(f"      table {tbl_idx+1}: {len(rows)} data rows, headers={headers[:4]}")
@@ -1107,7 +1160,18 @@ def extract_page_tables(pdf_path: str, page_infos: list,
             })
             found_any = True
 
-        if not found_any:
+        if not found_any and _had_rejected_table:
+            # This page's only table was a real, parseable table that we
+            # deliberately rejected as OUT-OF-SCOPE (e.g. a GLS/land-tender
+            # table on an asset-sales run). That is a known, resolved outcome —
+            # not "nothing found" — so do not retry with img2table or fall
+            # through to raw-text extraction below, which would re-mine the
+            # exact same out-of-scope rows straight out of the page's prose
+            # and silently undo the rejection (a land parcel leaking back in
+            # as a "text" record after its table was correctly excluded).
+            print(f"    Page {page_num:>3}: only out-of-scope table(s) found — "
+                  f"not falling back to text/img2table")
+        if not found_any and not _had_rejected_table:
             print(f"    Page {page_num:>3}: camelot found no tables — trying img2table")
             ocr_tbls = _img2table_page_tables(pdf_path, page_num)
             for tbl_idx, tbl in enumerate(ocr_tbls):
@@ -1132,7 +1196,7 @@ def extract_page_tables(pdf_path: str, page_infos: list,
                 })
                 found_any = True
 
-        if not found_any:
+        if not found_any and not _had_rejected_table:
             text = ""
             try:
                 import pdfplumber
@@ -1240,9 +1304,51 @@ def _ollama_free(base_url: str, model: str, messages: list, timeout: int = 120) 
         return json.loads(resp.read())["message"]["content"]
 
 
+_TABULAR_HDR_KWS = {
+    'property', 'name', 'building', 'asset', 'site', 'location',
+    'price', 'psf', 'value', 'consideration',
+    'buyer', 'purchaser', 'seller', 'vendor', 'tenant',
+    'rent', 'submarket', 'district', 'address',
+    'date', 'period', 'tenure', 'lease', 'area', 'gfa', 'nla',
+    'yield', 'type', 'zoning', 'sector',
+}
+
+
+def _looks_tabular(text: str) -> bool:
+    """
+    True only if the page text contains a genuine TABLE — detected by a single
+    line holding two or more distinct column-header keywords (e.g. 'Property
+    Price Unit Buyer Seller', or 'PROPERTY NAME TYPE BUYER SELLER PURCHASE
+    PRICE'). This is how a de-gridded transaction table (which camelot failed to
+    box, so it survives only as page text — e.g. Colliers Q3) is told apart from
+    ordinary NARRATIVE prose. Narrative paragraphs never line up two header words
+    on one line, so they return False and are never mined — closing the
+    fabrication vector (inventing deals from commentary + chart numbers).
+    """
+    for line in text.splitlines():
+        low = line.lower()
+        hits = sum(1 for k in _TABULAR_HDR_KWS
+                   if re.search(r'\b' + re.escape(k) + r'\b', low))
+        if hits >= 2:
+            return True
+    return False
+
+
 def _from_text(text: str, section_title: str, field_schema: list,
                subj_tokens: set, llm_cfg: dict) -> list:
-    """LLM extraction from raw page text — used both as Ollama fallback and GPT primary path."""
+    """
+    LLM extraction from raw page text — a fallback for a real transaction TABLE
+    that camelot could not grid, so it survives only as page text.
+
+    Gated by _looks_tabular(): the LLM is allowed to read the text ONLY when it
+    contains a recognisable table header line. Pure narrative prose is refused
+    outright (returns []), so the model can never fabricate deals out of
+    commentary. 'The AI trusts tables, never prose.'
+    """
+    if not _looks_tabular(text):
+        print(f"      [text] no table header detected — skipping prose "
+              f"(AI reads tables only, not narrative)")
+        return []
     field_list = "\n".join(f'  "{k}": {d}' for _, k, d in field_schema)
     system = (
         "You are a real estate data extraction assistant. "
@@ -1508,19 +1614,40 @@ def map_to_schema(page_tables: list, field_schema: list,
 
 # ─── PUBLIC API ───────────────────────────────────────────────────────────────
 
-def _page_tables_context(page_tables: list, max_chars: int = 14000) -> str:
-    """Compact text rendering of the raw page content (tables + prose) that fed
-    Stage 3+4 — used to ground the Stage 5 LLM verification pass against the
-    actual source, not the pipeline's own possibly-wrong reconstruction of it."""
+def _page_tables_context(page_tables: list, max_chars: int = 14000,
+                         tables_only: bool = False) -> str:
+    """Compact text rendering of the raw page content that fed Stage 3+4 — used
+    to ground the Stage 5 LLM verification pass against the actual source, not
+    the pipeline's own possibly-wrong reconstruction of it.
+
+    tables_only=True renders ONLY the structured tables (headers + rows) and
+    omits narrative prose pages entirely. Stage 5 uses this so the verifier
+    evaluates each value against its TABLE cell and each field against the
+    table's COLUMN HEADERS — with no prose in view, it cannot 'correct' a table
+    value toward a rounded/reworded figure from a commentary paragraph."""
     parts = []
     for e in page_tables:
         if e["source"] == "table":
             hdr      = " | ".join(str(h) for h in e.get("headers", []))
             rows_txt = "\n".join(" | ".join(str(c) for c in row) for row in e.get("rows", []))
             parts.append(f"[Page {e['page_num']} table]\n{hdr}\n{rows_txt}")
-        else:
+        elif not tables_only:
             parts.append(f"[Page {e['page_num']} text]\n{e.get('raw_text', '')}")
     return "\n\n".join(parts)[:max_chars]
+
+
+def _sig_number(s) -> float:
+    """First signed decimal number in a string (commas stripped), or None.
+    Used to detect a verifier correction that swaps one number for another."""
+    if s is None:
+        return None
+    m = re.search(r"-?\d[\d,]*\.?\d*", str(s))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def _llm_verify_records(records: list, context_text: str, field_schema: list,
@@ -1553,18 +1680,26 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
 
     system = (
         "You are a data-quality auditor checking an automated PDF-extraction pipeline's "
-        "output against the ORIGINAL source text it was extracted from. For EACH record, "
-        "check two independent things:\n"
-        "1. CELL CORRECTNESS — does each field's value look like a genuine, complete value? "
-        "A property name fused from two different transactions (wrapped text from one row "
-        "bled into another) is WRONG. Cross-check the SOURCE TEXT to find the correct, "
-        "complete name/value for each transaction.\n"
-        "2. COLUMN MAPPING ACCURACY — does the value assigned to each field genuinely "
-        "represent what that field's description says (given below)? e.g. a floor-area "
-        "field must be a genuine area figure — if the source has no such data for that "
-        "transaction, the correct answer is BLANK, not a copied/duplicated number from a "
-        "different field.\n\n"
+        "output against the SOURCE TABLES it was extracted from. The SOURCE below contains "
+        "ONLY the structured tables (column headers + rows) — no narrative prose. Use the "
+        "table headers to understand what each column MEANS, then verify EACH record:\n"
+        "1. CELL CORRECTNESS — does each field's value match the corresponding cell in the "
+        "source table for that transaction's row? A value fused from two different rows "
+        "(wrapped text bleeding between transactions) or copied from the wrong row is WRONG. "
+        "Find the transaction's actual row in the table and compare cell by cell.\n"
+        "2. COLUMN MAPPING ACCURACY — is each value under the field whose description (given "
+        "below) matches the table COLUMN that value came from? Read the table's own header for "
+        "that column and check it lines up with the field. e.g. a value under a 'Unit Price "
+        "(SGD/psf)' column must land in the psf field, NOT the floor-area field; a floor-area "
+        "field with no matching column in the table must be BLANK, never a number duplicated "
+        "from the price column.\n\n"
         "STRICT RULES:\n"
+        "- The SOURCE TABLES are the ONLY source of truth. Match every value to a specific "
+        "table cell. If a value is not present in any table cell for that row, it must be "
+        "BLANK — never invent or infer one.\n"
+        "- NEVER round, truncate, re-scale, or re-format a NUMBER. '1,133.00' must stay "
+        "'1,133.00' (never '1,100'); '1.59' must stay '1.59' (never '1.6'). Copy the table "
+        "cell exactly.\n"
         "- Only correct a field when you can point to exact text in SOURCE supporting the "
         "correction. NEVER invent, guess, or infer a value not stated in SOURCE.\n"
         "- NEVER strip a unit/scale qualifier (e.g. 'million', 'per key', 'psf') from a value "
@@ -1584,7 +1719,7 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
     user = (
         f"Field descriptions:\n{field_descs}\n\n"
         f"Extracted records (0-indexed):\n{json.dumps(compact, indent=2, default=str)}\n\n"
-        f"SOURCE TEXT (the original page content these records were extracted from):\n"
+        f"SOURCE TABLES (headers + rows the records were extracted from):\n"
         f"---\n{context_text}\n---"
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -1624,9 +1759,32 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
             for fk, val in corr.items():
                 if fk not in out[idx]:
                     continue  # never introduce a field the schema doesn't have
+                # GUARDRAIL: Stage 5 may not rewrite the property NAME. Names come
+                # from the table's property column (deterministic extraction +
+                # _merge_transaction_cont_rows row-reassembly). Empirically every
+                # Stage-5 name edit was a prose-derived rewrite that LOST fidelity
+                # (e.g. 'MBFC (T3)'→'MBFC's Tower 3', dropping a '(50.0%)' stake),
+                # and it never once improved a name. Leave names to the table.
+                if fk == "property_name":
+                    if val != out[idx].get(fk):
+                        print(f"      [verify] BLOCKED name rewrite on record {idx}: "
+                              f"{out[idx].get(fk)!r} → {val!r} (names come from the table)")
+                    continue
                 before = out[idx].get(fk)
                 if before == val:
                     continue
+                # GUARDRAIL: never let the verifier substitute one non-empty number
+                # for a DIFFERENT non-empty number — that is the "rounded-from-prose"
+                # failure mode (table '1,133.00' → paragraph '1,100'; '1.59' → '1.6').
+                # Legitimate Stage-5 fixes are mapping corrections (blank the mis-mapped
+                # field) or text de-fusion, never numeric re-rounding. Blanking (val
+                # falsy) and pure-text edits are still allowed through.
+                if val not in (None, ""):
+                    _b, _a = _sig_number(before), _sig_number(val)
+                    if _b is not None and _a is not None and abs(_b - _a) > 1e-9:
+                        print(f"      [verify] BLOCKED numeric override on record {idx} "
+                              f"{fk}: {before!r} → {val!r} (prose-rounding guard)")
+                        continue
                 out[idx][fk] = val
                 n_fixed += 1
                 print(f"      [verify] record {idx} ({out[idx].get('property_name', '')!r:.40}) "
@@ -1707,8 +1865,9 @@ def extract_pdf_records(
     records = map_to_schema(page_tables, field_schema, subject_name, llm_cfg, dedup=dedup)
     print(f"  [PDF] {len(records)} record(s) extracted")
 
-    if records:
+    if records and os.environ.get("PDF_SKIP_STAGE5") != "1":
         print(f"\n  [PDF Stage 5] Verifying cell correctness + column mapping ...")
         records = _llm_verify_records(
-            records, _page_tables_context(page_tables), field_schema, llm_cfg)
+            records, _page_tables_context(page_tables, tables_only=True),
+            field_schema, llm_cfg)
     return records

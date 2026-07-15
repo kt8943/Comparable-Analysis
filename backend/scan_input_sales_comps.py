@@ -996,6 +996,98 @@ _NON_ADDRESS_WORDS = {
 }
 
 
+def _record_completeness(r: dict) -> int:
+    """Count of non-blank canonical fields — used to pick the most complete
+    record as the base when merging cross-source duplicates."""
+    _skip = {'lon', 'lat', 'distance_km', 'map_marker'}
+    return sum(1 for k, v in r.items()
+               if k not in _skip and not str(k).startswith('_') and str(v or '').strip())
+
+
+def _dedup_cross_source(records: list, threshold_km: float = 0.2,
+                        price_tol_frac: float = 0.15) -> list:
+    """
+    Merge records that represent the SAME transaction reported by DIFFERENT
+    input sources (e.g. the same deal appears in both an uploaded Colliers PDF
+    and a CBRE PDF for one deal, under different property-name spellings —
+    'MBFC (T3)' vs 'Marina Bay Financial Centre Tower 3'). Name-matching would
+    miss this; geocode proximity catches it regardless of how each source
+    wrote the name.
+
+    Two records are treated as the same deal ONLY when BOTH:
+      - they geocoded within `threshold_km` of each other (same building), AND
+      - their price_sgd_m values agree within `price_tol_frac` (guards against
+        merging two genuinely different, merely-adjacent buildings, e.g. two
+        towers in the same complex, which can land within threshold_km of
+        each other in a dense CBD).
+    Records sharing the same `_source` tag are never merged here — same-file
+    duplicates are a different bug, handled earlier by name-based `_dedup`.
+
+    For each matched pair/group, keeps the MOST COMPLETE record (most non-blank
+    fields) as the base and fills any of its still-blank fields from the other
+    record(s) — so complementary data from both sources survives (e.g. one
+    source has psf, the other has the cap rate).
+    """
+    n = len(records)
+    used = [False] * n
+    groups: list = []
+    for i in range(n):
+        if used[i] or records[i].get('lon') is None or records[i].get('lat') is None:
+            continue
+        group = [i]
+        for j in range(i + 1, n):
+            if used[j] or records[j].get('lon') is None or records[j].get('lat') is None:
+                continue
+            if records[i].get('_source') and records[i].get('_source') == records[j].get('_source'):
+                continue  # same source — not a cross-source duplicate
+            dist = _haversine_km(records[i]['lon'], records[i]['lat'],
+                                 records[j]['lon'], records[j]['lat'])
+            if dist > threshold_km:
+                continue
+            try:
+                p1 = float(re.sub(r'[^\d.]', '', str(records[i].get('price_sgd_m') or '')))
+                p2 = float(re.sub(r'[^\d.]', '', str(records[j].get('price_sgd_m') or '')))
+                if p1 <= 0 or p2 <= 0 or abs(p1 - p2) / max(p1, p2) > price_tol_frac:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            group.append(j)
+        if len(group) > 1:
+            groups.append(group)
+            for idx in group:
+                used[idx] = True
+
+    if not groups:
+        return records
+
+    grouped_idx = {idx for g in groups for idx in g}
+    result = [r for i, r in enumerate(records) if i not in grouped_idx]
+
+    for group in groups:
+        group_recs = sorted((records[i] for i in group),
+                            key=_record_completeness, reverse=True)
+        base = dict(group_recs[0])
+        sources = [s for s in (r.get('_source') for r in group_recs) if s]
+        filled = []
+        for other in group_recs[1:]:
+            for k, v in other.items():
+                if k in ('lon', 'lat', 'distance_km', 'map_marker') or str(k).startswith('_'):
+                    continue
+                if not str(base.get(k) or '').strip() and str(v or '').strip():
+                    base[k] = v
+                    filled.append(k)
+        if sources:
+            base['_source'] = '+'.join(dict.fromkeys(sources))  # de-dup, keep order
+        if filled:
+            base['_dedup_note'] = (f"merged {len(group_recs)} cross-source record(s); "
+                                   f"filled from other source: {', '.join(sorted(set(filled)))}")
+        print(f"      [cross-source dedup] merged {len(group_recs)} record(s) → "
+              f"{str(base.get('property_name',''))[:40]!r} "
+              f"(sources: {base.get('_source','')})")
+        result.append(base)
+    return result
+
+
 def _geocode_comps(records: list, mapbox_tok: str,
                    country_code: str, country_name: str,
                    s_lon: float, s_lat: float) -> list:
@@ -1416,6 +1508,13 @@ def run(config_path: str = "configs/deal_config.json",
         print(f"      Geocoding comparables …")
         processed = _geocode_comps(processed, mapbox_tok, country_code,
                                    country_name, s_lon, s_lat)
+
+        _before_dedup = len(processed)
+        processed = _dedup_cross_source(processed)
+        if len(processed) < _before_dedup:
+            print(f"      Cross-source dedup: {_before_dedup} → {len(processed)} "
+                  f"record(s) (merged duplicates reported by multiple sources)")
+
         for i, r in enumerate(processed, 1):
             r["map_marker"] = str(i)
 
