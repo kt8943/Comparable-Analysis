@@ -1218,6 +1218,52 @@ def extract_page_tables(pdf_path: str, page_infos: list,
 
 # ─── Stage 4: record assembly ─────────────────────────────────────────────────
 
+# Finite verbs / market-commentary words that appear in narrative sentences but
+# never inside a genuine property/site name ("worker dormitories, WAS also a
+# significant driver …", "office investment sales volume IS anticipated …").
+_NAME_VERB_RE = re.compile(
+    r"\b(was|were|is|are|has|have|had|will|would|could|should|may|might|"
+    r"remains?|continues?|expects?|expected|anticipated|according|"
+    r"driven|rose|fell|grew|declined|increased|decreased)\b", re.I)
+# A name that ENDS on a conjunction / preposition / article broke off
+# mid-sentence ("… niche asset classes such as data centres AND").
+_NAME_TRAIL_RE = re.compile(
+    r"\b(and|or|of|the|in|to|for|with|by|a|an|its|their|as|at|on|from|"
+    r"under|over|into|amid)[.,]?$", re.I)
+
+
+def _is_sentence_fragment(name: str) -> bool:
+    """
+    True when a supposed property name is really a fragment of narrative prose.
+
+    Chart/commentary blocks sometimes survive camelot as pseudo-tables; the
+    column mapper then lands prose lines in the name field and chart-axis
+    numbers ($10/$8/$4) in the price field, producing plausible-looking fake
+    records ("The industrial sector, including … data centres and | 10.0").
+    The old length-only guard (>80 chars) missed these — they run 79-80 chars
+    or are short ("sales or acquisitions."). Detect them STRUCTURALLY instead:
+    real property names never end with a period or a dangling conjunction,
+    and never contain a finite verb. Deterministic — junk removal must not
+    depend on the Stage-5 LLM happening to notice.
+    """
+    n = " ".join(str(name or "").split())
+    if not n:
+        return False
+    words = n.split()
+    if len(words) < 3:
+        return False        # short names are never mistaken for prose
+    # Ends with a period → a sentence, not a name. (Allow abbreviations that
+    # legitimately end names: 'Ltd.', 'Pte.', 'Inc.', 'Co.', 'No.', 'St.' …)
+    if n.endswith(".") and not re.search(
+            r"\b(ltd|pte|inc|corp|co|jr|sr|st|rd|ave|blvd|no)\.$", n, re.I):
+        return True
+    if _NAME_TRAIL_RE.search(n):
+        return True
+    if len(words) >= 5 and _NAME_VERB_RE.search(n):
+        return True
+    return False
+
+
 def _skip_subject(name: str, subj_tokens: set) -> bool:
     if not subj_tokens or not name:
         return False
@@ -1268,6 +1314,9 @@ def _from_table(headers: list, rows: list, col_map: dict, unit_map: dict,
             continue
         if len(name) > 80:
             print(f"      SKIP (garbage — name too long): {name[:60]!r}")
+            continue
+        if _is_sentence_fragment(name):
+            print(f"      SKIP (garbage — prose sentence, not a property name): {name[:60]!r}")
             continue
         if name.count('\n') >= 3:
             print(f"      SKIP (garbage — name has multiple newlines): {name[:60]!r}")
@@ -1399,6 +1448,9 @@ def _from_text(text: str, section_title: str, field_schema: list,
                 continue
             name = str(next((item.get(k, "") for k in _NAME_KEYS if item.get(k)), ""))
             if _skip_subject(name, subj_tokens):
+                continue
+            if _is_sentence_fragment(name):
+                print(f"      SKIP (garbage — prose sentence, not a property name): {name[:60]!r}")
                 continue
             result.append(item)
         return result
