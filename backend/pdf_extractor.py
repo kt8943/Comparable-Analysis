@@ -39,6 +39,25 @@ from tools.column_mapper import map_columns
 
 _NAME_KEYS = frozenset({"property_name", "site_name", "building_name"})
 
+
+def _is_real_candidate(rec: dict) -> bool:
+    """
+    A record worth sending to Stage 5 verification — has a genuine, non-empty
+    NAME and at least one other non-blank field. Filters out garbage rows
+    (misdetected pseudo-tables' chart captions / stray phrases, which end up
+    with an empty name and often just ONE stray field filled) before they ever
+    reach the LLM verification batch, rather than after. See extract_pdf_records
+    Stage 5 call site for why this matters: a large noisy batch degrades the
+    model's judgment even on the real records in it.
+    """
+    name = str(next((rec.get(k, "") for k in _NAME_KEYS if rec.get(k)), "")).strip()
+    if not name:
+        return False
+    other_non_blank = sum(1 for k, v in rec.items()
+                          if k not in _NAME_KEYS and not str(k).startswith("_")
+                          and str(v or "").strip())
+    return other_non_blank >= 1
+
 # Generic asset-class / aggregate labels.  When a "property name" is essentially
 # just one of these words it is a category heading or a summary-table row
 # (e.g. an "Investment Activity by Property Type" breakdown), not a real
@@ -1276,8 +1295,15 @@ def _skip_subject(name: str, subj_tokens: set) -> bool:
 
 
 def _from_table(headers: list, rows: list, col_map: dict, unit_map: dict,
-                subj_tokens: set) -> list:
-    """Build record dicts from structured table rows using col_map + unit_map."""
+                subj_tokens: set, table_id: str = "") -> list:
+    """Build record dicts from structured table rows using col_map + unit_map.
+
+    Each kept record carries a ``_prov`` map: {field_key -> {table, row, col,
+    header, cell}} recording the exact source table cell every value came from.
+    This is the provenance backbone — it lets any later stage (Stage 5, the eval
+    harness, a future click-through UI) answer "does this value actually exist in
+    the source, and where?" as an exact lookup instead of an LLM guess.
+    """
     # Forward-fill the property_name column: PDFs with visually merged/spanning
     # cells produce empty strings in pdfplumber for all rows after the first.
     name_col = col_map.get("property_name")
@@ -1291,14 +1317,16 @@ def _from_table(headers: list, rows: list, col_map: dict, unit_map: dict,
                 row[name_col] = last_name
 
     records = []
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         rec = {}
+        prov = {}
         for field_key, col_idx in col_map.items():
             if col_idx is None or col_idx >= len(row):
                 continue
             val = row[col_idx]
             if val in ("", None):
                 continue
+            raw_cell = val
             mult = unit_map.get(field_key, 1.0)
             if mult != 1.0:
                 try:
@@ -1306,6 +1334,13 @@ def _from_table(headers: list, rows: list, col_map: dict, unit_map: dict,
                 except (ValueError, AttributeError):
                     pass
             rec[field_key] = val
+            prov[field_key] = {
+                "table":  table_id,
+                "row":    row_idx,
+                "col":    col_idx,
+                "header": str(headers[col_idx]) if col_idx < len(headers) else "",
+                "cell":   str(raw_cell),
+            }
         if not rec:
             continue
         name = str(next((rec.get(k, "") for k in _NAME_KEYS if rec.get(k)), ""))
@@ -1330,6 +1365,7 @@ def _from_table(headers: list, rows: list, col_map: dict, unit_map: dict,
             continue
         price = rec.get("price_sgd_m") or rec.get("price_psf_gfa") or ""
         print(f"      KEEP {name!r:.55s}  price={price!r:.20s}")
+        rec["_prov"] = prov
         records.append(rec)
 
     # Tag all records with detected price unit (for downstream display conversion)
@@ -1559,9 +1595,15 @@ def _dedup(records: list) -> list:
             # and adopting a price when the kept copy lacks one — instead of
             # discarding it (which would otherwise drop the priced copy).
             kept = kept_recs[dup_idx]
+            _rec_prov = rec.get("_prov") or {}
             for k, v in rec.items():
+                if k == "_prov":
+                    continue
                 if v not in ("", None) and kept.get(k) in ("", None):
                     kept[k] = v
+                    # adopt the merged copy's provenance for the field we filled
+                    if k in _rec_prov:
+                        kept.setdefault("_prov", {})[k] = _rec_prov[k]
             if not kept_prices[dup_idx] and price:
                 kept_prices[dup_idx] = price
             print(f"    [dedup] merged {dup_reason} duplicate: {raw!r:.60s}")
@@ -1692,6 +1734,20 @@ def map_to_schema(page_tables: list, field_schema: list,
                 reject_table_headers=reject_table_headers,
                 extra_exclusion_note=extra_exclusion_note,
             )
+            # No grid survived on this page, so nothing here was READ out of a
+            # table cell — the LLM decided where every value starts and ends by
+            # reading unstructured text (that is why these records carry no
+            # _prov). When the text is shredded (cells glued together with no
+            # separators) that decision can silently go wrong: a rank column
+            # fused onto the name yields '125 Loyang Crescent504.2237', out of
+            # which the model picked the name 'Loyang'. The result is plausible
+            # and un-checkable from the output alone, so mark the rows here and
+            # let the review UI tell the analyst these are judgment calls.
+            for _r in recs:
+                _r["_llm_parsed"] = (
+                    f"page {pg}: no table grid detected — the AI read the "
+                    f"fields out of unstructured page text"
+                )
             print(f"    Page {pg:>3}: {len(recs)} record(s) from text")
         else:
             _page_tbl_seen[pg] += 1
@@ -1707,8 +1763,10 @@ def map_to_schema(page_tables: list, field_schema: list,
             _rows = entry["rows"]
             if col_map.get("tenant") is not None:
                 _rows = _merge_tenant_fragments(_rows, col_map)
+            _table_id = f"p{pg}#{_page_tbl_seen[pg]}"
             recs = _from_table(
                 entry["headers"], _rows, col_map, unit_map, subj_tokens,
+                table_id=_table_id,
             )
             print(f"    {label}: {len(recs)} record(s)")
         all_records.extend(recs)
@@ -1760,6 +1818,123 @@ def _sig_number(s) -> float:
         return None
 
 
+# ─── 1a helpers: evidence / value existence in the source context ──────────────
+
+def _norm_ctx(s) -> str:
+    """Lowercase + collapse all whitespace — for robust substring matching of an
+    evidence quote (or a proposed value) against the SOURCE table context."""
+    return re.sub(r"\s+", " ", str(s or "").lower()).strip()
+
+
+def _value_in_context(val, context_norm: str, context_nocomma: str) -> bool:
+    """True if ``val`` appears verbatim in the source context. Tries an exact
+    normalized match first, then a comma-stripped match so a table cell like
+    '1,133.00' still matches a value written '1133.00' (and vice-versa)."""
+    v = _norm_ctx(val)
+    if not v:
+        return False
+    if v in context_norm:
+        return True
+    return v.replace(",", "") in context_nocomma
+
+
+# ─── 1d: deterministic per-record validators (flag-only, never mutate) ─────────
+#
+# These run BEFORE Stage 5. They never change a value — they only attach an
+# advisory ``_auto_flags`` list and feed Stage 5 targeted questions ("this field
+# looks wrong, check it") instead of asking the LLM to police every cell blind.
+# Every check is deliberately lenient: the cost of a false flag is a wasted LLM
+# glance; the cost of a false pass is a silent data error, so we only flag gross,
+# unambiguous problems (a price sitting in a size field, a size field holding a
+# sale-structure word, price ÷ area disagreeing with the stated unit price).
+
+_ZONING_WORDS = (
+    "office", "retail", "industrial", "residential", "hospitality", "hotel",
+    "commercial", "logistics", "warehouse", "mixed", "business park",
+    "data centre", "data center", "medical", "education", "healthcare",
+    "shophouse", "f&b", "food",
+)
+_SALETYPE_WORDS = (
+    "strata", "whole bldg", "whole block", "whole building", "en bloc",
+    "block sale", "portfolio", "share sale", "forward sale", "leaseback",
+    "sale and leaseback",
+)
+# Pure-size fields that must be numeric — prose here means a mis-mapped column.
+_SIZE_KEYS = ("gfa_sf", "land_area_sf", "site_area_sf", "nla_sf")
+# Numeric fields with a sane plausibility band (lenient — spans SGD M/B tags,
+# sqm/sqft, percent-vs-decimal yields; only catches order-of-magnitude nonsense).
+_FIELD_RANGES = {
+    "gfa_sf":        (50, 80_000_000),
+    "land_area_sf":  (50, 80_000_000),
+    "site_area_sf":  (50, 80_000_000),
+    "price_psf_gfa": (1, 1_000_000),
+    "remaining_yrs": (0, 1200),
+}
+
+
+_PLACEHOLDER_VALUES = {"", "-", "–", "—", "n/a", "n.a.", "na", "nil", "none", "null"}
+
+
+def _is_placeholder(v) -> bool:
+    """True for a source cell that says 'no value here' ('N/A', '-', 'nil')."""
+    return str(v or "").strip().lower() in _PLACEHOLDER_VALUES
+
+
+def _deterministic_flags(records: list) -> list:
+    """Attach ``_auto_flags`` (list of 'field: reason' strings) to each record.
+    Returns the same list of records (mutated in place). Never edits values."""
+    for rec in records:
+        flags: list = []
+
+        # (a) plausibility ranges
+        for k, (lo, hi) in _FIELD_RANGES.items():
+            if rec.get(k) in (None, ""):
+                continue
+            n = _sig_number(rec.get(k))
+            if n is not None and not (lo <= n <= hi):
+                flags.append(f"{k}: value {rec[k]!r} outside plausible range "
+                             f"[{lo}, {hi}] — likely a mis-mapped column")
+
+        # (b) pure-size field holding prose = a mis-mapped column
+        for k in _SIZE_KEYS:
+            v = rec.get(k)
+            if v and re.search(r"[A-Za-z]{3,}", str(v)):
+                flags.append(f"{k}: contains text {str(v)[:30]!r} — a size field "
+                             f"must be numeric; likely mapped from the wrong column")
+
+        # (c) zoning / sale-type value swap (the exact class of column error
+        #     seen this session: bare TYPE→sale_type, SECTOR→land_zoning)
+        lz = str(rec.get("land_zoning") or "").lower()
+        st = str(rec.get("sale_type") or "").lower()
+        if lz and any(w in lz for w in _SALETYPE_WORDS) \
+                and not any(w in lz for w in _ZONING_WORDS):
+            flags.append(f"land_zoning: value {rec.get('land_zoning')!r} looks "
+                         f"like a SALE TYPE, not a land use — check the mapping")
+        if st and any(w in st for w in _ZONING_WORDS) \
+                and not any(w in st for w in _SALETYPE_WORDS):
+            flags.append(f"sale_type: value {rec.get('sale_type')!r} looks like a "
+                         f"LAND ZONING, not a sale structure — check the mapping")
+
+        # (d) cross-field arithmetic identity: price ÷ area ≈ stated unit price.
+        #     A large disagreement means a column swap or a sqm/sqft unit error.
+        p   = _sig_number(rec.get("price_sgd_m"))
+        g   = _sig_number(rec.get("gfa_sf"))
+        psf = _sig_number(rec.get("price_psf_gfa"))
+        if p and g and psf and g > 0 and psf > 0:
+            scale   = 1e9 if rec.get("_price_unit") == "B" else 1e6
+            implied = p * scale / g
+            ratio   = max(implied / psf, psf / implied)
+            if ratio >= 3.0:
+                flags.append(
+                    f"price/gfa arithmetic: price ÷ GFA implies ~{implied:,.0f} psf "
+                    f"but price_psf_gfa is {psf:,.0f} ({ratio:.1f}x off) — a column "
+                    f"swap or sqm/sqft unit mismatch")
+
+        if flags:
+            rec["_auto_flags"] = flags
+    return records
+
+
 def _llm_verify_records(records: list, context_text: str, field_schema: list,
                         llm_cfg: dict) -> list:
     """
@@ -1787,6 +1962,17 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
                         if v not in (None, "", 0) and not str(k).startswith("_")}}
         for i, r in enumerate(records)
     ]
+
+    # 1d → Stage 5: turn the deterministic pre-checks into targeted questions so
+    # the LLM's attention goes to the fields we already have reason to doubt,
+    # rather than re-policing every correct cell blind.
+    hint_lines = []
+    for i, r in enumerate(records):
+        for f in (r.get("_auto_flags") or []):
+            hint_lines.append(f"  - record {i}: {f}")
+    auto_hint = ("\n\nAUTOMATED PRE-CHECKS flagged these fields as suspicious — "
+                 "verify each specifically against the SOURCE tables:\n"
+                 + "\n".join(hint_lines)) if hint_lines else ""
 
     system = (
         "You are a data-quality auditor checking an automated PDF-extraction pipeline's "
@@ -1822,8 +2008,14 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
         "- If a value looks wrong but you cannot determine the correct one from SOURCE, set "
         "it to null (blank) rather than guessing, and say why in \"flag\".\n"
         "- Leave fields that are already correct untouched — do not \"fix\" things that aren't broken.\n"
+        "- EVIDENCE IS MANDATORY: for every correction that sets a NON-NULL value, you MUST "
+        "include, in the \"evidence\" map, the exact verbatim text copied from SOURCE that the "
+        "corrected value appears in. Copy it character-for-character from a SOURCE cell — do not "
+        "paraphrase. A correction whose evidence text is not found verbatim in SOURCE will be "
+        "REJECTED automatically. (Blanking a field to null needs no evidence.)\n"
         "- Output ONLY a JSON array, one object per record needing any change: "
         '{"index": int, "corrections": {"field_key": corrected_value_or_null, ...}, '
+        '"evidence": {"field_key": "verbatim SOURCE text for that non-null correction"}, '
         '"flag": "short note, or empty string"}. Omit records that need no changes entirely.'
     )
     user = (
@@ -1831,6 +2023,7 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
         f"Extracted records (0-indexed):\n{json.dumps(compact, indent=2, default=str)}\n\n"
         f"SOURCE TABLES (headers + rows the records were extracted from):\n"
         f"---\n{context_text}\n---"
+        f"{auto_hint}"
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -1856,6 +2049,8 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
         return records
 
     out = [dict(r) for r in records]
+    _ctx_norm    = _norm_ctx(context_text)
+    _ctx_nocomma = _ctx_norm.replace(",", "")
     n_fixed, n_flagged = 0, 0
     for v in verdicts:
         if not isinstance(v, dict):
@@ -1864,6 +2059,7 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
         if not isinstance(idx, int) or idx < 0 or idx >= len(out):
             continue
         corr = v.get("corrections") or {}
+        evidence = v.get("evidence") if isinstance(v.get("evidence"), dict) else {}
         flag = str(v.get("flag") or "").strip()
         if isinstance(corr, dict):
             for fk, val in corr.items():
@@ -1895,8 +2091,59 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
                         print(f"      [verify] BLOCKED numeric override on record {idx} "
                               f"{fk}: {before!r} → {val!r} (prose-rounding guard)")
                         continue
+                # GUARDRAIL: never let the verifier BLANK a short TEXT/CATEGORY
+                # value (not a bare number — those are handled separately, since
+                # a legitimate mis-mapped-duplicate-number fix, e.g. a price
+                # wrongly copied into gfa_sf, is a real number that ALSO happens
+                # to appear elsewhere in the source verbatim, and blanking THAT
+                # must still work) that is still literally present, verbatim, in
+                # the source context. Observed failure: a large noisy batch (many
+                # half-empty records from misdetected pseudo-tables elsewhere in
+                # the PDF) degrades the model's per-record judgment even on the
+                # good records — it blanked land_zoning='Commercial' to None for
+                # 3 real Savills transactions, even though the exact row
+                # "PROPERTY | Commercial | ..." was right there in SOURCE.
+                # Re-running the SAME 3 records alone (no noisy batch) did NOT
+                # reproduce it — proof this isn't a genuine mapping error, just
+                # batch-size-driven LLM inconsistency.
+                if (val in (None, "") and before not in (None, "")
+                        and len(str(before)) <= 60
+                        and _sig_number(before) is None      # not a bare number
+                        and re.search(r"[a-zA-Z]{3,}", str(before))):  # a real word
+                    if str(before).lower() in context_text.lower():
+                        print(f"      [verify] BLOCKED blanking record {idx} "
+                              f"{fk}: {before!r} → blank (value still verbatim in "
+                              f"SOURCE — not a genuine mismatch)")
+                        continue
+                # 1a EVIDENCE GATE: any correction that sets a NON-NULL value must
+                # be traceable to the source — either the model's supplied evidence
+                # quote is verbatim in SOURCE, or the corrected value itself is.
+                # This generalizes the guards above into one rule (no verifiable
+                # source text → no correction) and is what actually stops the model
+                # FABRICATING a value that appears nowhere in the tables.
+                if val not in (None, ""):
+                    ev = evidence.get(fk, "")
+                    ok = _value_in_context(ev, _ctx_norm, _ctx_nocomma) or \
+                         _value_in_context(val, _ctx_norm, _ctx_nocomma)
+                    if not ok:
+                        print(f"      [verify] BLOCKED ungrounded correction on "
+                              f"record {idx} {fk}: {before!r} → {val!r} "
+                              f"(no verbatim support in SOURCE; evidence={ev!r:.40})")
+                        continue
                 out[idx][fk] = val
                 n_fixed += 1
+                # Every guardrail above BLOCKS a bad edit and says so in the run
+                # log; the edits that survive are applied to the record and were
+                # only ever visible as a log line the analyst has no reason to
+                # open. Record them on the record itself so the preview can show
+                # which cells the verifier changed and what they used to say.
+                # Exception: blanking a placeholder ('N/A' → None) is clerical
+                # cleanup, not a judgment about a value — and it fires on nearly
+                # every field of every row (5 per row on Colliers Q1 2026), so
+                # surfacing it would bury the edits actually worth reviewing.
+                if not (val in (None, "") and _is_placeholder(before)):
+                    out[idx].setdefault("_verify_edits", []).append(
+                        f"{fk}: {before!r} → {val!r}")
                 print(f"      [verify] record {idx} ({out[idx].get('property_name', '')!r:.40}) "
                       f"{fk}: {before!r} → {val!r}")
         if flag:
@@ -1978,8 +2225,36 @@ def extract_pdf_records(
     print(f"  [PDF] {len(records)} record(s) extracted")
 
     if records and os.environ.get("PDF_SKIP_STAGE5") != "1":
-        print(f"\n  [PDF Stage 5] Verifying cell correctness + column mapping ...")
-        records = _llm_verify_records(
-            records, _page_tables_context(page_tables, tables_only=True),
-            field_schema, llm_cfg)
+        # Pre-filter garbage/incomplete records BEFORE Stage 5, not after.
+        # map_to_schema's raw output can include nameless, dataless rows from
+        # misdetected pseudo-tables (chart captions, stray phrases) that ride
+        # along with no name AND no data at all — every scan module's own
+        # later "need name + price" gate drops them anyway, so nothing is lost
+        # by dropping them here too. But leaving them IN the Stage 5 batch
+        # means the LLM verifies ~25 garbage rows alongside a handful of real
+        # ones in one call — observed to degrade its judgment even on the good
+        # records (a correct land_zoning value got blanked when verified
+        # alongside a noisy batch, but was kept correctly when verified alone).
+        # Shrinking the batch to real candidates removes that noise at the
+        # source instead of guarding against its symptoms after the fact.
+        _real = [r for r in records if _is_real_candidate(r)]
+        if len(_real) < len(records):
+            print(f"      [pre-filter] dropped {len(records) - len(_real)} "
+                  f"garbage/incomplete record(s) before Stage 5 verification")
+        records = _real
+
+        if records:
+            # 1d — deterministic validators run first (no LLM): they attach
+            # advisory _auto_flags and hand Stage 5 targeted "check this field"
+            # questions instead of asking it to police every cell blind.
+            records = _deterministic_flags(records)
+            _n_auto = sum(len(r.get("_auto_flags") or []) for r in records)
+            if _n_auto:
+                print(f"      [pre-check] {_n_auto} deterministic flag(s) raised "
+                      f"— passed to Stage 5 as targeted checks")
+
+            print(f"\n  [PDF Stage 5] Verifying cell correctness + column mapping ...")
+            records = _llm_verify_records(
+                records, _page_tables_context(page_tables, tables_only=True),
+                field_schema, llm_cfg)
     return records

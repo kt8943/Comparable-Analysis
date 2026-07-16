@@ -642,6 +642,39 @@ def map_columns(
                 print(f"    submarket(excluded)    → col {i} ({headers[i]!r})  "
                       f"[no template column — kept out of address/zoning/geocoding]")
 
+    # ── Tier 0c: bare "Type" column disambiguation ─────────────────────────────
+    # A column header of just "Type" (Cushman/CMMB market-beat reports: PROPERTY
+    # NAME | TYPE | BUYER | SELLER | PURCHASE PRICE | SUBMARKET) is too short to
+    # match any exact synonym for either land_zoning ("property type", "asset
+    # type", …) or sale_type ("sale type", "deal type", …) — it falls through to
+    # the embedding tier, which resolves it on bare token similarity alone and
+    # (observed on real CMMB reports) sends it to sale_type even when the
+    # column's VALUES are plainly property-use categories (Office, Retail,
+    # Industrial, Mixed/Others) that belong in land_zoning. Decide by the
+    # column's actual VALUES instead of the ambiguous one-word header.
+    _ZONING_VALUE_WORDS = ("office", "retail", "industrial", "residential",
+                          "hospitality", "hotel", "commercial", "logistics",
+                          "warehouse", "mixed", "data centre", "data center",
+                          "business park")
+    _SALETYPE_VALUE_WORDS = ("strata", "whole bldg", "whole block", "en bloc",
+                             "block sale", "portfolio")
+    for i, hn in enumerate(headers_norm):
+        if i in claimed or hn != "type":
+            continue
+        vals = [str(r[i]).strip().lower() for r in (sample_rows or [])
+                if i < len(r) and r[i] not in (None, "")]
+        if not vals:
+            continue
+        zoning_hits   = sum(1 for v in vals if any(w in v for w in _ZONING_VALUE_WORDS))
+        saletype_hits = sum(1 for v in vals if any(w in v for w in _SALETYPE_VALUE_WORDS))
+        _half = max(1, (len(vals) + 1) // 2)
+        if zoning_hits >= _half and zoning_hits >= saletype_hits:
+            if col_map.get("land_zoning") is None and "land_zoning" in col_map:
+                _assign("land_zoning", i, "value:type-column")
+        elif saletype_hits >= _half:
+            if col_map.get("sale_type") is None and "sale_type" in col_map:
+                _assign("sale_type", i, "value:type-column")
+
     for field_key in all_keys:
         for i, hn in enumerate(headers_norm):
             if i in claimed or not hn:

@@ -31,7 +31,9 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from tools.calculations import bala_factor, bala_expr as _bala_expr, _BALA_TABLE
+from tools.calculations import (bala_factor, bala_expr as _bala_expr, _BALA_TABLE,
+                                parse_cap_rate as _cap_rate,
+                                parse_remaining_yrs as _parse_remaining_yrs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -108,10 +110,26 @@ def get_output_schema(subject_cfg: dict = None) -> list:
 # SECTION 2 — ROW CONVERTERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _blank_if_absent(v):
+    """Numeric value, or None when the source reported none for this field.
+
+    A missing GFA / remaining leasehold / cap rate is UNKNOWN, not zero. Coercing
+    it to 0 prints a confident '0.0' (or '0.00%') that reads as a measured value
+    the report never had — the analyst cannot tell it apart from a real figure.
+    _data_row renders None as '—', which says 'not reported' honestly. 0 is never
+    a real GFA/leasehold/cap rate, so treat it as absent too.
+    """
+    try:
+        f = float(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return f or None
+
+
 def subject_to_row(cfg: dict) -> dict:
     price_m    = cfg.get("price_sgd_m")
     price_unit = cfg.get("price_unit", "M")
-    gfa        = cfg.get("gfa_sf") or 1
+    gfa        = _blank_if_absent(cfg.get("gfa_sf"))
     prop_name  = cfg["property_name"]
     address    = cfg.get("address", "")
     prop_cell  = (f"{prop_name}\n{address}"
@@ -124,11 +142,14 @@ def subject_to_row(cfg: dict) -> dict:
         "map_marker":    "★",
         "sale_date":     cfg.get("sale_date", ""),
         "land_zoning":   cfg.get("land_zoning", ""),
-        "remaining_yrs": cfg.get("remaining_leasehold_yrs", 0),
-        "gfa_sf":        gfa,
+        "remaining_yrs": _parse_remaining_yrs(cfg.get("remaining_leasehold_yrs")),
+        "gfa_sf":        int(gfa) if gfa else None,
         "price_sgd_m":   _m_to_display(price_m, price_unit),
-        "price_psf_gfa": round(float(price_m) * 1e6 / gfa) if price_m else None,
-        "ftm_cap_rate":  cfg.get("ftm_noi_cap_rate"),
+        # gfa used to default to 1 so this division could not raise — which
+        # printed the subject's GFA as a literal "1" and a psf of price×1e6.
+        # With no GFA there is no psf to report.
+        "price_psf_gfa": round(float(price_m) * 1e6 / gfa) if (price_m and gfa) else None,
+        "ftm_cap_rate":  _cap_rate(cfg.get("ftm_noi_cap_rate")),
         "adj_cap_rate":  None,    # subject IS the reference
         "location":      cfg.get("location", ""),
         "quality":       cfg.get("quality", ""),
@@ -138,7 +159,20 @@ def subject_to_row(cfg: dict) -> dict:
 
 
 def _calc_price_psf(c: dict):
-    """Compute price psf GFA. price_sgd_m is always M-normalized, so always × 1e6."""
+    """Price psf GFA. price_sgd_m is always M-normalized, so always × 1e6.
+
+    RULE (precedence): use the source's directly-reported unit price when the
+    input provides one (e.g. Colliers' 'Unit Price (SGD/psf)' = 3,757 for
+    Northpoint City South Wing). ONLY when the input has no reported unit price
+    do we derive it by calculation, price ÷ GFA (stake-adjusted to a 100% basis)."""
+    # 1) Directly reported by the source input — take it as-is.
+    try:
+        reported = float(str(c.get("price_psf_gfa")).replace(",", "").strip())
+    except (TypeError, ValueError):
+        reported = 0.0
+    if reported > 0:
+        return round(reported)
+    # 2) No reported unit price → derive from price ÷ GFA.
     price_m = float(c.get("price_sgd_m") or 0) or None
     gfa_sf  = int(c.get("gfa_sf") or 0) or None
     stake   = float(c.get("stake_pct") or 1.0) or 1.0
@@ -170,6 +204,12 @@ def comp_to_row(c: dict, price_unit: str = "M") -> dict:
         _src_map[_src] = "Excel " + _src[6:]
     if _src.startswith("image_"):
         _src_map[_src] = "Image " + _src[6:]
+    # parse_remaining_yrs, not a bare float(): the scan modules normally hand us
+    # a number, but a value typed into the preview ("99 years from 2004",
+    # "Freehold") arrives raw, and a lease we can DERIVE must be derived rather
+    # than blanked. Returns None only when there is genuinely nothing to compute.
+    _yrs = _parse_remaining_yrs(c.get("remaining_yrs"))
+    _gfa = _blank_if_absent(c.get("gfa_sf"))
     return {
         "type":          "Comparable",
         "source":        _src_map.get(c.get("_source", ""), ""),
@@ -177,16 +217,20 @@ def comp_to_row(c: dict, price_unit: str = "M") -> dict:
         "map_marker":    str(c.get("map_marker", "")),
         "sale_date":     str(c.get("sale_date", "")),
         "land_zoning":   str(c.get("land_zoning", "")),
-        "remaining_yrs": ("FH" if (float(c.get("remaining_yrs") or 0)) >= 999
-                          else round(float(c.get("remaining_yrs") or 0), 1)),
-        "gfa_sf":        int(c.get("gfa_sf") or 0),
+        "remaining_yrs": (None if _yrs is None else
+                          "FH" if _yrs >= 999 else round(_yrs, 1)),
+        "gfa_sf":        int(_gfa) if _gfa else None,
         # If the source reported a price range (e.g. "600-630"), show the original
         # string as the display value; use the numeric midpoint for psf computation.
         "price_sgd_m":   (c.get("price_sgd_m_display")
                           or _m_to_display(c.get("price_sgd_m"), price_unit)),
         "price_psf_gfa": _calc_price_psf(c),
-        "ftm_cap_rate":  float(c.get("ftm_cap_rate") or 0),
-        "adj_cap_rate":  float(c.get("adj_cap_rate") or 0),  # overwritten by formula below
+        "ftm_cap_rate":  _blank_if_absent(c.get("ftm_cap_rate")),
+        # Written statically here; _write_formulas replaces it with the live Bala
+        # formula UNLESS the source reported an Adj. Cap Rate of its own, which
+        # this flag marks — a direct input is never overwritten by a calculation.
+        "adj_cap_rate":  _blank_if_absent(c.get("adj_cap_rate")),
+        "_adj_reported": _cap_rate(c.get("adj_npi_yield")) is not None,
         "location":      str(c.get("location", "")),
         "quality":       str(c.get("quality", "")),
         "asset_type":    str(c.get("asset_type", "")),
@@ -284,7 +328,8 @@ def _data_row(ws, row: int, row_dict: dict, alt: bool = False, bold: bool = Fals
     ws.row_dimensions[row].height = 48
 
 
-def _write_formulas(ws, row: int, is_subject: bool = False, schema=None):
+def _write_formulas(ws, row: int, is_subject: bool = False, schema=None,
+                    row_dict: dict = None):
     """
     Write live Excel formula for Adj CR (col J).
 
@@ -303,11 +348,20 @@ def _write_formulas(ws, row: int, is_subject: bool = False, schema=None):
     if is_subject:
         return   # subject Adj CR stays as "—"
 
+    # The source printed its own Adj. Cap Rate — _data_row already wrote that
+    # direct input, so leave the cell alone instead of overwriting it with the
+    # derived Bala figure.
+    if (row_dict or {}).get("_adj_reported"):
+        return
+
     # Adj Cap Rate via official Singapore Bala Table (VLOOKUP in 'Bala Tbl' sheet)
     bala_comp = _bala_expr(f"{E}{row}")
     bala_subj = _bala_expr("Params!$B$2")
     adj       = ws.cell(row=row, column=adj_col)
-    adj.value        = f"={I}{row}*{bala_comp}/{bala_subj}"
+    # bala_expr already treats a "—" leasehold as freehold, but an unreported FTM
+    # cap rate (I) is now "—" rather than 0, and "—"×factor is #VALUE!. No cap
+    # rate means no adjusted cap rate — show the same "—" the other cells use.
+    adj.value        = f'=IFERROR({I}{row}*{bala_comp}/{bala_subj},"—")'
     adj.number_format = "0.00%"
     adj.alignment    = _align("center", "center", wrap=False)
     adj.font         = _font(_DARK, bold=False, sz=9)
@@ -481,7 +535,7 @@ def build_workbook(subject_row: dict, comp_rows: list,
     for i, crow in enumerate(comp_rows):
         r = 10 + i
         _data_row(ws, r, crow, alt=(i % 2 == 1), schema=schema)
-        _write_formulas(ws, r, is_subject=False, schema=schema)
+        _write_formulas(ws, r, is_subject=False, schema=schema, row_dict=crow)
 
     # ── Average row ───────────────────────────────────────────────────────────
     if comp_rows:

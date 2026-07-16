@@ -18,7 +18,7 @@ Stage 1 — extract_report_insights()
 
 Stage 2 — generate_rationale()
     Uses the cached insights from Stage 1 plus the deal config (subject
-    property details) to write a 3–5 section investment committee memo.
+    property details) to write a 4-section investment committee memo.
 
     This stage runs TWO separate LLM calls:
 
@@ -589,39 +589,40 @@ def _rag_find_source(
 ) -> dict | None:
     """Find the best-matching page chunk for a claim using a two-stage strategy.
 
-    Stage 1 — Exact number matching (for claims with figures):
+    Stage 1 — Anchor-number matching (for claims with figures):
         Extract data values from the claim (decimals, percentages, large quantities;
-        bare 4-digit years like 2025 are excluded to avoid matching every page).
-        Only pages that contain at least one of those exact figures are considered.
-        If no page contains the figure, the claim is unverifiable → return None.
+        bare 4-digit years like 2025 are excluded to avoid matching every page), then
+        pick the single most distinctive one (_pick_anchor_number — a decimal like
+        '1,377.8' beats a common round figure like '50%'). Only pages that support
+        that ONE anchor number (exact match, or a scale-bridged match via
+        _number_in_text — e.g. 'billion' in the claim vs 'million' in the page) are
+        considered. If no page supports it, the claim is unverifiable → return None.
         Cosine similarity then picks the best-ranked page among those candidates.
+
+        Gating on one distinctive figure instead of "any number the claim mentions"
+        is deliberate: a common figure like '3%' used to let almost any page qualify,
+        which was the single biggest source of wrong-page matches.
 
     Stage 2 — Pure cosine similarity (for claims with no numbers):
         If the claim contains no data figures (e.g. "demand driven by tech sector"),
         rank all pages by semantic similarity and return the best match above
         min_score.
 
-    The returned chunk text is a full page (prose + tables, chart labels stripped)
-    that is guaranteed to contain the claimed number.  No secondary sentence
-    extraction is needed — the reviewer can see the number in context.
+    The returned "text" is a short sentence-level snippet (see
+    _extract_best_snippet), not the full page — the page is only the unit of
+    retrieval, never the unit of display.
     """
     if not rag_index:
         return None
 
     # Data values only — exclude bare 4-digit years to avoid false positives
     claim_numbers = re.findall(r'\d+\.\d+%?|\d+%|[1-9][\d,]{4,}', claim_text)
+    anchor = _pick_anchor_number(claim_numbers)
 
-    if claim_numbers:
-        # Only consider pages that contain at least one claimed figure
-        candidates = [
-            chunk for chunk in rag_index
-            if any(
-                n.replace(",", "") in chunk["text"].replace(",", "")
-                for n in claim_numbers
-            )
-        ]
+    if anchor:
+        candidates = [chunk for chunk in rag_index if _number_in_text(anchor, chunk["text"])]
         if not candidates:
-            # Figure not found in any page — claim cannot be sourced
+            # Anchor figure not found in any page — claim cannot be sourced
             return None
     else:
         candidates = rag_index
@@ -641,33 +642,208 @@ def _rag_find_source(
         for n in claim_numbers
     )
 
-    display = _extract_relevant_paragraphs(best["text"], claim_numbers)
+    snippet, context, low_confidence = _extract_best_snippet(
+        best["text"], claim_numbers, claim_text)
 
     return {
-        "source_file":   best["source_file"],
-        "page":          best["page"],
-        "text":          display,
-        "citation_type": "Verbatim" if verbatim else "Paraphrased",
-        "score":         score,
+        "source_file":    best["source_file"],
+        "page":           best["page"],
+        "text":           snippet,
+        "context":        context,
+        "citation_type":  "Verbatim" if verbatim else "Paraphrased",
+        "score":          score,
+        "low_confidence": low_confidence,
     }
 
 
-def _extract_relevant_paragraphs(page_text: str, claim_numbers: list[str]) -> str:
-    """Return only the paragraph(s) from page_text that contain a claimed number.
+_SCALE_WORDS = {
+    "trillion": 1e12, "tn": 1e12,
+    "billion": 1e9, "bn": 1e9,
+    "million": 1e6, "mn": 1e6,
+    "thousand": 1e3, "k": 1e3,
+}
 
-    Splits on double-newlines (paragraph boundaries produced by _filter_prose_and_tables),
-    keeps every paragraph that contains at least one figure from claim_numbers, and
-    joins them with a blank line.  Falls back to the full page text when no paragraph
-    matches (e.g. qualitative claims with no numbers).
+
+def _numeric_value(token: str) -> "float | None":
+    """Parse a matched number token ('3.2%', '1,377.8') to a float."""
+    try:
+        return float(token.replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick_anchor_number(claim_numbers: list[str]) -> "str | None":
+    """Pick the single most distinctive figure from a claim's numbers.
+
+    A decimal-bearing figure ('1,377.8') is far less likely to collide with an
+    unrelated page than a common round one ('50%', '3%') — prefer decimals,
+    then the longest digit run. This one number is what gates candidate-page
+    selection in _rag_find_source: a page sharing only an incidental round
+    number with the claim is no longer enough to count as a match.
     """
     if not claim_numbers:
-        return page_text
+        return None
+    def _rank(n: str):
+        return ("." in n, sum(c.isdigit() for c in n))
+    return max(claim_numbers, key=_rank)
+
+
+def _scale_variants(value: float) -> list[float]:
+    """Candidate re-scalings of a number, to bridge unit mismatches between a
+    claim and the source page — e.g. the rationale says 'S$1.38 billion' while
+    the source table (reported in millions) prints '1,377.8'. 1.38 * 1000 =
+    1380, within rounding tolerance of 1377.8, so the two must be recognised
+    as the same figure even though no substring of one appears in the other."""
+    if value == 0:
+        return [0.0]
+    return [value, value * 1000, value / 1000, value * 1_000_000, value / 1_000_000]
+
+
+def _number_in_text(anchor: str, text: str, fuzzy_tol: float = 0.03) -> bool:
+    """True if the claim figure `anchor` is supported by `text`.
+
+    Two passes:
+      1. Exact substring (comma-insensitive) — the standard verbatim-number
+         check.
+      2. Scale-bridging fuzzy match — parses every number-looking token out of
+         `text` and accepts if any re-scaling of `anchor` (see
+         _scale_variants) lands within `fuzzy_tol` relative difference of one.
+         This is what lets 'billion' in a claim match 'million' in a source
+         table without a literal text match. Percentages are excluded from
+         the fuzzy path — a percent figure is never a scale mismatch, and
+         fuzzy-matching them would just reintroduce false positives from
+         common round numbers.
+    """
+    anchor_norm = anchor.replace(",", "")
+    if anchor_norm in text.replace(",", ""):
+        return True
+    if "%" in anchor:
+        return False
+    anchor_val = _numeric_value(anchor)
+    if not anchor_val:
+        return False
+    variants = _scale_variants(anchor_val)
+    for tok in re.findall(r'\d[\d,]*\.?\d*', text):
+        tok_val = _numeric_value(tok)
+        if not tok_val:
+            continue
+        if any(abs(v - tok_val) / tok_val <= fuzzy_tol for v in variants):
+            return True
+    return False
+
+
+_SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9])')
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "were", "by", "at", "as", "this", "that", "it",
+    "its", "from", "which", "will", "be", "has", "have", "had", "not",
+    "but", "also", "than", "into", "over", "amid", "amidst",
+}
+_SNIPPET_MAX_CHARS = 400
+
+
+def _split_sentences(paragraph: str) -> list[str]:
+    """Split a paragraph into sentences. Requires the character after a
+    sentence-ending mark to start a new sentence (capital/digit), which is
+    enough to avoid breaking on decimals ('3.2%') without a full abbreviation
+    list — good enough for the institutional-report prose these PDFs contain.
+    """
+    return [s.strip() for s in _SENT_SPLIT_RE.split(paragraph.strip()) if s.strip()]
+
+
+def _keyword_overlap(claim_text: str, sentence: str) -> float:
+    """Cheap lexical relevance score: fraction of the claim's significant
+    words (len >= 4, stopwords removed) that also appear in the sentence.
+    Purely lexical — no per-sentence embedding call, so this costs nothing
+    beyond the one page-level embedding already being paid for.
+    """
+    claim_words = {w.strip(".,;:()[]%$'\"").lower()
+                   for w in claim_text.split() if len(w) >= 4} - _STOPWORDS
+    if not claim_words:
+        return 0.0
+    sent_words = {w.strip(".,;:()[]%$'\"").lower() for w in sentence.split()}
+    return len(claim_words & sent_words) / len(claim_words)
+
+
+def _extract_best_snippet(
+    page_text: str, claim_numbers: list[str], claim_text: str,
+) -> "tuple[str, str, bool]":
+    """Return (short_snippet, context_paragraph, low_confidence) for a claim
+    matched to `page_text`.
+
+    Replaces the old paragraph-level extraction, which returned the ENTIRE
+    page whenever no paragraph matched a claimed number, and returned the
+    entire page UNCONDITIONALLY for any qualitative claim (no numbers) —
+    together the two biggest causes of long, irrelevant "supporting text" in
+    the audit sheet.
+
+    This version never returns the full page:
+      - Numeric claims: ranks sentences that support a claimed number (exact
+        or scale-bridged via _number_in_text) by keyword overlap with the
+        claim; the winner plus one neighbouring sentence becomes the snippet.
+      - Qualitative claims (no numbers): ranks ALL sentences by keyword
+        overlap only, so a one-line claim gets a one-line quote instead of
+        the whole page.
+      - If nothing scores above zero, the single best-scoring sentence is
+        still returned (never the page), and low_confidence=True is set so
+        the caller can force a "verify against PDF" status regardless of the
+        page-level cosine score — a short wrong-ish snippet flagged as
+        uncertain is far more reviewable than a long dump presented as
+        support.
+
+    `context_paragraph` is the full paragraph the winning sentence came from,
+    written to a separate Excel column so reviewers can expand context
+    without the main "Supporting Text" column becoming unscannable.
+    """
     paras = [p.strip() for p in page_text.split("\n\n") if p.strip()]
-    hits = [
-        p for p in paras
-        if any(n.replace(",", "") in p.replace(",", "") for n in claim_numbers)
+    if not paras:
+        return "", "", True
+
+    all_sents: list[tuple[int, int, str]] = [
+        (pi, si, sent)
+        for pi, para in enumerate(paras)
+        for si, sent in enumerate(_split_sentences(para))
     ]
-    return "\n\n".join(hits) if hits else page_text
+    if not all_sents:
+        # No sentence boundaries at all (e.g. a lone table-row paragraph with
+        # no punctuation) — fall back to paragraph granularity, still never
+        # the whole page.
+        if claim_numbers:
+            hits = [p for p in paras if any(_number_in_text(n, p) for n in claim_numbers)]
+            if hits:
+                return hits[0][:_SNIPPET_MAX_CHARS], hits[0], False
+        return paras[0][:_SNIPPET_MAX_CHARS], paras[0], True
+
+    def _score(sent: str) -> "tuple[float, float]":
+        num_score = (1.0 if claim_numbers and
+                     any(_number_in_text(n, sent) for n in claim_numbers) else 0.0)
+        return (num_score, _keyword_overlap(claim_text, sent))
+
+    scored = [(pi, si, sent, *_score(sent)) for pi, si, sent in all_sents]
+
+    if claim_numbers:
+        with_number = [s for s in scored if s[3] > 0]
+        pool, low_confidence = (with_number, False) if with_number else (scored, True)
+    else:
+        pool = scored
+        low_confidence = all(s[4] == 0 for s in scored)
+
+    pool.sort(key=lambda s: (s[3], s[4]), reverse=True)
+    best_pi, best_si, best_sent = pool[0][0], pool[0][1], pool[0][2]
+
+    para_sents = _split_sentences(paras[best_pi])
+    if best_si + 1 < len(para_sents):
+        neighbor = para_sents[best_si + 1]
+    elif best_si > 0:
+        neighbor = para_sents[best_si - 1]
+    else:
+        neighbor = None
+
+    snippet = f"{best_sent} {neighbor}" if neighbor else best_sent
+    if len(snippet) > _SNIPPET_MAX_CHARS:
+        snippet = snippet[:_SNIPPET_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+
+    return snippet, paras[best_pi], low_confidence
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -919,8 +1095,7 @@ Silence is professional. Flagging the gap is not. Omit and move on.
       rental growth, capital value, or risk in this specific deal
   Never write a paragraph that is all numbers with no reasoning, or all reasoning
   with no numbers. Every paragraph must contain both.
-• Always write exactly 4 sections. Add a 5th only when a genuinely distinct,
-  data-supported angle cannot be absorbed into the first four.
+• Always write exactly 4 sections. Never more, never fewer.
 • Complete every section in full. No trailing headings, JSON, or separators after the
   final section.
 
@@ -935,7 +1110,7 @@ Silence is professional. Flagging the gap is not. Omit and move on.
   Introduce each key data point once in its primary section; do not repeat mechanically.
 
 ━━ SECTION TITLES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Write the title directly after the section number (## 1. / ## 2. / ## 3. / ## 4. / ## 5.)
+Write the title directly after the section number (## 1. / ## 2. / ## 3. / ## 4.)
 — no brackets, no angle brackets, no quotes, no period.  Length: 6–9 words.
 
 A title must do two things at once:
@@ -969,6 +1144,67 @@ Vocabulary to draw from (use what fits the data):
 Derive every title from the specific data in this prompt — country, submarket,
 asset class, and the actual numbers from the research.  Original titles only."""
 
+
+# ── Section 3 ("Asset & deal particular") asset-class-specific angle ───────────
+# Section 3 used to be written with office-flavoured language ("tenancy/WALE")
+# regardless of asset class — a logistics deal has no WALE-shaped asset case,
+# it has clear height, loading bays, and last-mile positioning. Each angle below
+# tells the model what to lead with for that sector; _sector_key is the SAME
+# taxonomy tools/location_score.py uses to score comp Location competitiveness,
+# reused here rather than duplicated so "industrial" / "retail" / etc. mean the
+# same thing everywhere in the app.
+_ASSET_CLASS_SECTION3_ANGLES = {
+    "office": (
+        "Lead with tenancy quality: passing rent vs market rent, WALE, anchor "
+        "tenant covenant strength, occupancy rate, and reversionary potential. "
+        "If tenancy/WALE data is not in the research, develop the asset quality "
+        "(grade, certification, specification) and pricing angles instead — "
+        "never acknowledge the absence of tenancy data in the prose."
+    ),
+    "industrial": (
+        "Lead with logistics/industrial specification, NOT office-style tenancy "
+        "metrics: clear height, floor loading capacity, number and type of "
+        "loading bays/dock doors, column spacing, and last-mile or port/airport "
+        "connectivity. Cite occupier covenant, passing-vs-market rent, or WALE "
+        "only as secondary support where the research actually provides them — "
+        "specification and connectivity are the primary asset case here."
+    ),
+    "data_centre": (
+        "Lead with technical specification: power capacity and redundancy "
+        "(N, N+1, 2N), cooling design, and connectivity/fibre access, plus any "
+        "named hyperscale or colocation tenant. Cite occupancy or contracted "
+        "revenue/WALE only where the research supports it."
+    ),
+    "retail": (
+        "Lead with trade-catchment strength: footfall drivers, tenant mix and "
+        "anchor draw, occupancy cost ratio, and reversionary potential from "
+        "under-rented units. Cite building specification as secondary support."
+    ),
+    "hospitality": (
+        "Lead with operating performance: RevPAR, occupancy, ADR trend, "
+        "operator/brand covenant, and renovation or repositioning upside. Cite "
+        "building specification and location draw as secondary support."
+    ),
+    "mixed": (
+        "Lead with the performance of each use component separately (e.g. the "
+        "office and retail podium) before making a combined asset case; cite "
+        "tenancy/occupancy data per component where the research supports it."
+    ),
+}
+
+
+def _section3_asset_angle(asset_class: str) -> str:
+    """The asset-class-specific instruction for section 3 — see
+    _ASSET_CLASS_SECTION3_ANGLES. Falls back to the office angle (the
+    historical default) for an unrecognised or blank asset class."""
+    try:
+        from tools.location_score import _sector_key
+        sector = _sector_key(asset_class)
+    except Exception:
+        sector = "office"
+    return _ASSET_CLASS_SECTION3_ANGLES.get(sector, _ASSET_CLASS_SECTION3_ANGLES["office"])
+
+
 _RATIONALE_PROMPT = """\
 Write an investment committee rationale for the subject property below.
 Use only the Market Research Summary, the Comparable Evidence, and the Subject Property
@@ -986,7 +1222,7 @@ GFA           : GFA_SF GFA_UNIT
 Country       : COUNTRY_NAME
 EXTRA_FIELDS
 ═════════════════════════════════════════════════════════════════
-
+CONNECTIVITY_BLOCK
 ═══ MARKET RESEARCH SUMMARY ════════════════════════════════════
 COMBINED_INSIGHTS
 ════════════════════════════════════════════════════════════════
@@ -1006,20 +1242,28 @@ in the research — do not use a fixed list of categories. Name the categories y
 based on what the research actually contains.
 
 GUIDANCE (examples of typical categories — not an exhaustive list, not all required):
-  • Market cycle position — e.g. vacancy rates, net absorption, rental growth rate,
+  • Market fundamentals — e.g. vacancy rates, net absorption, rental growth rate,
     cap rate or yield levels, investment volume, capital value trends, market outlook
-  • Submarket or location dynamics — e.g. submarket vacancy vs city average,
-    infrastructure projects, location cluster or precinct performance, rental premiums
-    by district, migration of occupiers across submarkets
-  • Demand drivers — e.g. occupier sector trends (e-commerce, 3PL, tech, financial
-    services), structural demand shifts, ESG or green-building requirements, lease
-    demand and pre-commitment activity, floor-plate or specification preferences
+  • Location / market preference — e.g. named transit connectivity and precinct
+    positioning from the Location Context block ("connected to Raffles Place MRT",
+    "prime CBD"), submarket vacancy vs city average, infrastructure projects,
+    location cluster or precinct performance, rental premiums by district,
+    migration of occupiers across submarkets. Qualitative only — never estimate a
+    distance or walking time; if no source describes the location, omit the angle
+  • Demand drivers and other preference factors — e.g. occupier sector trends
+    (e-commerce, 3PL, tech, financial services), structural demand shifts, ESG or
+    green-building requirements, lease demand and pre-commitment activity,
+    floor-plate or specification preferences
   • Supply pipeline — e.g. completions schedule, under-construction volume, land
     scarcity or development moratorium, GLS or planning approval pipeline,
     construction cost pressures
-  • Deal-specific details — e.g. tenancy profile, WALE, lease expiry schedule,
-    anchor tenant, occupancy rate, passing rent vs market rent, pricing, GFA,
-    remaining leasehold, reversionary potential
+  • Asset & deal particulars — asset-class-specific: for office, tenancy profile /
+    WALE / lease expiry / anchor tenant / passing rent vs market rent; for
+    industrial/logistics, clear height / loading bays / column spacing / last-mile
+    or port-airport connectivity; for a data centre, power capacity/redundancy /
+    cooling / connectivity; for retail, footfall drivers / tenant mix / occupancy
+    cost ratio; for hospitality, RevPAR / occupancy / ADR / operator covenant —
+    plus pricing, GFA, remaining leasehold, and reversionary potential for any class
   • Comparable pricing evidence — price psf and cap rates of comparable asset sales,
     asking or effective rents of leasing comparables, land price psf ppr of comparable
     land sales, and how the subject's pricing sits versus those comparable averages
@@ -1040,8 +1284,8 @@ For each category you identify:
 
 STEP 2 — PLAN SECTIONS
 Using only the data retrieved in STEP 1:
-  a) You will always write exactly 4 sections. Add a 5th only when a genuinely distinct,
-     data-supported angle cannot be absorbed into the first four.
+  a) You will write exactly 4 sections — never more, never fewer. Every category from
+     STEP 1 must be absorbed into one of the four; there is no overflow section.
   b) Assign each category to the section where it will serve as primary evidence.
      Categories with "— none found —" must not drive any section — omit that angle entirely.
   c) State in one sentence the investment thesis each section will argue.
@@ -1051,6 +1295,8 @@ For each section, replace the [write a title here...] instruction on the ## line
 actual title — 6–9 words, no property name, no location name, no colon separating a category
 from a location. Just the title itself, nothing else on that line.
 Do NOT mention any report name, file name, or source document anywhere in the sections.
+Do NOT open a section with a category label or theme name of any kind. Section text
+begins directly with the substance — a reader must never see the internal taxonomy.
 Do NOT use phrases like "according to", "the report indicates", or any attribution.
 Write every fact as a direct, unattributed statement. All source tracking goes in the audit JSON only.
 
@@ -1063,33 +1309,42 @@ Pack in specific figures and data points — concise and evidence-dense beats lo
 
 PRESCRIBED SECTIONS (always write all four):
 
-## 1. [write a 6–9 word investment thesis title here — derived from your STEP 1 market-cycle data]
-Draw from your market-cycle and supply-pipeline categories (whatever you named them in STEP 1).
+## 1. [write a 6–9 word investment thesis title here — derived from your STEP 1 market-fundamentals data]
+(Guidance — never reproduce this line or its label in the prose.)
+Draw from your market-fundamentals and supply-pipeline categories (whatever you
+named them in STEP 1).
 Paragraph 1 — supply/demand balance: vacancy trajectory, net absorption, new completions,
   landlord pricing power. Anchor every sentence to a specific figure.
 Paragraph 2 — rental and capital value momentum: rental growth rate and direction, yield
   context, development pipeline constraints, market outlook and entry timing thesis.
 
-## 2. [write a 6–9 word investment thesis title here — derived from your STEP 1 location/demand data]
-Draw from your location/submarket and demand-driver categories.
-Paragraph 1 — submarket positioning: why this specific submarket commands premium occupier
-  demand; performance vs city-wide average; proximity to key infrastructure or logistics nodes.
-Paragraph 2 — demand drivers: structural occupier trends driving take-up; catchment depth;
-  land scarcity or regulatory factors that entrench the location's defensibility.
+## 2. [write a 6–9 word investment thesis title here — derived from your STEP 1 location/market-preference data]
+(Guidance — never reproduce this line or its label in the prose.)
+Draw from your location/market-preference and demand-driver categories, and from
+the Location Context block above when present.
+Connectivity is QUALITATIVE: name the stations and the precinct ("directly connected to
+Raffles Place MRT, in the prime Raffles Place CBD") — do NOT state a distance in km/m or a
+walking time unless a source explicitly gives that figure, and never estimate one yourself.
+If no source describes the location, omit the angle rather than assert it.
+Paragraph 1 — locational preference: why this specific location/submarket is preferred by
+  occupiers and investors — named transit connectivity, precinct positioning, or logistics
+  access WHERE A SOURCE STATES IT; performance vs city-wide average.
+Paragraph 2 — demand drivers and other preference factors: structural occupier trends driving
+  take-up; catchment depth; land scarcity or regulatory factors that entrench the location's
+  defensibility.
 
-## 3. [write a 6–9 word investment thesis title here — derived from your STEP 1 deal-specific data]
-Draw from your deal-specific category. Use whichever deal-specific angles are supported by
-the research: asset quality, green certification, GFA, passing rent vs market rent,
-reversionary potential, pricing vs comparable transactions, key risks and mitigants.
-If tenancy / WALE data is not in the research, develop the asset quality and pricing
-angles instead — never acknowledge the absence of tenancy data in the prose.
-Paragraph 1 — asset case: lead with the property's quality, specification, certification,
-  and market positioning; then connect to reversionary or income upside.
+## 3. [write a 6–9 word investment thesis title here — derived from your STEP 1 asset-and-deal-particular data]
+(Guidance — never reproduce this line or its label in the prose.)
+Draw from your asset-and-deal-particulars category.
+ASSET_SPECIFIC_ANGLE
+Paragraph 1 — asset case: lead with the asset-class-specific angle above, then connect to
+  reversionary or income upside.
 Paragraph 2 — deal case: pricing vs comparable transactions (cite the Comparable Evidence —
   the subject's price psf / cap rate versus the comparable average and range), capital
   appreciation thesis, key risks and specific mitigants, why compelling at this cycle point.
 
 ## 4. [write a 6–9 word investment thesis title here — derived from your STEP 1 capital-markets data]
+(Guidance — never reproduce this line or its label in the prose.)
 Draw from your capital values, transaction volumes, and yield data categories.
 Paragraph 1 — investment market: recent transaction volumes, investor appetite, yield
   compression or expansion trend, and the comparable deals in the Comparable Evidence that
@@ -1097,11 +1352,9 @@ Paragraph 1 — investment market: recent transaction volumes, investor appetite
 Paragraph 2 — capital value outlook: yield trajectory, cap rate context vs historical range,
   why the pricing is supportable and what drives capital appreciation from here.
 
-OPTIONAL FIFTH SECTION (add only if your STEP 1 categories contain a genuinely distinct angle
-that cannot be absorbed into sections 1–4 — e.g. a quantified ESG premium, a named supply
-moratorium, or a structural demand shift with its own data set):
-
-## 5. [write a 6–9 word investment thesis title here — only if a distinct data-supported angle exists]
+There is no fifth section. A distinct angle the research supports (e.g. a quantified ESG
+premium, a named supply moratorium, a structural demand shift) belongs inside whichever of
+the four sections it best evidences — fold it in, do not append a new section for it.
 
 STEP 4 — VERIFY BEFORE RETURNING
 Before returning your response, check every section against this list.
@@ -1113,9 +1366,13 @@ Fix any failure before returning — do not return output that fails a check.
   [ ] DATA ANCHOR  — Every opinion, forecast, or investment conclusion contains or directly
                      follows a specific figure, percentage, or named fact. No plain assertions.
   [ ] SOURCE CHECK — Every number (vacancy rate, cap rate, rental rate, yield, price, volume,
-                     GFA, growth %, index value) must appear explicitly in the Market Research
-                     Summary, the Comparable Evidence, or Deal Config. Delete any figure you
+                     GFA, growth %, index value, or distance) must appear explicitly in the
+                     Market Research Summary, the Comparable Evidence, the Location Context,
+                     or Deal Config. Delete any figure you
                      cannot locate there.
+  [ ] CONNECTIVITY — Every named station, precinct, or connectivity claim appears in the
+                     Location Context block or the research. No estimated distances or
+                     walking times anywhere. Delete any you cannot locate there.
   [ ] POLICY CHECK — Every policy name, regulation, government initiative, or named programme
                      must be explicitly named in the Market Research Summary. Delete any policy
                      reference you cannot locate there.
@@ -1124,7 +1381,8 @@ Fix any failure before returning — do not return output that fails a check.
                      a different supporting data point or omit that sentence.
   [ ] PARAGRAPHS   — Each section has exactly 2 paragraphs (3 only if data demands it).
                      Paragraphs are separated by a blank line. Each paragraph is 80–130 words.
-  [ ] SECTION COUNT — Exactly 4 sections are present (5 only if a distinct angle exists).
+  [ ] SECTION COUNT — Exactly 4 sections are present. If you wrote a 5th, fold its content
+                      into the section it best evidences and delete the extra heading.
   [ ] GAP-FLAGGING — Zero sentences signal a missing data point. Search for "not provided",
                      "not available", "without specific", "in the absence", "while specific",
                      "although X data", "cannot be determined". Delete any such sentence and
@@ -1228,7 +1486,36 @@ def _clean_rationale_body(text: str) -> str:
     # Drop trailing blank lines
     while clean and not clean[-1].strip():
         clean.pop()
-    return "\n".join(clean)
+    return _strip_theme_labels("\n".join(clean))
+
+
+# The four prescribed sections are built around internal themes. The prompt tells the
+# model never to print them, but a prompt is not a guarantee — models echo a scaffolding
+# label back as a section prefix ("MARKET FUNDAMENTALS. The Singapore office market …").
+# That is internal taxonomy leaking into a client-facing memo, so it is also removed
+# deterministically here.
+_THEME_LABEL_RE = re.compile(
+    r'^\s*(?:MARKET\s+FUNDAMENTALS|MARKET\s+PREFERENCE|LOCATION\s*/?\s*MARKET\s+PREFERENCE'
+    r'|ASSET\s*&\s*DEAL\s+PARTICULARS?|ASSET\s+AND\s+DEAL\s+PARTICULARS?'
+    r'|CAPITAL\s+MARKETS)\s*[.:—–-]\s*',
+    re.IGNORECASE)
+
+
+def _strip_theme_labels(text: str) -> str:
+    """Remove a leading theme label from any paragraph that opens with one.
+
+    Only strips the label and its trailing punctuation, never the sentence after it,
+    and only at the start of a paragraph — a label appearing mid-sentence is prose the
+    author meant to write ("capital markets remain liquid") and is left alone.
+    """
+    out = []
+    for para in text.split("\n"):
+        stripped = _THEME_LABEL_RE.sub("", para, count=1)
+        # Re-capitalise if the label was followed by a lowercase continuation.
+        if stripped is not para and stripped[:1].islower():
+            stripped = stripped[:1].upper() + stripped[1:]
+        out.append(stripped)
+    return "\n".join(out)
 
 
 # ── Audit-call prompts (separate second LLM call) ─────────────────────────────
@@ -1300,6 +1587,8 @@ citation_type guide:
   Verbatim    — the rationale quotes the source almost word-for-word
   Paraphrased — the rationale restates a figure or finding in different words
   Deal Config — the claim originates from the deal configuration / subject property data
+  Web Search  — a connectivity/precinct claim sourced from the Location Context web
+                search; cited to the URL that supports it, not to a report page
 """
 
 
@@ -1421,10 +1710,25 @@ def _get_cross_check(entry: dict, extracted_reports: list[dict]) -> str:
     rag_score = entry.get("rag_score")
     ctype     = entry.get("citation_type", "")
 
+    # Web-searched location context: no PDF page and no cached extract to check
+    # against, so neither the RAG score nor the 4-word window below applies.
+    # Checked FIRST — otherwise rag_score=None sends it to _cross_check_claim,
+    # which would look for the URL among the report filenames, fail, and report
+    # the misleading "⚠ Source file not in selected reports".
+    if ctype == "Web Search":
+        return "🌐  Web source — open the URL and verify"
+
     if rag_score is not None:
         if ctype in ("Deal Config", "General Knowledge"):
             return ctype
         page = (entry.get("page_ref") or "?")
+        # A snippet the sentence-ranker had to guess at (no number/keyword hit
+        # scored above zero — see _extract_best_snippet) is forced into the
+        # low-confidence band regardless of the page-level cosine score: the
+        # PAGE can be a strong semantic match while the specific SENTENCE
+        # pulled from it is not.
+        if entry.get("low_confidence"):
+            return f"⚠  Low confidence snippet ({page}) — verify against PDF"
         if rag_score >= 0.5:
             return f"✓  RAG match {rag_score:.0%} ({page})"
         elif rag_score >= 0.3:
@@ -1448,9 +1752,16 @@ def _write_source_audit_excel(
     - Which section and section title it came from
     - The exact claim text
     - The source PDF filename and page reference
-    - The LLM's verbatim supporting quote from the research
+    - A short, sentence-level supporting quote (RAG path: extracted by code
+      from the actual PDF page via _extract_best_snippet — not an LLM quote,
+      despite occasional legacy wording; LLM-fallback path: a quote the audit
+      LLM itself supplies) plus a separate Context column with the full
+      surrounding passage
     - Citation type (Verbatim / Paraphrased / Deal Config)
-    - Backend cross-check status (auto-verified against the cached extract)
+    - Backend cross-check status — for RAG-matched rows this confirms a match
+      against the actual PDF page; for the LLM-fallback path (no OpenAI key)
+      it only confirms consistency with the Stage-1 SUMMARY of the PDF, not
+      the PDF itself (see _cross_check_claim)
     - Blank columns for the human reviewer to mark CONFIRMED / INCORRECT / CANNOT VERIFY
 
     Row colour coding:
@@ -1461,8 +1772,8 @@ def _write_source_audit_excel(
     Columns
     -------
     #  |  Section  |  Section Title  |  Claim / Data Point  |  Source Report  |
-    Supporting Text (LLM quote)  |  Citation Type  |  Backend Cross-Check  |
-    Human Validation  |  Reviewer Notes
+    Page Ref  |  Supporting Text (short quote)  |  Context (full passage)  |
+    Citation Type  |  Backend Cross-Check  |  Human Validation  |  Reviewer Notes
     """
     import openpyxl
     from openpyxl.styles import (PatternFill, Font, Alignment, Border, Side)
@@ -1497,7 +1808,7 @@ def _write_source_audit_excel(
 
     # ── Title row ─────────────────────────────────────────────────────────────
     prop_name = subject_cfg.get("property_name", subject_cfg.get("deal_name", "Property"))
-    ws.merge_cells("A1:K1")
+    ws.merge_cells("A1:L1")
     title_cell = ws["A1"]
     title_cell.value = (f"Source Audit — {prop_name}  "
                         f"({subject_cfg.get('asset_class','').title()}, "
@@ -1509,11 +1820,16 @@ def _write_source_audit_excel(
     ws.row_dimensions[1].height = 22
 
     # Instruction row
-    ws.merge_cells("A2:K2")
+    ws.merge_cells("A2:L2")
     note_cell = ws["A2"]
     note_cell.value = (
-        "VALIDATION INSTRUCTIONS:  Review every row where Backend Cross-Check = "
-        "⚠  Not found in cached extract.  Open the original PDF and verify the claim.  "
+        "VALIDATION INSTRUCTIONS:  Review every row flagged ⚠ in Backend Cross-Check "
+        "(includes low-confidence snippets, not just claims missing from the source).  "
+        "Open the original PDF and verify the claim — 'Supporting Text' is a short quote; "
+        "'Context' holds the full surrounding passage for cases needing more context.  "
+        "Note: for RAG-matched rows, Backend Cross-Check confirms a match against the "
+        "actual PDF page; for the LLM-fallback path (no OpenAI key), it only confirms "
+        "consistency with the Stage-1 SUMMARY of the PDF, not the PDF itself.  "
         "Mark Human Validation as CONFIRMED / INCORRECT / CANNOT VERIFY, and add notes."
     )
     note_cell.font      = Font(name="Calibri", italic=True, color="FF555555", size=8)
@@ -1529,13 +1845,14 @@ def _write_source_audit_excel(
         "Claim / Data Point Used",
         "Source Report",
         "Page\nRef",
-        "LLM Supporting Text\n(verbatim quote provided by LLM)",
+        "Supporting Text\n(short quote — sentence-level match)",
+        "Context\n(full surrounding passage)",
         "Citation Type",
-        "Backend Cross-Check\n(auto-verified against cached extract)",
+        "Backend Cross-Check",
         "Human Validation\n(CONFIRMED / INCORRECT / CANNOT VERIFY)",
         "Reviewer Notes",
     ]
-    COL_WIDTHS = [4, 9, 38, 45, 32, 8, 45, 14, 34, 20, 28]
+    COL_WIDTHS = [4, 9, 38, 45, 32, 8, 34, 45, 14, 30, 20, 28]
 
     for col_idx, (hdr, width) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
         cell = ws.cell(row=3, column=col_idx, value=hdr)
@@ -1570,6 +1887,7 @@ def _write_source_audit_excel(
             entry.get("source_file", ""),
             entry.get("page_ref") or "—",
             entry.get("supporting_text") or "",
+            entry.get("context") or "",
             ctype,
             cross_chk,
             "",   # Human Validation — blank for reviewer
@@ -1582,24 +1900,26 @@ def _write_source_audit_excel(
             cell.border     = _thin_border()
             cell.alignment  = _align(wrap=True)
 
-            # Special formatting  (cols shifted +1 after adding Page Ref at col 6)
+            # Special formatting (cols shifted +1 after adding the Context column at col 8)
             if col_idx == 1:  # row number
                 cell.alignment = _align("center", "top", wrap=False)
                 cell.font      = _body_font(color="FF888888")
             elif col_idx == 6:  # page reference
                 cell.alignment = _align("center", "top", wrap=False)
                 cell.font      = _body_font(bold=True, color="FF1A3A5C")
-            elif col_idx == 8:  # citation type
+            elif col_idx == 8:  # context — de-emphasised vs. the primary snippet
+                cell.font = _body_font(color="FF666666")
+            elif col_idx == 9:  # citation type
                 color = AMBER if ctype in ("Inferred", "General Knowledge") else DARK
                 cell.font = _body_font(bold=(ctype == "Inferred"), color=color)
-            elif col_idx == 9:  # cross-check status
+            elif col_idx == 10:  # cross-check status
                 if "✓" in cross_chk:
                     cell.font = _body_font(color="FF1A7A2A")
                 elif "⚠" in cross_chk:
                     cell.font = _body_font(bold=True, color="FFC00000")
                 else:
                     cell.font = _body_font(color="FF555555")
-            elif col_idx == 10:  # human validation (blank but highlighted)
+            elif col_idx == 11:  # human validation (blank but highlighted)
                 cell.fill = _fill(GREEN)
                 cell.font = _body_font(color="FF1A7A2A")
             else:
@@ -1617,11 +1937,11 @@ def _write_source_audit_excel(
                      if e.get("citation_type") in ("Inferred", "General Knowledge"))
 
     sum_row = total + 4 + 2
-    ws.merge_cells(f"A{sum_row}:K{sum_row}")
+    ws.merge_cells(f"A{sum_row}:L{sum_row}")
     sum_cell = ws[f"A{sum_row}"]
     sum_cell.value = (
         f"SUMMARY:  {total} citations total  |  "
-        f"{n_verified} verified in cached extract  |  "
+        f"{n_verified} verified  |  "
         f"{n_warn} require manual PDF verification  |  "
         f"{n_inferred} inferred / general knowledge (review carefully)"
     )
@@ -1766,6 +2086,8 @@ def generate_rationale(
     refinement_notes: str = "",
     force_refresh: bool = False,
     comp_summary: str = "",
+    location_context: str = "",
+    location_sources: list | None = None,
 ) -> tuple[str, list]:
     """
     Two-call LLM pipeline that produces the investment rationale and its
@@ -1828,6 +2150,17 @@ def generate_rationale(
         .replace("GFA_UNIT",          subject_cfg.get("gfa_unit",      "sf").upper())
         .replace("COUNTRY_NAME",      subject_cfg.get("country_name",  "—"))
         .replace("EXTRA_FIELDS",      "\n".join(extra) if extra else "")
+        .replace("ASSET_SPECIFIC_ANGLE", _section3_asset_angle(subject_cfg.get("asset_class", "")))
+        # Text only — the source URLs are deliberately withheld from the prose
+        # call (same reason PDF filenames are anonymised: the model must not be
+        # able to cite a source inside the memo). URLs go to the audit instead.
+        .replace("CONNECTIVITY_BLOCK", (
+            "═══ LOCATION CONTEXT (what published sources say about this "
+            "property's connectivity and precinct — qualitative; do not convert "
+            "to distances) ═\n"
+            f"{location_context.strip()}\n"
+            "════════════════════════════════════════════════════════════════\n"
+        ) if location_context.strip() else "")
         .replace("COMBINED_INSIGHTS", combined_anon)
         .replace("COMPARABLE_EVIDENCE_BLOCK", (
             "═══ COMPARABLE EVIDENCE (verified comparable transactions / rents) ═\n"
@@ -1844,7 +2177,7 @@ def generate_rationale(
         ) if refinement_notes.strip() else "")
     )
 
-    print("  [generating] Investment rationale (3 sections) ...")
+    print("  [generating] Investment rationale (4 sections) ...")
     t0_rationale = time.perf_counter()
     try:
         raw_rationale = _llm_chat(
@@ -1928,8 +2261,32 @@ def generate_rationale(
                                 "source_file":    match["source_file"],
                                 "page_ref":       f"p.{match['page']}",
                                 "supporting_text": match["text"],
+                                "context":        match.get("context", ""),
                                 "citation_type":  match["citation_type"],
                                 "rag_score":      round(match["score"], 3),
+                                "low_confidence": match.get("low_confidence", False),
+                            })
+                        elif _match_location_context(claim_dict.get("claim", ""),
+                                                     location_context, location_sources):
+                            # No PDF page matched, but the web location search DID
+                            # supply this claim. Without this branch it would fall
+                            # through to the "Deal Config" default below and be
+                            # attributed to a file it never came from — the audit
+                            # must name the real source (the search URL), not the
+                            # nearest convenient label.
+                            _loc = _match_location_context(claim_dict.get("claim", ""),
+                                                           location_context, location_sources)
+                            audit_entries.append({
+                                "section_num":    claim_dict.get("section_num"),
+                                "section_title":  claim_dict.get("section_title", ""),
+                                "claim":          claim_dict.get("claim", ""),
+                                "source_file":    _loc["source_file"],
+                                "page_ref":       None,
+                                "supporting_text": _loc["supporting_text"],
+                                "context":        location_context.strip(),
+                                "citation_type":  _loc["citation_type"],
+                                "rag_score":      None,   # not a PDF match — see cross-check
+                                "low_confidence": False,
                             })
                         else:
                             # Low similarity → claim likely originates from deal config
@@ -1940,8 +2297,10 @@ def generate_rationale(
                                 "source_file":    "Deal Config",
                                 "page_ref":       None,
                                 "supporting_text": None,
+                                "context":        "",
                                 "citation_type":  "Deal Config",
                                 "rag_score":      round(match["score"], 3) if match else 0.0,
+                                "low_confidence": False,
                             })
                 except Exception as e:
                     print(f"  [warning] RAG claim matching failed: {e}")
@@ -2059,6 +2418,192 @@ def _summarize_comp_excels(out_dir: Path) -> str:
     return "\n\n".join(blocks)
 
 
+_LOCATION_SEARCH_SYSTEM = (
+    "You are a commercial real estate research analyst. Search the web for how a "
+    "specific property is CONNECTED and POSITIONED, and report only what published "
+    "sources actually say.\n"
+    "Report, in 3-5 short sentences:\n"
+    "  - Named public-transit stations serving the building (name the station and "
+    "line; say 'directly connected' / 'a short walk' only if a source says so).\n"
+    "  - The precinct/district it sits in and how that precinct is characterised "
+    "(e.g. 'in the Raffles Place CBD', 'prime CBD', 'city fringe').\n"
+    "  - Named expressway/highway access, if a source states it.\n"
+    "RULES:\n"
+    "  - QUALITATIVE ONLY. Do NOT state a distance in km/m or a walking time unless "
+    "a source explicitly states that figure — naming the station and its precinct "
+    "is enough. Never estimate or compute a distance yourself.\n"
+    "  - Only state what you actually found published. If you cannot find "
+    "information about this property's connectivity, reply with exactly: "
+    "NO LOCATION INFORMATION FOUND\n"
+    "  - Do not describe the investment case, price, tenants, or market outlook — "
+    "connectivity and precinct positioning only."
+)
+
+
+# "([officespaces.com.sg](https://…))" — the search model's inline attribution,
+# emitted immediately AFTER the sentence each source supports.
+_INLINE_CITE_RE = re.compile(r"\(\[[^\]]+\]\(([^)]*)\)\)")
+
+
+def _parse_search_citations(raw: str) -> list:
+    """[{"text","url"}] — each span of prose paired with the URL that supports it.
+
+    The search model inline-cites per claim: "…connected to Raffles Place MRT
+    ([officespaces.com.sg](url)) The building is in the Raffles Place district
+    ([capitaspringoffice.com](url))". That ordering IS the attribution, so it is
+    parsed BEFORE _clean_search_text strips it — otherwise every claim would be
+    credited to whichever URL happened to come first, which is the same defect as
+    citing a PDF page that doesn't contain the claim.
+    """
+    spans, last = [], 0
+    for m in _INLINE_CITE_RE.finditer(raw):
+        text = _clean_search_text(raw[last:m.start()])
+        url  = m.group(1)
+        if text and url:
+            spans.append({"text": text, "url": url})
+        last = m.end()
+    return spans
+
+
+def _clean_search_text(text: str) -> str:
+    """Strip the search model's markdown scaffolding to plain prose.
+
+    gpt-4o-mini-search-preview returns inline attributions and links, e.g.
+        "## [CapitaSpring](https://…)\n\n…connected to Raffles Place MRT
+         ([officespaces.com.sg](https://…)) The building is…"
+    That must not reach the prose prompt: the memo bans source attribution
+    outright, and leaving URLs in front of the model invites it to cite one in
+    client-facing text (the same reason PDF filenames are anonymised). It would
+    also pollute the audit's sentence matching. URLs are preserved separately as
+    structured `sources` for the audit — only the prose is passed on.
+    """
+    t = re.sub(r"\(\[[^\]]+\]\([^)]*\)\)", "", text)   # "([domain](url))" attributions
+    t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)      # "[label](url)" → "label"
+    t = re.sub(r"^\s*#+\s*", "", t, flags=re.M)         # markdown headings
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _search_location_context(subject_cfg: dict, openai_key: str,
+                             search_model: str = "gpt-4o-mini-search-preview"
+                             ) -> "tuple[str, list]":
+    """Web-search the subject's location/connectivity context. One search per run.
+
+    The app deliberately does NOT geocode or measure proximity itself (that path
+    was removed): a computed distance is a claim the Source Audit cannot trace to
+    any document. Instead this asks the search model what PUBLISHED SOURCES say
+    about the building's connectivity, and keeps their URLs so every resulting
+    claim is attributable — "connected to Raffles Place MRT, in the prime Raffles
+    Place CBD" cited to a real page, rather than a distance we invented.
+
+    Qualitative by construction (see _LOCATION_SEARCH_SYSTEM): the model is told
+    not to state a distance or walking time unless a source states it, because an
+    unsourced "0.4 km from the MRT" is exactly the fabrication risk that made
+    self-geocoding unattractive.
+
+    Returns (context_text, sources) where sources = [{"title","url"}]. Returns
+    ("", []) when there is no key, the search fails, or nothing is found — the
+    caller then omits the block entirely rather than substituting anything.
+    """
+    if not openai_key:
+        return "", []
+    name    = str(subject_cfg.get("property_name") or subject_cfg.get("deal_name") or "").strip()
+    address = str(subject_cfg.get("address") or "").strip()
+    country = str(subject_cfg.get("country_name") or "").strip()
+    if not (name or address):
+        return "", []
+
+    query = " ".join(x for x in (name, address, country) if x)
+    try:
+        import openai as _openai
+        client = _openai.OpenAI(api_key=openai_key)
+        resp = client.chat.completions.create(
+            model=search_model,
+            messages=[
+                {"role": "system", "content": _LOCATION_SEARCH_SYSTEM},
+                {"role": "user", "content":
+                    f"Search for the public-transit connectivity, precinct/district "
+                    f"positioning, and expressway access of this property: {query}"},
+            ],
+        )
+    except Exception as e:
+        print(f"  [location search] skipped — search failed: {e}")
+        return "", []
+
+    msg  = resp.choices[0].message
+    raw  = msg.content or ""
+    text = _clean_search_text(raw)
+    if not text or "NO LOCATION INFORMATION FOUND" in text.upper():
+        print("  [location search] no published location info found — block omitted")
+        return "", []
+
+    # Per-claim attribution, parsed from the inline citations before they are
+    # stripped, so the audit cites the page that actually supports each claim.
+    spans = _parse_search_citations(raw)
+
+    # Fallback when the model didn't inline-cite: the response's annotation URLs.
+    # google.com/maps links are dropped — the search model attaches one as a
+    # convenience link to the property, not as a source for any claim, and citing
+    # it would send a reviewer to a map instead of to evidence.
+    if not spans:
+        seen = set()
+        for ann in getattr(msg, "annotations", None) or []:
+            if getattr(ann, "type", "") == "url_citation":
+                uc = getattr(ann, "url_citation", None)
+                url = getattr(uc, "url", "") if uc else ""
+                if url and "google.com/maps" not in url and url not in seen:
+                    seen.add(url)
+                    spans.append({"text": text, "url": url})
+    print(f"  [location search] {len(text)} chars, {len(spans)} attributed source(s)")
+    return text, spans
+
+
+def _match_location_context(claim_text: str, location_context: str,
+                            location_sources: list,
+                            min_overlap: float = 0.34) -> "dict | None":
+    """Audit support for a claim that came from the web location search.
+
+    The RAG audit matches claims against PDF pages; a location claim has no page,
+    so without this it would fall through to the "Deal Config" default and be
+    attributed to a file it never came from. This checks the claim against the
+    location-context sentences instead and, on a hit, attributes it to the real
+    search URL.
+
+    Returns None when the claim isn't supported here (so the caller continues to
+    its normal fallback), never a guess.
+    """
+    if not location_context or not claim_text:
+        return None
+
+    # Score against the ATTRIBUTED spans (each carries the URL that supports it),
+    # so the cited URL is the one backing this specific claim — not whichever
+    # source happened to be listed first.
+    best_span, best_score = None, 0.0
+    for span in (location_sources or []):
+        for sent in _split_sentences(span.get("text", "")):
+            s = _keyword_overlap(claim_text, sent)
+            if s > best_score:
+                best_span, best_score = {"sent": sent, "url": span.get("url", "")}, s
+
+    if best_span and best_score >= min_overlap:
+        return {"supporting_text": best_span["sent"],
+                "source_file": best_span["url"] or "Web search",
+                "citation_type": "Web Search"}
+
+    # No per-claim attribution available — still only claim a web source when the
+    # context genuinely supports the claim; otherwise fall through to the caller's
+    # normal path rather than inventing a citation.
+    sentences = _split_sentences(location_context)
+    if not sentences:
+        return None
+    best = max(sentences, key=lambda s: _keyword_overlap(claim_text, s))
+    if _keyword_overlap(claim_text, best) < min_overlap:
+        return None
+    return {"supporting_text": best, "source_file": "Web search",
+            "citation_type": "Web Search"}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRY POINT  (called from CLI or via run.py)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2127,6 +2672,18 @@ def run(
         print(f"  Comps       : injected into rationale evidence "
               f"({len(comp_summary)} chars)")
 
+    # Location context — ONE web search per run for what published sources say
+    # about the subject's connectivity/precinct. Qualitative only; the app never
+    # measures proximity itself. ("", []) whenever unavailable → block omitted.
+    _search_model = (cfg.get("openai", {}) or {}).get(
+        "search_model", "gpt-4o-mini-search-preview")
+    try:
+        location_context, location_sources = _search_location_context(
+            subj, openai_key, _search_model)
+    except Exception as e:
+        print(f"  [note] Location search skipped: {e}")
+        location_context, location_sources = "", []
+
     # Resolve report paths — auto-discover if caller did not specify any
     if not report_paths:
         report_paths = sorted(
@@ -2164,6 +2721,8 @@ def run(
         refinement_notes=refinement_notes,
         force_refresh=force_refresh,
         comp_summary=comp_summary,
+        location_context=location_context,
+        location_sources=location_sources,
     )
 
     # ── Save outputs ──────────────────────────────────────────────────────────

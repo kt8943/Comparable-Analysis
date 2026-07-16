@@ -357,6 +357,11 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "tenant":          tnt,
             "lease_type":      l_type,
             "_source":         "pdf",
+            # AI-judgment markers — the preview declares these so the analyst can
+            # review values the AI decided rather than transcribed from a cell.
+            "_llm_parsed":     item.get("_llm_parsed"),
+            "_verify_edits":   item.get("_verify_edits"),
+            "_verify_flag":    item.get("_verify_flag"),
         })
 
     print(f"  → {len(records)} valid records after filtering")

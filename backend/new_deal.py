@@ -35,25 +35,11 @@ for _stream in (sys.stdout, sys.stderr):
 # DEFAULTS  (read from any existing config so shared settings stay in sync)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SEARCH_DEFAULTS = {
-    "proximity_km":    1.0,
-    "submarket_km":    5.0,
-    "min_results":     3,
-    "max_results":     10,
-    "years_back":      2,
-    "years_back_max":  8,
-    "years_back_step": 2,
-    "max_level":       3,
-}
-
-# Typical proximity / submarket radii by asset class
-_RADIUS_BY_CLASS = {
-    "office":      {"proximity_km": 1.0, "submarket_km": 3.0},
-    "retail":      {"proximity_km": 1.0, "submarket_km": 3.0},
-    "logistics":   {"proximity_km": 5.0, "submarket_km": 10.0},
-    "industrial":  {"proximity_km": 5.0, "submarket_km": 10.0},
-    "mixed-use":   {"proximity_km": 1.0, "submarket_km": 5.0},
-}
+# Comp-search settings are NOT written into deal configs. They are house rules in
+# configs/shared_settings.json → search_rules, applied to every deal (existing and
+# new), with per-asset-class radii under search_rules.by_asset_class. A deal that
+# genuinely needs different numbers can add the key to its own search block.
+_ASSET_CLASSES = ("office", "retail", "logistics", "industrial", "mixed-use")
 
 
 def _load_shared_settings() -> dict:
@@ -182,6 +168,71 @@ def _mapbox_geocode(address: str, token: str) -> dict:
         return result
     except Exception as e:
         print(f"  [mapbox geocode] failed: {e}")
+        return {}
+
+
+def _google_geocode(address: str, api_key: str, country_code: str = "") -> dict:
+    """
+    Forward geocode an address using the Google Maps Geocoding API.
+    Returns a dict in the SAME shape as _mapbox_geocode() — neighborhood,
+    locality, district — so derive_market_fields() can use either provider
+    interchangeably.
+
+    Google's address_components use different type names than Mapbox's context
+    array; the mapping below picks the most granular level for each of our
+    three keys:
+      neighborhood  ← 'neighborhood'
+      district      ← 'sublocality' / 'sublocality_level_1' (finer than
+                      neighborhood in some cities), else
+                      'administrative_area_level_2'
+      locality      ← 'locality' — but SKIPPED when it's the country/city-state
+                      name itself (e.g. 'Singapore'), since that duplicates
+                      country_name and adds no submarket information.
+    """
+    if not api_key:
+        return {}
+    try:
+        params = {"address": address, "key": api_key}
+        if country_code:
+            params["components"] = f"country:{country_code.upper()}"
+        url = ("https://maps.googleapis.com/maps/api/geocode/json?"
+               + urllib.parse.urlencode(params))
+        req = urllib.request.Request(url, headers={"User-Agent": "pgim-comps/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        if data.get("status") != "OK" or not data.get("results"):
+            return {}
+
+        comps  = data["results"][0].get("address_components", [])
+        result = {}
+
+        def _text_for(*type_names):
+            for c in comps:
+                if any(t in c.get("types", []) for t in type_names):
+                    return c.get("long_name", "").strip()
+            return ""
+
+        neighborhood = _text_for("neighborhood")
+        district     = _text_for("sublocality", "sublocality_level_1",
+                                 "administrative_area_level_2")
+        locality     = _text_for("locality")
+        country      = _text_for("country")
+
+        if neighborhood:
+            result["neighborhood"] = neighborhood
+        if district and district != neighborhood:
+            result["district"] = district
+        # A locality equal to the country name (e.g. Singapore, a city-state) is
+        # not a submarket — it duplicates country_name and tells us nothing new.
+        if locality and locality != country:
+            result["locality"] = locality
+        if country:
+            result["country"] = country
+
+        return result
+    except Exception as e:
+        print(f"  [google geocode] failed: {e}")
         return {}
 
 
@@ -366,7 +417,7 @@ def main():
         "Asset class  (office / logistics / retail / industrial / mixed-use)",
         default="office", cast=str
     ).lower().strip()
-    asset_class = asset_class_raw if asset_class_raw in _RADIUS_BY_CLASS else "office"
+    asset_class = asset_class_raw if asset_class_raw in _ASSET_CLASSES else "office"
 
     gfa_raw  = _ask("GFA (enter number, unit will be set by country)", cast=float)
     quality  = _ask("Quality / grade", default="Grade A", cast=str)
@@ -442,8 +493,7 @@ def main():
                         default="", cast=str)
 
     # ── 7. Build config dict ──────────────────────────────────────────────────
-    radii = _RADIUS_BY_CLASS.get(asset_class, _RADIUS_BY_CLASS["office"])
-    search_cfg = {**_SEARCH_DEFAULTS, **radii}
+    search_cfg = {}
 
     gfa_int = int(gfa_raw)
 
@@ -656,22 +706,41 @@ def extract_from_document(text: str, llm_cfg: dict, openai_key: str = "") -> dic
     return json.loads(raw)
 
 
+def _load_geocoding_settings() -> dict:
+    """Read configs/shared_settings.json — the actual single source of truth
+    for geocoding_provider / google_maps_key (NOT the guessed-from-any-deal-
+    config _load_shared_settings() above, which only ever had mapbox_token)."""
+    p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def derive_market_fields(address: str, asset_class: str,
                           llm_cfg: dict, openai_key: str = "",
                           mapbox_token: str = "") -> dict:
     """
     Use the LLM to infer all market / location config fields from an address,
-    then override location and submarket_keywords with real geodata from the
-    Mapbox Geocoding API if a token is provided.
+    then override location and submarket_keywords with real geodata from a
+    geocoding API — Google Maps or Mapbox, whichever is configured.
 
     Given just the property address and asset class, the LLM returns:
       country_name, country_code, currency, currency_symbol, gfa_unit,
       land_zoning, location (submarket descriptor), asset_search_keyword,
       submarket_keywords (list), broader_market_query
 
-    If mapbox_token is supplied, the Mapbox Geocoding API is called to look up
-    the real neighbourhood / district names for the address. These replace the
-    LLM's guessed submarket_keywords, which are often inaccurate on small models.
+    The provider is picked from configs/shared_settings.json's
+    "geocoding_provider" — "google" (requires "google_maps_key") or "mapbox"
+    (default). This matches generate_comps_map_base.geocode_any()'s provider
+    selection, used for comp-pin geocoding, so New Deal and the comp scans
+    agree on which geocoder is authoritative. If the selected provider fails
+    or returns nothing, falls back to Mapbox (using the mapbox_token param,
+    which the caller reads from the same shared_settings.json).
+    Either way, the real place hierarchy REPLACES the LLM's guessed
+    submarket_keywords, which are often inaccurate (LLMs frequently invent
+    plausible-sounding but wrong neighbourhood names, especially on smaller
+    models).
 
     This is what drives the "Generate Config Preview" button in the dashboard —
     the user types an address and the LLM fills in all the remaining config
@@ -685,24 +754,37 @@ def derive_market_fields(address: str, asset_class: str,
     else:
         fields = _derive_fields_with_llm(address, asset_class, llm_cfg, openai_key)
 
-    # Override submarket with real geodata from Mapbox if token is available
-    if mapbox_token:
-        geo = _mapbox_geocode(address, mapbox_token)
-        if geo:
-            # Build submarket keywords from the place hierarchy Mapbox returned
-            # Priority: neighborhood > locality > district (most granular first)
-            geo_keywords = []
-            for key in ("neighborhood", "locality", "district"):
-                val = geo.get(key)
-                if val and val not in geo_keywords:
-                    geo_keywords.append(val)
+    settings           = _load_geocoding_settings()
+    geocoding_provider  = settings.get("geocoding_provider", "mapbox").lower()
+    google_maps_key     = settings.get("google_maps_key", "")
+    country_code        = fields.get("country_code", "")
 
-            if geo_keywords:
-                fields["submarket_keywords"] = geo_keywords
-                # Update location descriptor to the most granular name found
-                fields["location"] = geo_keywords[0]
-                print(f"  [mapbox geocode] location: {geo_keywords[0]}  |  "
-                      f"submarket keywords: {geo_keywords}")
+    geo = {}
+    geo_source = ""
+    if geocoding_provider == "google" and google_maps_key:
+        geo = _google_geocode(address, google_maps_key, country_code)
+        geo_source = "google"
+        if not geo:
+            print("  [geocode] Google Maps returned nothing — falling back to Mapbox")
+    if not geo:
+        geo = _mapbox_geocode(address, mapbox_token)
+        geo_source = "mapbox"
+
+    if geo:
+        # Build submarket keywords from the place hierarchy the geocoder returned.
+        # Priority: neighborhood > locality > district (most granular first)
+        geo_keywords = []
+        for key in ("neighborhood", "locality", "district"):
+            val = geo.get(key)
+            if val and val not in geo_keywords:
+                geo_keywords.append(val)
+
+        if geo_keywords:
+            fields["submarket_keywords"] = geo_keywords
+            # Update location descriptor to the most granular name found
+            fields["location"] = geo_keywords[0]
+            print(f"  [{geo_source} geocode] location: {geo_keywords[0]}  |  "
+                  f"submarket keywords: {geo_keywords}")
 
     return fields
 
@@ -730,11 +812,10 @@ def build_config(fields: dict, shared: dict = None) -> tuple:
         shared = _load_shared_settings()
 
     asset_class = (fields.get("asset_class") or "office").lower().strip()
-    if asset_class not in _RADIUS_BY_CLASS:
+    if asset_class not in _ASSET_CLASSES:
         asset_class = "office"
 
-    radii      = _RADIUS_BY_CLASS[asset_class]
-    search_cfg = {**_SEARCH_DEFAULTS, **radii}
+    search_cfg = {}
 
     deal_name   = (fields.get("deal_name") or fields.get("property_name") or "New Deal").strip()
     slug        = _slugify(deal_name)
@@ -781,11 +862,11 @@ def build_config(fields: dict, shared: dict = None) -> tuple:
         },
         "online_search": search_cfg,
         "rent_search": {
-            "min_results":  5,
-            "max_level":    3,
-            "proximity_km": 0.5,
-            "submarket_km": 2.0,
-            "market_km":    3.0,
+            "min_results":    5,
+            "max_level":      3,
+            "proximity_km":   3.0,
+            "city_km":        25.0,
+            "recency_months": 36,   # tighter than sales/land — rents date faster
         },
         "mapbox": {
             "token":    shared.get("mapbox_token", ""),

@@ -333,7 +333,9 @@ def subject_to_row(cfg: dict) -> dict:
         "map_marker":    "★",
         "launch_date":   cfg.get("sale_date", ""),
         "land_zoning":   cfg.get("land_zoning", ""),
-        "tenure_yrs":    cfg.get("remaining_leasehold_yrs", 0),
+        # An absent tenure is unknown, not a 0-year lease — blank it like every
+        # other unreported field here rather than printing a confident "0.0".
+        "tenure_yrs":    cfg.get("remaining_leasehold_yrs") or None,
         "site_area_sf":  cfg.get("site_area_sf"),   # may be absent → shows "—"
         "max_gfa_sf":    _max_gfa,
         "price_sgd_m":   _m_to_display(_price_m, price_unit),

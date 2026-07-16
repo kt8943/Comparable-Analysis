@@ -12,11 +12,11 @@ Output schema  (13 columns — company template)
   Site Area (SF) | Max GFA (SF) | Price (SGD M) | Price (SGD psf ppr)
   Adj. Price (SGD psf ppr) | Location | Quality | Comment
 
-Search strategy (proximity-first, sub-market fallback)
+Search strategy (proximity-first, widening location tiers)
 -------------------------------------------------------
-  Level 1 — Proximity  : within proximity_km of subject (default 1km)
-  Level 2 — Sub-market : same location tier, within submarket_km (default 5km)
-  Level 3 — Broader    : full market, no distance cap
+  Tier 1 — Proximity   : within proximity_km of subject (default 3km)
+  Tier 2 — City        : within city_km of subject (default 25km)
+  Tier 3 — Country     : country-wide, no distance cap
 
 Usage
 -----
@@ -28,7 +28,7 @@ Config keys used
 ----------------
     openai.api_key          : OpenAI API key (or set OPENAI_API_KEY env var)
     land_search             : optional dict to override search parameters
-      proximity_km, submarket_km, min_results, max_results, years_back, max_level
+      proximity_km, city_km, min_results, max_results, years_back, max_level
     output_file             : used to derive the output folder
 """
 
@@ -56,6 +56,7 @@ from pathlib import Path
 import openpyxl
 
 from generate_land_comps_map import geocode_with_fallbacks, render_map
+from tools.house_rules import search_rules as _house_rules, warn_window_vs_recency
 from generate_land_comps_table import (
     get_land_schema, bala_factor,
     subject_to_row, comp_to_row,
@@ -136,14 +137,14 @@ def build_land_queries(subject_cfg: dict, level: str, years_back: int = 3) -> li
             f'{country_name} "{primary}" {asset_kw} land tender award ({yrs}) {currency} psf ppr',
         ]
 
-    elif level == "submarket":
+    elif level == "city":
         kw_expr = " OR ".join(f'"{k}"' for k in kws[:3])
         return [
             f'{country_name} ({kw_expr}) land sale GLS award site area ({yrs}) {currency}',
             f'{country_name} ({kw_expr}) land tender {asset_kw} psf ppr ({yrs})',
         ]
 
-    else:  # market
+    else:  # country
         qs = [
             f'{broader_land} ({yrs}) site area GFA tenure',
             f'{country_name} {asset_kw} land GLS tender award ({yrs}) URA JLL CBRE Savills',
@@ -706,25 +707,38 @@ def run(config_path: str = "configs/deal_config.json",
     extract_model = oa_cfg.get("extract_model", "gpt-4o-mini")
 
     # Search config (prefer land_search, fall back to online_search)
-    sc_cfg        = cfg.get("land_search") or cfg.get("online_search") or {}
-    proximity_km  = sc_cfg.get("proximity_km",   1.0)
-    submarket_km  = sc_cfg.get("submarket_km",   5.0)
-    market_km     = sc_cfg.get("market_km",      submarket_km)
+    # House rules (configs/shared_settings.json → search_rules) apply to every
+    # deal; land_search (falling back to online_search) overrides per deal.
+    sc_cfg        = _house_rules("land", cfg.get("land_search") or cfg.get("online_search") or {},
+                                 subject_cfg.get("asset_class", ""))
+
+    proximity_km  = sc_cfg.get("proximity_km",   3.0)
+    city_km       = sc_cfg.get("city_km",       25.0)
     min_results   = sc_cfg.get("min_results",    3)
-    max_results   = sc_cfg.get("max_results",    10)
+    max_results   = sc_cfg.get("max_results",    15)
     years_back    = sc_cfg.get("years_back",     3)
-    years_back_max  = sc_cfg.get("years_back_max",   10)
+    years_back_max  = sc_cfg.get("years_back_max",    5)
     years_back_step = sc_cfg.get("years_back_step",   2)
     max_level     = sc_cfg.get("max_level",      3)
     # Grounded data sources to combine with (or instead of) OpenAI web search.
     # Defaults to web-search only → identical behaviour to before.
     sources_cfg   = sc_cfg.get("sources") or ["web_search"]
-    # Recency: keep only comps within the last recency_months (default 24 — the firm
-    # house policy for every comp search). Land tenders are sparse, so this may
+    # Recency: keep only comps within the last recency_months (default 60 = 5 years —
+    # the house cap for every comp search). Land tenders are sparse, so this may
     # legitimately yield few/none for a built site; add land_search.recency_months to
-    # widen per deal. Unparseable dates are KEPT.
+    # tighten per deal. Unparseable dates are KEPT.
     from sources.base import months_ago as _months_ago
-    _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
+    _rec_m = int(sc_cfg.get("recency_months", 60) or 60)
+    _w = warn_window_vs_recency(years_back_max, _rec_m)
+    if _w:
+        print(_w)
+
+
+    # Hard budget on web queries per run. One query = 1 web search + 1 extract call,
+    # so max_queries=5 costs 5 searches + 5 extracts, plus 1 classification = 11
+    # OpenAI calls. Config overrides via online_search.max_queries.
+    max_queries = int(sc_cfg.get("max_queries", 5) or 5)
+    _queries    = {"n": 0}
 
     if not api_key:
         raise ValueError("OpenAI API key not found.  Set openai.api_key in config or "
@@ -777,9 +791,10 @@ def run(config_path: str = "configs/deal_config.json",
     if all_records is None:
         GEO_LEVELS   = [
             ("proximity", proximity_km, f"Proximity ≤{proximity_km}km"),
-            ("submarket", submarket_km, f"Sub-market ≤{submarket_km}km"),
+            ("city",      city_km,      f"City ≤{city_km}km"),
         ]
-        BROAD_LEVEL  = ("market", market_km, f"Broader market ≤{market_km}km")
+        # Tier 3: whole country — max_km None means no distance filter at all.
+        BROAD_LEVEL  = ("country", None, f"Country-wide ({country_name or 'all'})")
         all_records  = []
         levels_used  = []
         seen_keys    = {}
@@ -817,7 +832,11 @@ def run(config_path: str = "configs/deal_config.json",
             level_new = 0
             print(f"\n[Search] {level_label}  (years back: {yrs_used})")
             for q in queries:
+                if _queries["n"] >= max_queries:
+                    print(f"  · query budget reached ({max_queries}) — stopping search")
+                    break
                 print(f"  Query: {q[:90]}…" if len(q) > 90 else f"  Query: {q}")
+                _queries["n"] += 1
                 try:
                     raw, q_sources = search_and_extract_land(
                         q, client, search_model, extract_model,
@@ -872,8 +891,8 @@ def run(config_path: str = "configs/deal_config.json",
         from sources.registry import get_grounded
         _conn_params = {"country_code": country_code, "country_name": country_name,
                         "years_back": yrs, "s_lon": s_lon, "s_lat": s_lat,
-                        "proximity_km": proximity_km, "submarket_km": submarket_km,
-                        "market_km": market_km, "comp_type": "land",
+                        "proximity_km": proximity_km, "city_km": city_km,
+                        "comp_type": "land",
                         "client": client, "extract_model": extract_model,
                         "broker_pages": sc_cfg.get("broker_pages"),
                         "broker_max_pdfs": sc_cfg.get("broker_max_pdfs", 4),
@@ -894,9 +913,9 @@ def run(config_path: str = "configs/deal_config.json",
                                            subject_country=country_name,
                                            subject_asset_class=subject_cfg.get("asset_class", ""))
             # ── Comparability rules on grounded records ──────────────────────
-            from sources.base import months_ago as _months_ago
-            # Land/GLS awards are infrequent → default to a wider recency window (36mo).
-            _rec_m = int(sc_cfg.get("recency_months", 36) or 36)
+            # _rec_m / _months_ago come from run scope: one recency cap for every
+            # source. This used to re-read recency_months with its own 36mo default,
+            # so grounded records were filtered at a different age than web ones.
             _before = len(_cleaned)
             _cleaned = [r for r in _cleaned
                         if (_months_ago(str(r.get("launch_date") or r.get("sale_date") or "")) or 0) <= _rec_m]
@@ -907,7 +926,7 @@ def run(config_path: str = "configs/deal_config.json",
             # Location: same sub-market (tight comp radius, not city-wide).
             _added = _merge_geocoded(
                 _geo, _srcs or [{"title": _conn.label or _conn.name, "url": ""}],
-                submarket_km, source_name=_conn.name)
+                city_km, source_name=_conn.name)
             _lbl = _conn.label or _conn.name
             if _lbl not in levels_used:
                 levels_used.append(_lbl)
@@ -915,7 +934,7 @@ def run(config_path: str = "configs/deal_config.json",
 
         save_cache(cache_path, all_records, levels_used, c_key)
 
-    records = all_records[:max_results]
+    records = all_records
     print(f"\n[1/5] SEARCH complete — {len(records)} record(s)")
 
     if not records:
@@ -932,6 +951,12 @@ def run(config_path: str = "configs/deal_config.json",
     print(f"\n[3/5] SORT by distance")
     classified = [r for r in classified if r.get("lon") is not None]
     classified.sort(key=lambda r: _haversine_km(r["lon"], r["lat"], s_lon, s_lat))
+    # Trim AFTER the sort, not before classify: land ranks by proximity, so the cap
+    # keeps the NEAREST max_results sites. Trimming first kept whichever sites the
+    # earliest query happened to find, regardless of distance.
+    if len(classified) > max_results:
+        print(f"      → keeping the {max_results} nearest of {len(classified)}")
+        classified = classified[:max_results]
     for i, r in enumerate(classified):
         r["map_marker"] = str(i + 1)
 
@@ -951,7 +976,11 @@ def run(config_path: str = "configs/deal_config.json",
     print(f"\n[4/5] RENDER   {out_excel}")
     schema      = get_land_schema(subject_cfg)
     subj_row    = subject_to_row(subject_cfg)
-    comp_rows   = [comp_to_row(r) for r in classified]
+    # comp_to_row derives Source from '_source' (excel/pdf/image/manual), which only
+    # the file-scan pipeline sets — online records have none, so the column came out
+    # blank. Label them by search origin instead; URLs are on the 'Sources' sheet.
+    comp_rows   = [{**comp_to_row(r), "source": " + ".join(_record_origins(r))}
+                   for r in classified]
     build_workbook_online(subject_cfg, subj_row, comp_rows, out_excel,
                           schema, bala_yield, levels_used, classified=classified)
 

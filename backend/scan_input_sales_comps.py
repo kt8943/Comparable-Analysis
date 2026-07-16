@@ -59,6 +59,7 @@ import generate_global_sales_comps_table as _global_sales_tbl
 from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
 from tools.calculations import (
     haversine_km as _haversine_km,
+    parse_cap_rate as _cap_rate,
     parse_num as _num,
     parse_remaining_yrs as _parse_remaining_yrs,
     parse_sale_date as _parse_sale_date,
@@ -73,6 +74,18 @@ from tools.vision_llm import call_vision_llm as _call_vision_llm
 from tools.column_mapper import map_columns as _map_columns
 from tools.geo_utils import write_geo_sidecar
 from tools.ura_zone import resolve_ura_zone as _resolve_ura_zone, zone_from_coords as _zone_from_coords
+
+
+def _yrs_or_none(val):
+    """Remaining leasehold rounded to 1 dp, or None when the source reported none.
+
+    parse_remaining_yrs() already distinguishes 'not reported' (None) from a real
+    figure; callers must not collapse that to 0. A 0-year lease is a specific
+    claim (an expired lease) that the report then prints as a confident '0.0',
+    indistinguishable from a measured value. None reaches the table as '—'.
+    """
+    v = _parse_remaining_yrs(val)
+    return None if v is None else round(float(v), 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,15 +109,17 @@ _SCALED_AMOUNT_RE = re.compile(r"\b(million|mil|mn|billion|bn)\b", re.I)
 
 
 def _split_psf_value(raw_psf, sale_type: str) -> tuple:
-    """Return (price_psf_gfa_float_or_None, sale_type_with_note). If ``raw_psf``
-    is a genuine plain psf number, parse it normally. If it's a scaled absolute
-    amount instead, leave price_psf_gfa blank and preserve the ORIGINAL phrase
-    (unit qualifier included) as a visible note on sale_type, rather than either
-    fabricating a wrong psf number or silently dropping the figure."""
+    """Return (price_psf_gfa_float_or_None, sale_type). A genuine plain psf number
+    is parsed normally. A scaled absolute amount (e.g. a hotel '1.59 million/per
+    key') is NOT a per-sf price, so price_psf_gfa is left blank and no wrong psf
+    number is fabricated. The original phrase is deliberately NOT written into
+    sale_type — it stays in the record's provenance (_prov['price_psf_gfa']['cell'])
+    and remains answerable via the 'Ask this Deal' chat, which reads the source
+    PDF directly. This keeps sale_type clean (it drives stake % + asset-type
+    classification) and keeps the table uncluttered."""
     s = str(raw_psf or "").strip()
     if s and _SCALED_AMOUNT_RE.search(s):
-        note = f"[Unit Price: {s}]"
-        return None, (f"{sale_type} {note}".strip() if sale_type else note)
+        return None, sale_type
     return _num(raw_psf), sale_type
 
 
@@ -319,9 +334,9 @@ def parse_input_excel(input_file: str, base_url: str, model: str,
             "gfa_sf":          int(gfa) if gfa else None,
             "price_sgd_m":     price_m,
             "price_psf_gfa":   _get_num(row, "price_psf_gfa"),
-            "remaining_yrs":   round(float(_parse_remaining_yrs(_get(row, "remaining_yrs")) or 0), 1),
-            "adj_npi_yield":   _num(_get(row, "adj_npi_yield")),
-            "npi_yield":       _num(_get(row, "npi_yield")),
+            "remaining_yrs":   _yrs_or_none(_get(row, "remaining_yrs")),
+            "adj_npi_yield":   _cap_rate(_get(row, "adj_npi_yield")),
+            "npi_yield":       _cap_rate(_get(row, "npi_yield")),
             "sale_type":       sale_type,
             "buyer":           str(_get(row, "buyer") or "").strip(),
             "land_zoning":     str(_get(row, "land_zoning") or "").strip(),
@@ -488,9 +503,9 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "price_sgd_m":         price_m,
             "price_psf_gfa":       psf_val,
             "price_sgd_m_display": price_display,
-            "remaining_yrs":   round(float(_parse_remaining_yrs(item.get("remaining_yrs")) or 0), 1),
-            "adj_npi_yield":   _num(item.get("adj_npi_yield")),
-            "npi_yield":       _num(item.get("npi_yield")),
+            "remaining_yrs":   _yrs_or_none(item.get("remaining_yrs")),
+            "adj_npi_yield":   _cap_rate(item.get("adj_npi_yield")),
+            "npi_yield":       _cap_rate(item.get("npi_yield")),
             "sale_type":       sale_type,
             "buyer":           str(item.get("buyer") or "").strip(),
             "land_zoning":     str(item.get("land_zoning") or "").strip(),
@@ -500,6 +515,17 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "sale_date":       str(item.get("sale_date_raw") or "").strip(),
             "stake_pct":       stake_pct,
             "_source":         "pdf",
+            # Carry the extractor's provenance + advisory flags through the
+            # reshape so downstream (review UI, eval harness, cross-source
+            # conflict check) can trace each value to its source cell and see
+            # what the deterministic/Stage-5 checks flagged.
+            "_prov":           item.get("_prov"),
+            "_auto_flags":     item.get("_auto_flags"),
+            "_verify_flag":    item.get("_verify_flag"),
+            # AI-judgment markers — the preview shows these so the analyst can
+            # review values the AI decided rather than transcribed from a cell.
+            "_llm_parsed":     item.get("_llm_parsed"),
+            "_verify_edits":   item.get("_verify_edits"),
         })
 
     print(f"  → {len(records)} valid records after filtering")
@@ -695,9 +721,9 @@ def _parse_image_records(image_path: str, llm_cfg: dict, openai_key: str = "",
             "price_sgd_m":      price_m,
             "price_psf_gfa":    psf_val,
             "price_sgd_m_display": price_display,  # "600-630" range string for Excel
-            "remaining_yrs":   round(float(_parse_remaining_yrs(item.get("remaining_yrs")) or 0), 1),
-            "adj_npi_yield":   _num(item.get("adj_npi_yield")),
-            "npi_yield":       _num(item.get("npi_yield")),
+            "remaining_yrs":   _yrs_or_none(item.get("remaining_yrs")),
+            "adj_npi_yield":   _cap_rate(item.get("adj_npi_yield")),
+            "npi_yield":       _cap_rate(item.get("npi_yield")),
             "sale_type":       sale_type,
             "buyer":           str(item.get("buyer") or "").strip(),
             "land_zoning":     str(item.get("land_zoning") or "").strip(),
@@ -963,11 +989,37 @@ def compute_metrics(comps: list, subject_cfg: dict) -> list:
         stake   = float(d.get("stake_pct")   or 1.0)
         gfa     = d.get("gfa_sf")            # may be None when _REQUIRE_GFA = False
         rem_yrs = int(d.get("remaining_yrs") or 0)
-        ftm_cr  = float(d.get("npi_yield") or 0)
+        # Already normalised to a fraction at parse time; parse_cap_rate is
+        # idempotent (0.045 → 0.045), so re-runs that re-read stored records
+        # cannot double-scale it.
+        ftm_cr  = _cap_rate(d.get("npi_yield"))   # None when the source reported none
 
-        d["price_psf_gfa"] = round((price_m / stake) * 1e6 / gfa) if gfa else d.get("price_psf_gfa")
-        d["ftm_cap_rate"]  = ftm_cr
-        if _global or not bala_factor(subj_yrs):
+        # PRECEDENCE for every calculated cell: the source's REPORTED value wins →
+        # otherwise calculate it → otherwise leave None so the table prints "—".
+        # A missing input is unknown, never 0: a 0 here would print as a confident
+        # "0.0"/"0.00%" and would also drag the Average row down as if it were a
+        # real measurement.
+
+        # Unit price psf — this used to overwrite a reported psf with the derived
+        # one whenever GFA happened to exist, which silently discarded the number
+        # the report actually printed (the generator's _calc_price_psf prefers the
+        # reported value, but never saw it — it had already been overwritten here).
+        _reported_psf = d.get("price_psf_gfa")
+        if not _reported_psf:
+            d["price_psf_gfa"] = (round((price_m / stake) * 1e6 / gfa)
+                                  if (price_m and gfa) else None)
+
+        d["ftm_cap_rate"] = ftm_cr
+
+        # Adj cap rate — a source-reported Adj. Cap Rate column (adj_npi_yield) is
+        # a direct input and outranks the Bala calculation, which was previously
+        # applied unconditionally and overwrote it.
+        _reported_adj = _cap_rate(d.get("adj_npi_yield"))
+        if _reported_adj:
+            d["adj_cap_rate"] = _reported_adj
+        elif ftm_cr is None:
+            d["adj_cap_rate"] = None         # dependent (FTM cap rate) missing → "—"
+        elif _global or not bala_factor(subj_yrs):
             d["adj_cap_rate"] = ftm_cr       # no SG Bala adjustment for foreign deals
         else:
             d["adj_cap_rate"] = (ftm_cr
@@ -1086,6 +1138,92 @@ def _dedup_cross_source(records: list, threshold_km: float = 0.2,
               f"(sources: {base.get('_source','')})")
         result.append(base)
     return result
+
+
+def _price_num(v) -> float | None:
+    """Parse a price-ish cell to a float, or None. Handles '1,133.00', '600-630'
+    (takes the low end), stray currency/footnote chars."""
+    s = re.sub(r"[^\d.\-]", "", str(v or ""))
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    try:
+        return float(m.group(0)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _name_overlap(a: str, b: str) -> float:
+    """Token Jaccard of two property names (0..1). Used to confirm two records
+    from different sources really are the SAME building before treating a value
+    mismatch as a conflict (vs. two genuinely different adjacent buildings)."""
+    ta = set(re.sub(r"\W+", " ", str(a or "").lower()).split())
+    tb = set(re.sub(r"\W+", " ", str(b or "").lower()).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.2,
+                                 price_tol_frac: float = 0.15,
+                                 name_min_overlap: float = 0.5) -> list:
+    """Flag (do NOT merge, do NOT drop) records that are the SAME building
+    reported by DIFFERENT sources but whose key numeric value DISAGREES.
+
+    Complements _dedup_cross_source: that function MERGES cross-source records
+    whose prices AGREE (within price_tol_frac); this one catches the opposite
+    case — same building, sources report DIFFERENT numbers (e.g. Colliers vs
+    Cushman MarketBeat both list 'Northpoint City South Wing' but at different
+    prices). Silently keeping both rows, or silently picking one, hides a real
+    data question, so instead we attach a ``_review_flag`` to both records and
+    print a run-log warning (same surfacing channel as the geocode-centroid
+    warning) so the analyst can verify which source is right.
+
+    'Same building' requires BOTH geocode proximity (≤ threshold_km) AND a name
+    token overlap ≥ name_min_overlap, so two genuinely different buildings that
+    merely sit within threshold_km of each other in a dense CBD are not flagged.
+    """
+    n = len(records)
+    n_flagged = 0
+    for i in range(n):
+        ri = records[i]
+        if ri.get("lon") is None or ri.get("lat") is None:
+            continue
+        for j in range(i + 1, n):
+            rj = records[j]
+            if rj.get("lon") is None or rj.get("lat") is None:
+                continue
+            if ri.get("_source") and ri.get("_source") == rj.get("_source"):
+                continue  # same source — not cross-source
+            if _haversine_km(ri["lon"], ri["lat"],
+                             rj["lon"], rj["lat"]) > threshold_km:
+                continue
+            if _name_overlap(ri.get("property_name"),
+                             rj.get("property_name")) < name_min_overlap:
+                continue  # nearby but a different building — not a conflict
+
+            conflicts = []
+            for fk, label in (("price_sgd_m", "price"),
+                              ("price_psf_gfa", "unit price")):
+                a, b = _price_num(ri.get(fk)), _price_num(rj.get(fk))
+                if a and b and a > 0 and b > 0 \
+                        and abs(a - b) / max(a, b) > price_tol_frac:
+                    conflicts.append(
+                        f"{label}: {ri.get('_source','?')}={a:g} vs "
+                        f"{rj.get('_source','?')}={b:g}")
+            if not conflicts:
+                continue
+
+            note = ("Cross-source disagreement for the same building — "
+                    + "; ".join(conflicts) + ". Verify which source is correct.")
+            for r in (ri, rj):
+                r["_review_flag"] = note
+            n_flagged += 1
+            print(f"      [cross-source CONFLICT] "
+                  f"{str(ri.get('property_name',''))[:40]!r}: {'; '.join(conflicts)} "
+                  f"— flagged for review")
+    if n_flagged:
+        print(f"      Cross-source conflict check: {n_flagged} disagreement(s) "
+              f"flagged for review (kept both rows; not merged)")
+    return records
 
 
 def _geocode_comps(records: list, mapbox_tok: str,
@@ -1509,6 +1647,10 @@ def run(config_path: str = "configs/deal_config.json",
         processed = _geocode_comps(processed, mapbox_tok, country_code,
                                    country_name, s_lon, s_lat)
 
+        # Flag same-building cross-source value disagreements BEFORE merging, so
+        # the (deliberately unmerged) conflicting rows carry their review note.
+        processed = _flag_cross_source_conflicts(processed)
+
         _before_dedup = len(processed)
         processed = _dedup_cross_source(processed)
         if len(processed) < _before_dedup:
@@ -1579,7 +1721,20 @@ def run(config_path: str = "configs/deal_config.json",
                     }
                     for r in processed
                 }
-                _any_updated = False
+                # Cross-source dedup MERGES AWAY duplicate records (a name that
+                # existed in the pre-dedup _saved_records no longer appears in
+                # `processed`). Drop those from the saved sidecar too — the base
+                # record's own name (one of the pre-merge names, since it's a
+                # copy of one original record) still matches, so this keeps
+                # exactly the surviving record and removes its merged-away
+                # duplicate(s). Without this, comp_acquisition_agent's audit and
+                # the frontend read the stale PRE-dedup count/rows from this
+                # file (e.g. showing "8 valid" after the run log itself reported
+                # "Cross-source dedup: 8 → 6") even though the Excel is correct.
+                _pre_count = len(_saved_records)
+                _saved_records = [sr for sr in _saved_records
+                                  if str(sr.get("property_name", "")) in _meta_by_name]
+                _any_updated = len(_saved_records) != _pre_count
                 for sr in _saved_records:
                     _name = str(sr.get("property_name", ""))
                     _meta = _meta_by_name.get(_name)
@@ -1600,6 +1755,15 @@ def run(config_path: str = "configs/deal_config.json",
     # Console summary
     _is_global = country_name.lower() not in ("", "singapore")
     if not _is_global:
+        # An unreported cap rate / leasehold is None (the table prints "—"), and
+        # .get(key, 0)'s default does NOT cover that: compute_metrics always sets
+        # the key, so .get returns the None it holds and float(None) raises.
+        def _pct(v):
+            return f"{v * 100:6.2f}%" if isinstance(v, (int, float)) else f"{'—':>7}"
+
+        def _yrs(v):
+            return f"{int(v):>4}" if isinstance(v, (int, float)) else f"{'—':>4}"
+
         print(f"\n  {'#':<3} {'Property':<42} {'Yrs':>4} {'B(comp)':>8} "
               f"{'FTM':>7} {'AdjCR':>7} {'Rel':>4}")
         print("  " + "─" * 80)
@@ -1607,9 +1771,9 @@ def run(config_path: str = "configs/deal_config.json",
             bc   = bala_factor(int(c.get("remaining_yrs") or 0))
             name = str(c.get("raw_description", "")).split("\n")[0][:40]
             print(f"  {c.get('map_marker',''):<3} {name:<42} "
-                  f"{int(c.get('remaining_yrs') or 0):>4} {bc:>8.4f} "
-                  f"{float(c.get('ftm_cap_rate', 0))*100:>6.2f}% "
-                  f"{float(c.get('adj_cap_rate', 0))*100:>6.2f}% "
+                  f"{_yrs(c.get('remaining_yrs'))} {bc:>8.4f} "
+                  f"{_pct(c.get('ftm_cap_rate'))} "
+                  f"{_pct(c.get('adj_cap_rate'))} "
                   f"{c.get('relevance_score', ''):>4}")
     else:
         print(f"\n  {'#':<3} {'Property':<52} {'Price':>10}  {'Rel':>4}")

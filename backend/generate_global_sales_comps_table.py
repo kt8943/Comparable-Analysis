@@ -122,6 +122,18 @@ def _calc_unit_price(price_raw, price_unit: str, site_area) -> int | None:
         return None
 
 
+def _reported_unit_price(c: dict):
+    """The source's directly-reported unit price, or None. RULE (same as the SG
+    template): a reported unit price takes precedence over the price ÷ area
+    calculation — so when the input states one, we use it verbatim rather than
+    deriving (and possibly blanking) it from a missing area."""
+    try:
+        v = float(str(c.get("price_psf_gfa")).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return round(v) if v > 0 else None
+
+
 def _source_label(src: str) -> str:
     mapping = {"excel": "Excel", "pdf": "PDF", "image": "Image", "manual": "Manual"}
     for prefix in ("pdf_", "excel_", "image_"):
@@ -174,7 +186,8 @@ def comp_to_row(c: dict, subject_cfg: dict) -> dict:
         "sale_date":   str(c.get("sale_date", "")),
         "price_raw":   float(price_raw) if price_raw else None,
         "site_area":   int(site_area) if site_area else None,
-        "unit_price":  None,   # written as Excel formula by _data_row
+        # Reported unit price wins; None → _data_row writes the price ÷ area formula.
+        "unit_price":  _reported_unit_price(c),
         "buyer":       str(c.get("buyer", "")),
         "land_zoning": str(c.get("land_zoning", "")),
         "location":    str(c.get("location", "")),
@@ -238,7 +251,12 @@ def _data_row(ws, row: int, row_dict: dict, schema: list,
         val     = row_dict.get(key)
 
         if key == "unit_price":
-            display = f"=IFERROR({_price_col}{row}*{_scale}/{_area_col}{row},\"—\")"
+            # Reported-first: if the source stated a unit price, write it as-is;
+            # otherwise fall back to the live price ÷ area formula.
+            if isinstance(val, (int, float)) and val > 0:
+                display = val
+            else:
+                display = f"=IFERROR({_price_col}{row}*{_scale}/{_area_col}{row},\"—\")"
             is_numeric = True
         else:
             display  = "—" if val is None or val == "" else val

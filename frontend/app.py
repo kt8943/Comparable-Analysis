@@ -801,6 +801,88 @@ def _save_edited_preview(excel_path: str, edited_df: "pd.DataFrame") -> bool:
         return False
 
 
+def _ai_judgment_rows(records_path) -> list:
+    """
+    Rows in the preview whose values the AI DECIDED rather than transcribed from
+    a table cell — the analyst has to review these, and the output alone gives no
+    hint which ones they are.
+
+    A PDF comp is normally read deterministically: the extractor grids the table,
+    maps its columns, and copies each cell across, recording where every value
+    came from in ``_prov``. Three things break that chain, and the backend marks
+    each on the record:
+      _llm_parsed   the page had no usable grid, so the LLM read the fields out
+                    of raw page text and chose where each value begins and ends
+                    (this is how '25 Loyang Crescent' — glued to its rank column
+                    as '125 Loyang Crescent504.2237' — came back as 'Loyang')
+      _verify_edits Stage 5 verification changed a value after extraction
+      _review_flag  two sources disagree about the same building; both rows kept
+
+    Returns [{marker, name, notes[]}] ordered by marker, one entry per row.
+    """
+    try:
+        records = json.loads(Path(records_path).read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    out = []
+    for r in records if isinstance(records, list) else []:
+        if not isinstance(r, dict):
+            continue
+        notes = []
+        if r.get("_llm_parsed"):
+            notes.append(
+                "The whole row was read from unstructured page text — no table "
+                "grid was detected, so the AI decided where each value starts "
+                "and ends. Check the property name and every number against the "
+                "source PDF."
+            )
+        for e in (r.get("_verify_edits") or []):
+            notes.append(f"AI verification changed {e}")
+        if r.get("_review_flag"):
+            notes.append(str(r["_review_flag"]))
+        if not notes:
+            continue
+        # Only shown for rows already flagged above: on its own this is a
+        # comment ("Missing fields in SOURCE"), not a changed value, and it
+        # lands on nearly every row — as a headline it would be pure noise.
+        if r.get("_verify_flag"):
+            notes.append(f"AI note: {r['_verify_flag']}")
+        out.append({
+            "marker": str(r.get("map_marker", "") or "").strip(),
+            "name":   str(r.get("property_name", "") or "").strip() or "(unnamed)",
+            "notes":  notes,
+        })
+
+    def _mk(row):
+        return (0, int(row["marker"])) if row["marker"].isdigit() else (1, 0)
+    return sorted(out, key=_mk)
+
+
+def _render_ai_judgment_notice(records_path):
+    """Warn above the preview when the AI decided values in it — see
+    _ai_judgment_rows(). Silent when every row was transcribed from a cell."""
+    rows = _ai_judgment_rows(records_path)
+    if not rows:
+        return
+    _n = len(rows)
+    st.warning(
+        f"🤖 {_n} row{'s' if _n > 1 else ''} below contain values the AI "
+        f"**decided** rather than read straight from a table in the PDF — most "
+        f"often because the table had no grid lines to read. They can look "
+        f"perfectly plausible while being wrong, so verify them against the "
+        f"source before using this table."
+    )
+    with st.expander(f"🔍 Review {_n} AI-decided row{'s' if _n > 1 else ''}",
+                     expanded=False):
+        for row in rows:
+            _label = f"**#{row['marker']} · {row['name']}**" if row["marker"] \
+                     else f"**{row['name']}**"
+            st.markdown(_label)
+            for n in row["notes"]:
+                st.markdown(f"- {n}")
+
+
 def _sync_records_json(records_path, edited_df: "pd.DataFrame", marker_map: dict = None):
     """
     Keep _records.json in sync with the edited preview table after a Save.
@@ -1528,6 +1610,10 @@ def _show_results(config_path: str, prefix: str, context: str = "",
         if preview_df is not None and not preview_df.empty:
             st.markdown("#### 📊 Preview")
 
+            # Flag rows whose values the AI decided instead of transcribing, so
+            # the analyst reviews them before the table gets used downstream.
+            _render_ai_judgment_notice(_records_path)
+
             # Editable Address column — the analyst fills it when a property name
             # is too rough to geocode. On re-run it takes priority over the name.
             # Pre-fill from any address already in _records.json (matched by marker).
@@ -2157,10 +2243,34 @@ def _compute_average(header, comps, keywords):
                     pass
         if nums:
             m = sum(nums) / len(nums)
-            s = f"{m:,.1f}" if abs(m) < 1000 else f"{m:,.0f}"
-            avg[j] = (s + "%") if had_pct else s
+            # Same house rule as _fmt_grid_val: percentages 'xx.00%', every other
+            # number 'xxx,xxx.0' (thousands separator + exactly one decimal).
+            avg[j] = f"{m:,.2f}%" if had_pct else f"{m:,.1f}"
             any_val = True
     return avg if any_val else None
+
+
+def _fmt_grid_val(cell, header_name: str) -> str:
+    """Format one Excel cell for the PGIM preview grid, applying the house number
+    rule (shared with _read_excel_preview so the Overview, Comparable-Analysis
+    detail page and Word export all render numbers identically):
+      • Map Marker      → plain integer (1, 2, 3 …), never '1.0'
+      • percentage cell → 'xx.00%'   (detected from the cell's own number_format)
+      • any other number→ 'xxx,xxx.0' (thousands separator + exactly one decimal)
+      • text            → passed through unchanged
+    """
+    v = cell.value
+    if v in (None, ""):
+        return ""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, (int, float)):
+        if "marker" in (header_name or "").lower():
+            return str(int(v)) if float(v).is_integer() else str(v)
+        if "%" in str(cell.number_format or ""):
+            return f"{float(v) * 100:,.2f}%"
+        return f"{float(v):,.1f}"
+    return str(v).replace("\n", " ").strip()
 
 
 def _read_pgim_grid(excel_path, avg_keywords=None):
@@ -2214,8 +2324,9 @@ def _read_pgim_grid(excel_path, avg_keywords=None):
         return [c for idx, c in enumerate(cells) if idx not in drop]
 
     def _vals(cells):
-        return ["" if c.value in (None, "") else str(c.value).replace("\n", " ").strip()
-                for c in _keep(cells)]
+        kept = _keep(cells)
+        return [_fmt_grid_val(c, header[idx] if idx < len(header) else "")
+                for idx, c in enumerate(kept)]
 
     def _is_header(cells):
         low = [str(c.value or "").lower() for c in _keep(cells)]
@@ -2657,10 +2768,21 @@ _PREVIEW_ROWS = [
     ("Market",   "Currency Symbol",           "currency_symbol"),
     ("Market",   "GFA Unit",                  "gfa_unit"),
     ("Market",   "Land Zoning",               "land_zoning"),
-    ("Market",   "Location Descriptor",       "location"),
     ("Market",   "Asset Search Keyword",      "asset_search_keyword"),
+    # "Location Descriptor" (location) and "Broader Market Query" are deliberately
+    # NOT shown as separate rows:
+    #   - location duplicated Submarket Keywords in this table (derive_market_fields
+    #     always sets location = submarket_keywords[0]), so only one is shown here —
+    #     Submarket Keywords, since search code reads that one directly. `location`
+    #     is still a real field (drives the subject row's "Location" column in every
+    #     comps table + the rationale's LOCATION placeholder) — see the New Deal
+    #     save handler below, which derives it from submarket_keywords[0] so removing
+    #     this row doesn't blank that field for new deals.
+    #   - broader_market_query is the Level-3 (market-wide) search fallback query;
+    #     every search_online_*.py consumer already falls back to a sensible generic
+    #     query built from country + asset keyword when it's absent, so simply not
+    #     collecting it here is safe — no compensating fallback needed.
     ("Market",   "Submarket Keywords (csv)",  "submarket_keywords"),
-    ("Market",   "Broader Market Query",      "broader_market_query"),
 ]
 
 
@@ -3192,6 +3314,15 @@ def render_new_deal_form():
 
         if save:
             final = _df_to_fields(edited_df)
+            # "Location Descriptor" isn't a separate editable row (see _PREVIEW_ROWS)
+            # since it duplicated Submarket Keywords — but subject_to_row() in every
+            # comps table generator reads subject_property.location for the subject's
+            # "Location" column, and the rationale reads it for its LOCATION
+            # placeholder, so a brand-new deal still needs a value here. Derive it
+            # from the first submarket keyword, mirroring derive_market_fields()'s
+            # own convention at generation time.
+            if not str(final.get("location", "")).strip():
+                final["location"] = (final.get("submarket_keywords") or [""])[0]
             missing = [f for f in ("deal_name","address","gfa_sf")
                        if not str(final.get(f,"")).strip()]
             if missing:
@@ -5243,6 +5374,11 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
             continue                     # skip if no info
         _any_shown = True
         st.markdown(f"### {_heading}")
+        # Same AI-judgment declaration the editable preview shows — this static
+        # Output view is what actually gets read/exported, so the rows the AI
+        # decided rather than transcribed must be called out here too.
+        _render_ai_judgment_notice(
+            _latest.parent / _latest.name.replace(".xlsx", "_records.json"))
         _html = _pgim_table_html(str(_latest), _sub_banner, _comp_banner, _avg_kw)
         if _html:
             st.markdown(_html, unsafe_allow_html=True)

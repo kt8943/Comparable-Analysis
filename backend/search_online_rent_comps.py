@@ -5,10 +5,10 @@ search_online_rent_comps.py
 Searches online for comparable rental transactions near the subject property
 using OpenAI's web search capability.
 
-Search strategy (same 3-level proximity-first approach as sales comps):
-  Level 1 — Proximity  : within proximity_km of subject
-  Level 2 — Sub-market : same submarket, within submarket_km
-  Level 3 — Broader    : full market query, within market_km
+Search strategy (same 3-tier proximity-first ladder as sales comps):
+  Tier 1 — Proximity   : within proximity_km of subject
+  Tier 2 — City        : within city_km of subject
+  Tier 3 — Country     : country-wide, no distance cap
 
 Usage
 -----
@@ -52,6 +52,8 @@ from generate_rent_comps_table import (
     _fill, _font, _border, _align,
 )
 from generate_rent_comps_map import geocode_with_fallbacks, _parse_property_text
+from tools.house_rules import search_rules as _house_rules, warn_window_vs_recency
+from tools.calculations import find_same_building as _find_same_building
 
 
 def _shared_mapbox_token() -> str:
@@ -79,7 +81,7 @@ def _year_window(years_back: int) -> str:
 def build_rent_queries(subject_cfg: dict, level: str, years_back: int = 2) -> list:
     """
     Build web search queries for rental comps.
-    level: "proximity" | "submarket" | "market"
+    level: "proximity" | "city" | "country"
     """
     prop_name    = subject_cfg["property_name"]
     address      = subject_cfg.get("address", "")
@@ -102,14 +104,14 @@ def build_rent_queries(subject_cfg: dict, level: str, years_back: int = 2) -> li
             f'{country_name} "{primary}" {asset_kw} rental transaction ({yrs})',
         ]
 
-    elif level == "submarket":
+    elif level == "city":
         kw_expr = " OR ".join(f'"{k}"' for k in kws[:3])
         return [
             f'{country_name} ({kw_expr}) {asset_kw} lease rent ({yrs}) {currency}',
             f'{broader} lease rental ({yrs})',
         ]
 
-    else:  # market
+    else:  # country
         return [
             f'{broader} lease rental ({yrs})',
             f'{country_name} {asset_kw} asking rent market ({yrs}) JLL Savills CBRE Colliers',
@@ -403,6 +405,9 @@ def record_to_rent_row(r: dict, subject_cfg: dict) -> dict:
     prop = f"{name}\n{addr}" if addr else name
 
     return {
+        # Search origin ("Web search", "URA PMI", …). OUTPUT_SCHEMA has always had a
+        # Source column; without this key it rendered blank. URLs are on 'Sources'.
+        "source":         " + ".join(_record_origins(r)),
         "property":       prop,
         "map_marker":     str(r.get("map_marker", "")),
         "lease_date":     str(r.get("lease_date") or ""),
@@ -429,6 +434,16 @@ def _source_label(name: str) -> str:
     if not name:
         return "Web search"
     return _SOURCE_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _record_origins(rec: dict) -> list:
+    """Distinct origin labels for a record (e.g. ['Web search', 'Broker report'])."""
+    out = []
+    for s in rec.get("sources") or []:
+        lbl = _source_label(s.get("source_name") or "")
+        if lbl not in out:
+            out.append(lbl)
+    return out or ["Web search"]
 
 
 def build_workbook_online_rent(subject_row: dict, comp_rows: list,
@@ -493,20 +508,35 @@ def run(config_path: str = "configs/deal_config.json",
 
     # rent_search overrides online_search for rent-specific settings
     sales_cfg       = cfg.get("online_search", {})
-    sc_cfg          = {**sales_cfg, **cfg.get("rent_search", {})}
-    proximity_km    = sc_cfg.get("proximity_km",    0.5)   # rent default: tighter — same street
-    submarket_km    = sc_cfg.get("submarket_km",    2.0)   # rent default: same precinct
-    market_km       = sc_cfg.get("market_km",       3.0)   # rent default: max cap
+    # House rules (configs/shared_settings.json → search_rules) apply to every
+    # deal; rent_search (falling back to online_search) overrides per deal.
+    sc_cfg          = _house_rules("rent", {**sales_cfg, **cfg.get("rent_search", {})},
+                                   subject_cfg.get("asset_class", ""))
+
+    proximity_km    = sc_cfg.get("proximity_km",    3.0)
+    city_km         = sc_cfg.get("city_km",        25.0)
     min_results     = sc_cfg.get("min_results",     5)     # rent default: 5 (vs 3 for sales)
-    max_results     = sc_cfg.get("max_results",     10)
+    max_results     = sc_cfg.get("max_results",     15)
     years_back      = sc_cfg.get("years_back",      2)
-    years_back_max  = sc_cfg.get("years_back_max",  8)
-    years_back_step = sc_cfg.get("years_back_step", 2)
+    years_back_max  = sc_cfg.get("years_back_max",  3)
+    years_back_step = sc_cfg.get("years_back_step", 1)
     max_level       = sc_cfg.get("max_level",       3)
-    # Recency filter (web-search + connectors): keep only leases within recency_months
-    # (default 24 — the firm house policy). Unparseable dates are KEPT.
+    # Recency filter (web-search + connectors): keep only leases within recency_months.
+    # 36mo, tighter than the 60mo used for sales and land: rental evidence dates
+    # faster than capital evidence, so a lease from the last cycle says little about
+    # today's achievable rent. Unparseable dates are KEPT.
     from sources.base import months_ago as _months_ago
-    _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
+    _rec_m = int(sc_cfg.get("recency_months", 36) or 36)
+    _w = warn_window_vs_recency(years_back_max, _rec_m)
+    if _w:
+        print(_w)
+
+
+    # Hard budget on web queries per run. One query = 1 web search + 1 extract call,
+    # so max_queries=5 costs 5 searches + 5 extracts, plus 1 classification = 11
+    # OpenAI calls. Config overrides via online_search.max_queries.
+    max_queries = int(sc_cfg.get("max_queries", 5) or 5)
+    _queries    = {"n": 0}
 
     if not api_key:
         raise ValueError("OpenAI API key not found. "
@@ -558,14 +588,15 @@ def run(config_path: str = "configs/deal_config.json",
     else:
         GEO_LEVELS  = [
             ("proximity", proximity_km, f"Proximity ≤{proximity_km}km"),
-            ("submarket", submarket_km, f"Sub-market ≤{submarket_km}km"),
+            ("city",      city_km,      f"City ≤{city_km}km"),
         ]
-        BROAD_LEVEL = ("market", market_km, f"Broader market ≤{market_km}km")
+        # Tier 3: whole country — max_km None means no distance filter at all.
+        BROAD_LEVEL = ("country", None, f"Country-wide ({country_name or 'all'})")
 
         all_records:     list = []
         levels_used:     list = []
         seen_keys:       dict = {}
-        seen_coord_keys: set  = set()
+        # cross-source dupes are matched by location+rent via _find_same_building.
         yrs = years_back
 
         def _run_level(level_id, max_km, level_label, yrs_used):
@@ -573,7 +604,11 @@ def run(config_path: str = "configs/deal_config.json",
             level_new = 0
             print(f"\n[Search] {level_label}  (years back: {yrs_used})")
             for q in queries:
+                if _queries["n"] >= max_queries:
+                    print(f"  · query budget reached ({max_queries}) — stopping search")
+                    break
                 print(f"  Query: {q[:80]}…" if len(q) > 80 else f"  Query: {q}")
+                _queries["n"] += 1
                 try:
                     raw, q_sources = search_and_extract_rent(
                         q, client, search_model, extract_model, subject_cfg
@@ -600,12 +635,9 @@ def run(config_path: str = "configs/deal_config.json",
                     if max_km is not None and r.get("lon") is not None:
                         if _haversine_km(r["lon"], r["lat"], s_lon, s_lat) > max_km:
                             continue
-                    if r.get("lon") is not None and rent > 0:
-                        coord_key = (round(r["lon"], 2), round(r["lat"], 2),
-                                     round(rent / max(rent * 0.05, 0.1)))
-                        if coord_key in seen_coord_keys:
-                            continue
-                        seen_coord_keys.add(coord_key)
+                    if _find_same_building(all_records, r.get("lon"), r.get("lat"), rent,
+                                           lambda x: x.get("asking_rent") or x.get("eff_rent")) is not None:
+                        continue
                     if key in seen_keys:
                         idx = seen_keys[key]
                         existing_urls = {s["url"] for s in all_records[idx].get("sources",[])}
@@ -658,13 +690,13 @@ def run(config_path: str = "configs/deal_config.json",
         from sources.base import months_ago as _months_ago
         _conn_params = {"country_code": country_code, "country_name": country_name,
                         "years_back": yrs, "s_lon": s_lon, "s_lat": s_lat,
-                        "proximity_km": proximity_km, "submarket_km": submarket_km,
-                        "market_km": market_km, "comp_type": "rent",
+                        "proximity_km": proximity_km, "city_km": city_km,
+                        "comp_type": "rent",
                         "client": client, "extract_model": extract_model,
                         "ura_max_rows": sc_cfg.get("ura_max_rows", 300),
                         "broker_pages": sc_cfg.get("broker_pages"),
                         "broker_max_pdfs": sc_cfg.get("broker_max_pdfs", 4)}
-        _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
+        # _rec_m comes from run scope: one recency cap for every source.
         for _conn in get_grounded((country_code or "sg").lower(), "rent",
                                   sources_cfg, _conn_params):
             print(f"\n[Source] {_conn.label or _conn.name}")
@@ -685,7 +717,7 @@ def run(config_path: str = "configs/deal_config.json",
             for r in _geo:
                 if r.get("lon") is None:
                     continue
-                if _haversine_km(r["lon"], r["lat"], s_lon, s_lat) > submarket_km:
+                if _haversine_km(r["lon"], r["lat"], s_lon, s_lat) > city_km:
                     continue
                 rent = float(r.get("asking_rent") or r.get("eff_rent") or 0)
                 key  = re.sub(r"\W+", "", str(r.get("property_name", "")).lower())[:24] \
@@ -703,7 +735,7 @@ def run(config_path: str = "configs/deal_config.json",
 
         save_cache(cache_path, all_records, levels_used, c_key)
 
-    records = all_records[:max_results]
+    records = all_records
     print(f"\n[1/5] SEARCH complete — {len(records)} record(s) for processing")
 
     if not records:
@@ -714,6 +746,15 @@ def run(config_path: str = "configs/deal_config.json",
     print(f"\n[2/5] CLASSIFY  ({extract_model})")
     classified = classify_rent_records(records, subject_cfg, client, extract_model)
     print(f"      → {len(classified)} records classified")
+
+    # Trim AFTER classify, not before: classify_rent_records is what scores relevance
+    # and sorts by it. Trimming first kept whichever comps the earliest query happened
+    # to find and threw away better ones unseen.
+    if len(classified) > max_results:
+        print(f"      → keeping the {max_results} most relevant of {len(classified)}")
+        classified = classified[:max_results]
+        for i, r in enumerate(classified, 1):
+            r["map_marker"] = str(i)
 
     # ── Location competitiveness (SG, URA proximity vs subject) ───────────────
     # Same Superior/Comparable/Inferior logic as the internal pipeline, reusing the

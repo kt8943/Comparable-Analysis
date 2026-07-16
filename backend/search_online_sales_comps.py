@@ -5,13 +5,21 @@ search_online_comps.py
 Searches online for comparable office investment transactions near the subject
 property using OpenAI's web search capability.
 
-Search strategy (proximity-first, sub-market fallback):
-  Level 1 — Proximity  : within proximity_km of subject (default 1km)
-  Level 2 — Sub-market : same location tier, within submarket_km (default 10km)
-  Level 3 — Broader    : full Singapore office market, no distance cap
+Search strategy (proximity-first, widening location tiers):
+  Tier 1 — Proximity : within proximity_km of subject (default 3km)
+  Tier 2 — City      : within city_km of subject (default 25km)
+  Tier 3 — Country   : country-wide, no distance cap
 
-Each level is tried in order; the next level activates only when the current
-level returns fewer than min_results confirmed transactions.
+Each tier is tried in order; the next tier activates only when the current tier
+returns fewer than min_results confirmed transactions.
+
+Tier 2 is a radius, not a municipal boundary — the geocoder returns lon/lat only,
+with no locality field to test containment against. Set city_km per deal when the
+metro is larger (or smaller) than the default.
+
+Recency is a hard filter independent of the tiers: sales older than recency_months
+(default 60 = 5 years) are dropped at every tier. Widening the location never
+widens the date window.
 
 Usage
 -----
@@ -27,11 +35,12 @@ Config additions (deal_config.json)
         "extract_model": "gpt-4o-mini"
     },
     "online_search": {
-        "proximity_km":  1.0,
-        "submarket_km":  10.0,
-        "min_results":   3,
-        "max_results":   10,
-        "years_back":    2
+        "proximity_km":   3.0,
+        "city_km":        25.0,
+        "recency_months": 60,
+        "min_results":    3,
+        "max_results":    15,
+        "years_back":     2
     }
 
 Output
@@ -72,6 +81,8 @@ from generate_sales_comps_table import (
     subject_to_row, get_output_schema,
 )
 from generate_sales_comps_map import geocode_with_fallbacks, _parse_property_text
+from tools.calculations import find_same_building as _find_same_building
+from tools.house_rules import search_rules as _house_rules, warn_window_vs_recency
 
 
 def _shared_mapbox_token() -> str:
@@ -151,7 +162,7 @@ def _year_window(years_back: int) -> str:
 def build_queries(subject_cfg: dict, level: str, years_back: int = 2) -> list:
     """
     Return 2–3 search queries for the given expansion level.
-    level: "proximity" | "submarket" | "market"
+    level: "proximity" | "city" | "country"
     Fully generic: uses country_name, asset_class, currency from subject_cfg.
     """
     location     = subject_cfg.get("location", "")
@@ -181,7 +192,7 @@ def build_queries(subject_cfg: dict, level: str, years_back: int = 2) -> list:
             f'{country_name} "{primary}" {asset_kw} transaction ({yrs}) whole block',
         ]
 
-    elif level == "submarket":
+    elif level == "city":
         kw_expr = " OR ".join(f'"{k}"' for k in kws[:3])
         broader = broader_cfg or _BROADER_MARKET.get(location, f"{country_name} {asset_kw} investment")
         return [
@@ -189,7 +200,7 @@ def build_queries(subject_cfg: dict, level: str, years_back: int = 2) -> list:
             f'{broader} ({yrs}) block sale OR "partial stake"',
         ]
 
-    else:  # market
+    else:  # country
         broader = broader_cfg or _BROADER_MARKET.get(location, f"{country_name} {asset_kw} investment sale")
         return [
             f'{broader} ({yrs}) cap rate transaction {currency}',
@@ -225,7 +236,7 @@ Extract all confirmed real estate investment transactions from this text:
 
 For each transaction return a JSON object with:
   property_name, address, sale_date (e.g. "Q3 2025"), price_sgd_m (float),
-  gfa_sf (int or null), remaining_yrs (int, 0=freehold, null if unknown),
+  gfa_sf (int or null), remaining_yrs (int years left, 999=freehold, null if unknown),
   cap_rate_pct (float % or null), stake_pct (float or null — null means 100%),
   sale_type ("Block Sale"|"Partial Stake"|"En Bloc"|"Strata Sale"),
   land_zoning (or null), buyer (or null), seller (or null), country (default "Singapore")
@@ -320,7 +331,7 @@ def search_and_extract(query: str, client,
         f"For each transaction return a JSON object with:\n"
         f"  property_name, address, sale_date (e.g. 'Q3 2025'), "
         f"price_sgd_m (price in {currency} millions, float),\n"
-        f"  gfa_sf (GFA in {gfa_desc}, int or null), remaining_yrs (int, 0=freehold, null if unknown),\n"
+        f"  gfa_sf (GFA in {gfa_desc}, int or null), remaining_yrs (int years left, 999=freehold, null if unknown),\n"
         f"  cap_rate_pct (float % or null), stake_pct (float or null — null means 100%%),\n"
         f"  sale_type ('Block Sale'|'Partial Stake'|'En Bloc'|'Strata Sale'),\n"
         f"  asset_type (e.g. 'Block Sale ({asset_desc.title()})'),\n"
@@ -429,11 +440,10 @@ def validate_dedup(records: list, subject_name: str = "",
 
     Dedup strategy (catches bilingual duplicates like Korean + English same property):
       1. Name-based key  : normalized ASCII name[:24] + price → existing approach
-      2. Coordinate key  : (lon rounded 2dp, lat rounded 2dp) + price within 1%
+      2. Location match  : within ~150m AND price within 5%
          → catches same property reported in two languages / by two sources
     """
     seen_name_keys  = set()
-    seen_coord_keys = set()   # (lon2, lat2, price_bucket)
     subject_key  = re.sub(r"\W+", "", subject_name.lower())[:24] if subject_name else ""
     sc_tokens    = subject_country.lower().split() if subject_country else []
     out          = []
@@ -463,14 +473,10 @@ def validate_dedup(records: list, subject_name: str = "",
         name_key = norm_key + f"_{float(price):.0f}"
         if name_key in seen_name_keys:
             continue
-        # Dedup 2: coordinate-based (catches bilingual dupes with same location + price)
-        lon, lat = r.get("lon"), r.get("lat")
-        if lon is not None and lat is not None:
-            price_bucket = round(float(price) / max(float(price) * 0.05, 1))
-            coord_key    = (round(lon, 2), round(lat, 2), price_bucket)
-            if coord_key in seen_coord_keys:
-                continue
-            seen_coord_keys.add(coord_key)
+        # Dedup 2: location-based (catches bilingual dupes: same building + price)
+        if _find_same_building(out, r.get("lon"), r.get("lat"), price,
+                               lambda x: x.get("price_sgd_m")) is not None:
+            continue
         seen_name_keys.add(name_key)
         out.append(r)
     return out
@@ -600,6 +606,10 @@ def record_to_row(r: dict, subject_cfg: dict, bala_yield: float) -> dict:
     use       = str(r.get("asset_type")  or f"{stype} (Office)")
 
     return {
+        # Where this comp came from ("Web search", "URA PMI", …). OUTPUT_SCHEMA has
+        # always had a Source column; without this key _data_row wrote it blank.
+        # The verification URLs behind each label live on the 'Sources' sheet.
+        "source":        " + ".join(_record_origins(r)),
         "property":      prop_text,
         "map_marker":    str(r.get("map_marker", "")),
         "sale_date":     str(r.get("sale_date") or ""),
@@ -704,6 +714,28 @@ def _build_sources_sheet(wb, classified: list):
             row += 1
 
 
+def _link_source_cells(ws, schema, classified, first_row: int = 10):
+    """Make each comp's Source cell a clickable link to its first verification URL.
+
+    The label already says WHERE a comp came from ("Web search", "URA PMI"); this
+    makes it answer WHICH page, without the reader having to cross-reference the
+    Sources sheet by property name. The Sources sheet still lists every URL when a
+    comp is corroborated by more than one.
+    """
+    col = next((i for i, f in enumerate(schema, 1) if f[1] == "source"), None)
+    if not col:
+        return
+    for i, rec in enumerate(classified):
+        url = next((s.get("url") for s in (rec.get("sources") or []) if s.get("url")), "")
+        if not url:
+            continue
+        c = ws.cell(row=first_row + i, column=col)
+        # hyperlink + font only: .style = "Hyperlink" would wipe the row's
+        # alternating fill that _data_row just applied.
+        c.hyperlink = url
+        c.font = _font("FF1155CC", sz=9, bold=False, underline="single")
+
+
 def build_workbook_online(subject_row: dict, comp_rows: list,
                           subject_cfg: dict, output_path: str,
                           bala_yield: float, search_levels_used: list,
@@ -755,6 +787,8 @@ def build_workbook_online(subject_row: dict, comp_rows: list,
         r = 10 + i
         _data_row(ws, r, crow, alt=(i % 2 == 1), schema=schema)
         _write_formulas(ws, r, is_subject=False, schema=schema)
+    if classified:
+        _link_source_cells(ws, schema, classified[:len(comp_rows)], first_row=10)
 
     # ── Notes footer ─────────────────────────────────────────────────────────
     r = 10 + len(comp_rows) + 1
@@ -849,24 +883,44 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     search_model  = oa_cfg.get("search_model",  "gpt-4o-mini-search-preview")
     extract_model = oa_cfg.get("extract_model", "gpt-4o-mini")
 
-    sc_cfg          = cfg.get("online_search", {})
-    proximity_km    = sc_cfg.get("proximity_km",    1.0)
-    submarket_km    = sc_cfg.get("submarket_km",    3.0)
-    market_km       = sc_cfg.get("market_km",       submarket_km)  # Level 3 cap; defaults to submarket_km
+    # House rules (configs/shared_settings.json → search_rules) apply to every
+    # deal; this deal's own online_search block still overrides any key it sets.
+    sc_cfg          = _house_rules("sales", cfg.get("online_search", {}),
+                                   cfg["subject_property"].get("asset_class", ""))
+    # Three-tier location ladder: proximity → city → country.
+    #   Tier 1 proximity_km — tight radius around the subject (real distance filter)
+    #   Tier 2 city_km      — whole-city cap. A RADIUS, not a municipal polygon: the
+    #                         geocoder returns lon/lat only (no locality field), so a
+    #                         true boundary test isn't available. Widen per deal if the
+    #                         metro is larger than the default.
+    #   Tier 3 country      — no distance cap at all (None). Country containment comes
+    #                         from the country-scoped geocode + country-scoped queries.
+
+    proximity_km    = sc_cfg.get("proximity_km",    3.0)
+    city_km         = sc_cfg.get("city_km",        25.0)
     min_results     = sc_cfg.get("min_results",     3)
-    max_results     = sc_cfg.get("max_results",     10)
+    max_results     = sc_cfg.get("max_results",     15)
     years_back      = sc_cfg.get("years_back",      2)
-    years_back_max  = sc_cfg.get("years_back_max",  8)
+    years_back_max  = sc_cfg.get("years_back_max",  5)
     years_back_step = sc_cfg.get("years_back_step", 2)
     max_level       = sc_cfg.get("max_level",       3)   # 1=proximity only, 2=+submarket, 3=+broader
     # Grounded data sources to combine with (or instead of) OpenAI web search.
     # Defaults to web-search only → identical behaviour to before.
     sources_cfg     = sc_cfg.get("sources") or ["web_search"]
     # Recency filter (applies to BOTH web-search and grounded connectors): keep only
-    # sales within recency_months (default 24 — the firm house policy). Unparseable
-    # dates are KEPT.
+    # sales within recency_months (default 60 = 5 years). Unparseable dates are KEPT.
     from sources.base import months_ago as _months_ago
-    _rec_m = int(sc_cfg.get("recency_months", 24) or 24)
+    _rec_m = int(sc_cfg.get("recency_months", 60) or 60)
+    _w = warn_window_vs_recency(years_back_max, _rec_m)
+    if _w:
+        print(_w)
+
+
+    # Hard budget on web queries per run. One query = 1 web search + 1 extract call,
+    # so max_queries=5 costs 5 searches + 5 extracts, plus 1 classification = 11
+    # OpenAI calls. Config overrides via online_search.max_queries.
+    max_queries = int(sc_cfg.get("max_queries", 5) or 5)
+    _queries    = {"n": 0}
 
     if not api_key:
         raise ValueError(
@@ -928,15 +982,16 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     else:
         GEO_LEVELS = [
             ("proximity", proximity_km, f"Proximity ≤{proximity_km}km"),
-            ("submarket", submarket_km, f"Sub-market ≤{submarket_km}km"),
+            ("city",      city_km,      f"City ≤{city_km}km"),
         ]
-        # Level 3 uses market_km (defaults to submarket_km if not set in config)
-        BROAD_LEVEL = ("market", market_km, f"Broader market ≤{market_km}km")
+        # Tier 3: whole country — max_km None means no distance filter at all.
+        BROAD_LEVEL = ("country", None, f"Country-wide ({country_name or 'all'})")
 
         all_records:     list = []
         levels_used:     list = []
         seen_keys:       dict = {}   # name+price key → index in all_records
-        seen_coord_keys: set  = set()  # (lon2dp, lat2dp, price_bucket) — bilingual dedup
+        # bilingual/cross-source dupes are matched against all_records by
+        # location+price via _find_same_building — no separate coord index needed.
 
         yrs = years_back   # will increment on temporal expansion
 
@@ -954,18 +1009,14 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                     if _haversine_km(r["lon"], r["lat"], s_lon, s_lat) > max_km:
                         continue
                 _srcs = [({**s, "source_name": source_name} if source_name else s) for s in srcs]
-                if r.get("lon") is not None and price > 0:
-                    p_bucket  = round(price / max(price * 0.05, 0.5))
-                    coord_key = (round(r["lon"], 2), round(r["lat"], 2), p_bucket)
-                    if coord_key in seen_coord_keys:
-                        if key in seen_keys:
-                            idx = seen_keys[key]
-                            existing = {s.get("url") for s in all_records[idx].get("sources", [])}
-                            for s in _srcs:
-                                if s.get("url") and s["url"] not in existing:
-                                    all_records[idx].setdefault("sources", []).append(s)
-                        continue
-                    seen_coord_keys.add(coord_key)
+                _dup = _find_same_building(all_records, r.get("lon"), r.get("lat"),
+                                           price, lambda x: x.get("price_sgd_m"))
+                if _dup is not None:
+                    existing = {s.get("url") for s in all_records[_dup].get("sources", [])}
+                    for s in _srcs:
+                        if s.get("url") and s["url"] not in existing:
+                            all_records[_dup].setdefault("sources", []).append(s)
+                    continue
                 if key in seen_keys:
                     idx = seen_keys[key]
                     existing = {s.get("url") for s in all_records[idx].get("sources", [])}
@@ -985,7 +1036,11 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
             level_new = 0
             print(f"\n[Search] {level_label}  (years back: {yrs_used})")
             for q in queries:
+                if _queries["n"] >= max_queries:
+                    print(f"  · query budget reached ({max_queries}) — stopping search")
+                    break
                 print(f"  Query: {q[:80]}…" if len(q) > 80 else f"  Query: {q}")
+                _queries["n"] += 1
                 try:
                     raw, q_sources = search_and_extract(q, client, search_model, extract_model,
                                                         subject_cfg=subject_cfg)
@@ -1020,6 +1075,8 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                 print(f"  (Level 3 'Broader market' disabled — max_level={max_level})")
 
             while len(all_records) < min_results:
+                if _queries["n"] >= max_queries:
+                    break
                 for level_id, max_km, level_label in active_levels:
                     _run_level(level_id, max_km, level_label, yrs)
                     if len(all_records) >= min_results:
@@ -1029,9 +1086,11 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                     print(f"  ✓ min_results ({min_results}) reached.")
                     break
 
-                # Temporal expansion
+                # Temporal expansion. Clamp to years_back_max so the last step lands
+                # exactly on the cap (2 → 4 → 5) instead of stepping past it and
+                # ending the loop a rung early.
                 if yrs < years_back_max:
-                    yrs += years_back_step
+                    yrs = min(yrs + years_back_step, years_back_max)
                     print(f"\n  ↩  Sparse results ({len(all_records)}). "
                           f"Extending search window to {yrs} years back…")
                 else:
@@ -1040,7 +1099,8 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                     break
 
             # ── Phase 2: broader market (only if max_level=3 and still sparse) ───
-            if len(all_records) < min_results and max_level >= 3:
+            if (len(all_records) < min_results and max_level >= 3
+                    and _queries["n"] < max_queries):
                 print(f"\n  Falling back to broader market search (geo levels exhausted).")
                 _run_level(*BROAD_LEVEL, yrs)
                 if len(all_records) < min_results:
@@ -1050,8 +1110,8 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
         from sources.registry import get_grounded
         _conn_params = {"country_code": country_code, "country_name": country_name,
                         "years_back": yrs, "s_lon": s_lon, "s_lat": s_lat,
-                        "proximity_km": proximity_km, "submarket_km": submarket_km,
-                        "market_km": market_km, "comp_type": "sales",
+                        "proximity_km": proximity_km, "city_km": city_km,
+                        "comp_type": "sales",
                         "client": client, "extract_model": extract_model,
                         "ura_max_rows": sc_cfg.get("ura_max_rows", 60),
                         "broker_pages": sc_cfg.get("broker_pages"),
@@ -1080,10 +1140,11 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                 print(f"  · recency ≤{_rec_m}mo: kept {len(_cleaned)}/{_before}")
             _geo = geocode_records(_cleaned, mapbox_tok, country_code,
                                    country_name=country_name)
-            # Location: keep only same sub-market (tight comp radius, not city-wide).
+            # Location: grounded feeds are country-scoped registries, so cap them at
+            # the city tier rather than letting them pull in the whole country.
             _added = _merge_geocoded(
                 _geo, _srcs or [{"title": _conn.label or _conn.name, "url": ""}],
-                submarket_km, source_name=_conn.name)
+                city_km, source_name=_conn.name)
             _lbl = _conn.label or _conn.name
             if _lbl not in levels_used:
                 levels_used.append(_lbl)
@@ -1091,8 +1152,7 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
 
         save_cache(cache_path, all_records, levels_used, c_key)
 
-    # ── Trim to max_results ───────────────────────────────────────────────────
-    records = all_records[:max_results]
+    records = all_records
     print(f"\n[1/5] SEARCH complete — {len(records)} record(s) for processing")
 
     if not records:
@@ -1104,6 +1164,16 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     print(f"\n[2/5] CLASSIFY  ({extract_model})")
     classified = classify_records(records, subject_cfg, client, extract_model)
     print(f"      → {len(classified)} records classified")
+
+    # ── Trim to max_results ───────────────────────────────────────────────────
+    # AFTER classify, not before: classify_records is what scores relevance and sorts
+    # by it. Trimming first kept whichever comps the earliest query happened to find
+    # and threw away better ones unseen.
+    if len(classified) > max_results:
+        print(f"      → keeping the {max_results} most relevant of {len(classified)}")
+        classified = classified[:max_results]
+        for i, r in enumerate(classified, 1):
+            r["map_marker"] = str(i)
 
     # ── Location competitiveness (SG, URA proximity vs subject) ───────────────
     # Overrides the LLM free-text location with Superior/Comparable/Inferior using
