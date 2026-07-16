@@ -667,7 +667,20 @@ def run(config_path: str = "configs/deal_config.json",
 
     subject_cfg  = cfg["subject_property"]
     mb_cfg       = cfg.get("mapbox", {})
-    mapbox_tok   = mb_cfg.get("token", "")
+
+    # Mapbox token — always read from shared_settings.json (single source of truth,
+    # same as scan_input_sales_comps.py). Fall back to the deal config's own
+    # mapbox.token only if shared_settings is absent. Previously this only read
+    # mb_cfg, so a deal config missing/blank on "mapbox.token" silently skipped
+    # the map for RENT (while sales still worked via the shared_settings fallback).
+    _ss_path = Path(__file__).parent.parent / "configs" / "shared_settings.json"
+    try:
+        mapbox_tok = json.loads(_ss_path.read_text(encoding="utf-8")).get("mapbox_token", "")
+    except Exception:
+        mapbox_tok = ""
+    if not mapbox_tok:
+        mapbox_tok = mb_cfg.get("token", "")
+
     llm_cfg      = cfg.get("llm", {"provider": "ollama",
                                     "ollama": {"base_url": "http://localhost:11434",
                                                "model": "qwen2.5:3b"}})

@@ -1363,28 +1363,43 @@ _TABULAR_HDR_KWS = {
 }
 
 
-def _looks_tabular(text: str) -> bool:
+def _tabular_header_lines(text: str) -> list:
     """
-    True only if the page text contains a genuine TABLE — detected by a single
-    line holding two or more distinct column-header keywords (e.g. 'Property
-    Price Unit Buyer Seller', or 'PROPERTY NAME TYPE BUYER SELLER PURCHASE
-    PRICE'). This is how a de-gridded transaction table (which camelot failed to
-    box, so it survives only as page text — e.g. Colliers Q3) is told apart from
-    ordinary NARRATIVE prose. Narrative paragraphs never line up two header words
-    on one line, so they return False and are never mined — closing the
-    fabrication vector (inventing deals from commentary + chart numbers).
+    Returns EVERY line that reads like a table's column-header row (2+ distinct
+    header keywords, e.g. 'Property Price Unit Buyer Seller' or 'PROPERTY NAME
+    TYPE BUYER SELLER PURCHASE PRICE'). A page's text can contain several such
+    lines (chart-axis captions coincidentally hit 2 keywords too), so callers
+    that need to find one SPECIFIC table's header (e.g. the reject-list check
+    below) must scan all candidates, not just the first — the real transaction
+    table's header is not always the first line to match.
     """
+    out = []
     for line in text.splitlines():
         low = line.lower()
         hits = sum(1 for k in _TABULAR_HDR_KWS
                    if re.search(r'\b' + re.escape(k) + r'\b', low))
         if hits >= 2:
-            return True
-    return False
+            out.append(line)
+    return out
+
+
+def _looks_tabular(text: str) -> bool:
+    """True only if the page text contains a genuine TABLE header line — see
+    _tabular_header_lines(). Narrative-only pages return False and are never
+    mined, closing the fabrication vector (inventing deals from commentary +
+    chart numbers)."""
+    return bool(_tabular_header_lines(text))
+
+
+_NARRATIVE_MENTION_RE = re.compile(
+    r"other\s+(?:significant|notable|major|key)\s+(?:deals?|transactions?|sales?)\s+"
+    r"included|in\s+other\s+notable\s+transactions", re.I)
 
 
 def _from_text(text: str, section_title: str, field_schema: list,
-               subj_tokens: set, llm_cfg: dict) -> list:
+               subj_tokens: set, llm_cfg: dict,
+               reject_table_headers: list = None,
+               extra_exclusion_note: str = "") -> list:
     """
     LLM extraction from raw page text — a fallback for a real transaction TABLE
     that camelot could not grid, so it survives only as page text.
@@ -1393,11 +1408,44 @@ def _from_text(text: str, section_title: str, field_schema: list,
     contains a recognisable table header line. Pure narrative prose is refused
     outright (returns []), so the model can never fabricate deals out of
     commentary. 'The AI trusts tables, never prose.'
+
+    Gated a SECOND way by reject_table_headers: Stage 2 (extract_page_tables)
+    already refuses a GRIDDED table whose header matches an out-of-scope marker
+    (e.g. a GLS/land table on an asset-sales run, or an asset-sale table with a
+    Buyer/Seller column on a LAND run). But when the SAME table can't be grid-
+    detected at all (camelot fails to box it — the same failure mode that makes
+    a real table survive only as page text, e.g. Colliers Q4's private-sales
+    table), it used to reach this LLM fallback with NO knowledge of the reject
+    list, silently re-admitting the exact out-of-scope rows Stage 2 was built to
+    exclude (a Colliers/CMMB asset-sale table leaking into a LAND scan's output).
+    Apply the identical header-keyword check here before ever calling the LLM.
+
+    Gated a THIRD way by _NARRATIVE_MENTION_RE: a "passing mention" sentence
+    (e.g. "Other significant deals included X, sold to Y for SGD Z million,
+    and ...") reads as tabular to the keyword heuristic above (it names deals
+    with prices) and the system prompt already tells the LLM not to mine it —
+    but that instruction is not reliably followed (observed: sometimes returns
+    [], sometimes extracts 2 records with prices scrambled by chart-axis
+    numbers the PDF layout interleaves into the same sentence). Block this
+    pattern in code so it never depends on the LLM's compliance that run.
     """
+    if _NARRATIVE_MENTION_RE.search(text):
+        print(f"      [text] skipped — passing narrative mention of deals "
+              f"detected ('other significant deals included...' pattern), "
+              f"not a formal transaction listing")
+        return []
     if not _looks_tabular(text):
         print(f"      [text] no table header detected — skipping prose "
               f"(AI reads tables only, not narrative)")
         return []
+    if reject_table_headers:
+        for _hdr_line in _tabular_header_lines(text):
+            _low = _hdr_line.lower()
+            _hit = next((kw for kw in reject_table_headers if kw in _low), None)
+            if _hit:
+                print(f"      [text] skipped — out-of-scope table detected in page "
+                      f"text (header matched reject list {_hit!r}): {_hdr_line[:70]!r}")
+                return []
     field_list = "\n".join(f'  "{k}": {d}' for _, k, d in field_schema)
     system = (
         "You are a real estate data extraction assistant. "
@@ -1414,6 +1462,7 @@ def _from_text(text: str, section_title: str, field_schema: list,
         "named deals out of it produces noisy duplicates alongside the report's own formal "
         "comp table elsewhere in the document. If the page is pure narrative commentary with no "
         "genuine tabular/enumerated listing, return an empty array []."
+        + (f"\n{extra_exclusion_note}" if extra_exclusion_note else "")
     )
     user = (
         f"Section: {section_title}\n\n"
@@ -1597,7 +1646,9 @@ def _merge_tenant_fragments(rows: list, col_map: dict) -> list:
 # ─── Stage 3 → 4 orchestration ───────────────────────────────────────────────
 
 def map_to_schema(page_tables: list, field_schema: list,
-                  subject_name: str, llm_cfg: dict, dedup: bool = True) -> list:
+                  subject_name: str, llm_cfg: dict, dedup: bool = True,
+                  reject_table_headers: list = None,
+                  extra_exclusion_note: str = "") -> list:
     """
     Stage 3 + 4: for each page entry build records.
 
@@ -1607,6 +1658,11 @@ def map_to_schema(page_tables: list, field_schema: list,
     dedup : merge duplicate names (default). Set False for rent/lease comps,
             where the same building legitimately appears multiple times (one row
             per lease deal — different tenants/floors/areas).
+    reject_table_headers / extra_exclusion_note : same out-of-scope markers
+            Stage 2 uses to refuse a GRIDDED table of the wrong comp type (e.g.
+            a land/GLS table on an asset-sales run) — passed through here so
+            the text-fallback path (_from_text) applies the identical check
+            when that same table survives only as page text instead of a grid.
     """
     subj_tokens = (set(re.sub(r"\W+", " ", subject_name.lower()).split())
                    if subject_name else set())
@@ -1633,6 +1689,8 @@ def map_to_schema(page_tables: list, field_schema: list,
             recs = _from_text(
                 entry["raw_text"], entry["section_title"],
                 field_schema, subj_tokens, llm_cfg,
+                reject_table_headers=reject_table_headers,
+                extra_exclusion_note=extra_exclusion_note,
             )
             print(f"    Page {pg:>3}: {len(recs)} record(s) from text")
         else:
@@ -1914,7 +1972,9 @@ def extract_pdf_records(
           f"{txt_count} text-only page(s)")
 
     print(f"\n  [PDF Stage 3+4] Assembling records ...")
-    records = map_to_schema(page_tables, field_schema, subject_name, llm_cfg, dedup=dedup)
+    records = map_to_schema(page_tables, field_schema, subject_name, llm_cfg, dedup=dedup,
+                            reject_table_headers=reject_table_headers,
+                            extra_exclusion_note=extra_exclusion_note)
     print(f"  [PDF] {len(records)} record(s) extracted")
 
     if records and os.environ.get("PDF_SKIP_STAGE5") != "1":
