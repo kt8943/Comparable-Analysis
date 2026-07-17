@@ -244,13 +244,10 @@ comp type), `classify_*_comps`, `parse_input_excel`, `extract_comps_from_pdf`,
 `generate_bala_table`, `geocode_and_map`, `generate_investment_rationale`,
 `setup_new_deal`, and `fix_json`.
 
-> **Caveat a reviewer must know: no Python code loads `skills/` at runtime.** They are
-> *specifications*, not executed units — the contract each capability is meant to
-> honour (its inputs, its permitted tools, its steps), and the substrate for an
-> agent runtime that can read them. The behaviour that actually ships lives in the
-> `.py` modules. **They can therefore drift from the code**, and nothing detects it.
-> Treat a `skill.md` as intent and the module as truth; if the two disagree, the
-> module wins and the spec is stale.
+> **Note:** `skills/` is a specification layer — no Python loads it at runtime. Each
+> file states the contract a capability honours: its inputs, its permitted tools, its
+> steps. The behaviour that ships lives in the `.py` modules, so read a `skill.md` as
+> intent and the module as the implementation.
 
 ---
 
@@ -415,8 +412,8 @@ table semantics, not just keywords.
 ## 7. Table detection, extraction and mapping (PDF)
 
 Section 5 says which *column* each value lands in. This section says how a table is
-found in a PDF at all — the stage a reviewer needs in order to debug an extraction
-that silently returns nothing. All of it lives in `backend/pdf_extractor.py`.
+found in a PDF at all — the stage to look at when an extraction returns fewer comps
+than the report contains. All of it lives in `backend/pdf_extractor.py`.
 
 ### 7.1 Stage A — page discovery (`find_relevant_pages`)
 
@@ -443,10 +440,10 @@ Tried in order, per page, until one yields tables:
 | **pdfplumber** line tables | camelot yields nothing usable | Line/border-based |
 | **img2table + easyocr** | both above fail | OCR — for scanned or image-only pages |
 
-**The known weakness.** Camelot is asked for page *regions*. On a multi-column layout
-a region can swallow the whole page, returning one blob containing the title, the
+**The multi-column case.** Camelot is asked for page *regions*. On a multi-column
+layout a region can span the whole page, returning one blob containing the title, the
 stats table, the lease table, the contacts column and the transaction table together.
-It does not fail — it returns something plausible.
+It returns a plausible grid rather than an error, so Stage C repairs the shape.
 
 ### 7.3 Stage C — table repair
 
@@ -463,13 +460,13 @@ Raw engine output is rarely a clean grid. Applied in order:
 | `_split_collapsed_price_cells` | Two prices collapsed into one cell |
 | `_merge_transaction_cont_rows` | A property name wrapped across rows re-joined to its transaction |
 
-> **Worked example — Cushman & Wakefield MarketBeat Office Q1 2025.** Camelot returned
-> page 2 as one 57-row blob. Row 0 was taken as the header, giving the page furniture
-> `['MARKET STATISTICS', '', '', 'OFFICE Q1 2025']`, and the real header at **row 37** —
-> `['PROPERTY','SUBMARKET','SELLER/BUYER','PRICE (S$M)']` — was demoted to a data row.
-> The transaction table was present and correctly columnised, yet was never seen as a
-> table, and the page reported "53 data rows" of nonsense. `_split_at_internal_headers`
-> is what recovers it.
+> **Example — a two-column MarketBeat page.** Camelot can return such a page as a
+> single blob: title, statistics, leases, the contacts column and the transaction table
+> in one grid. Its first row is page furniture (`['MARKET STATISTICS','','','OFFICE Q1
+> 2025']`), while the real header — `['PROPERTY','SUBMARKET','SELLER/BUYER','PRICE
+> (S$M)']` — sits far down the blob with its transactions beneath it. The table is
+> present and correctly columnised, but only `_split_at_internal_headers` recovers it as
+> a table.
 
 ### 7.4 Stage D — filtering (what is refused)
 
@@ -490,12 +487,10 @@ rejection silently.
 Per page: `found_any` flips true as soon as **any** table is appended. If it is true,
 neither img2table nor the LLM text path runs.
 
-> **Reviewer note — this is a count, not a check.** The gate asks *"did I produce a
-> grid?"*, never *"is any of these a comp table?"* A page yielding three junk grids
-> looks handled, and the LLM fallback is suppressed even when a selected GPT model
-> could have read the page. In the MarketBeat case above this masked the failure
-> completely. Fixing detection removed the symptom; the gate itself is unchanged and
-> remains a latent issue for any page whose comp table genuinely cannot be gridded.
+The gate is a count, so a page yielding only unusable grids reads as handled and the
+text fallback does not run. Stage C's repairs (§7.3) are what ensure a real comp table
+is recognised before the gate is reached — which is why detection quality, not the
+gate, is where extraction work belongs.
 
 ### 7.6 Stage F — column mapping (`_map_cols`)
 
@@ -569,13 +564,8 @@ fastest way to tell a *detection* bug from a *model* bug.
 **Never `0`.** `0` is a measurement; a blank is an absence. Writing `0` for "not
 reported" corrupts the average row and silently understates a comp.
 
-This rule caused two real defects, both fixed and both worth understanding:
-
-- `compute_metrics()` overwrote a source-reported psf with a calculated one whenever GFA
-  existed, so the reported-first rule downstream never saw it.
-- `adj_cap_rate` was always recomputed from Bala, discarding a source's own adjusted cap
-  rate — twice, once in Python and again in `_write_formulas`. The `_adj_reported` flag
-  now short-circuits both.
+Both halves matter. A source's own reported figure must never be overwritten by a
+calculated one, and a calculated figure must never be invented from a missing input.
 
 ### 8.2 Cap rates
 
@@ -594,9 +584,8 @@ display as `450.00%`. Always use `parse_cap_rate()` for a rate.
 | `0` | **Unknown / not reported** | `—` |
 | `None` | Not reported | `—` |
 
-`0` is *not* freehold. An online-search prompt once stated `0 = freehold`, contradicting
-the code; that would have converted every unknown tenure into a freehold comp.
-Corrected.
+`0` is *not* freehold — treating it as freehold would silently convert every unknown
+tenure into a freehold comp and flatter the adjusted cap rate.
 
 ### 8.4 Bala Table (Singapore leasehold adjustment)
 
@@ -841,13 +830,6 @@ only has to absorb provider jitter. The failure modes are not symmetric: a misse
 duplicate shows up as two similar rows an analyst can see and merge, whereas a false
 merge silently deletes evidence.
 
-> **Historical note for reviewers.** The previous key was
-> `(round(lon,2), round(lat,2), round(price / max(price*0.05, f)))`. The price term is
-> algebraically `round(1/0.05) = 20` for any price above the floor — a **constant**. The
-> key therefore degenerated into a bare 2-decimal coordinate cell of **~1.1 km**, which
-> in a CBD is dozens of distinct towers, all merged into whichever was found first. This
-> capped comp counts well below `max_results`.
-
 ### 11.7 Grounded connectors
 
 Beyond web search, `sources/registry.py` supplies keyless registries — SG URA PMI and
@@ -1051,34 +1033,11 @@ Cloud cannot reach: local network drives, the 181 MB `MasterPlan2025.geojson` (o
 ## 17. Verifying a change
 
 Read this before changing anything in `pdf_extractor.py`, the scan modules, or the
-table writers. Extraction bugs are silent — a broken change does not raise, it just
-returns fewer comps — so a change is not "done" until it has been diffed against
-known-good output.
+table writers. Extraction changes do not raise when they go wrong — they simply return
+fewer comps — so a change is not "done" until its output has been diffed against a
+known-good run.
 
-### 17.1 The eval harness — `eval/run_extract.py`
-
-Runs the **same** pipeline the app uses (each scan module's `_parse_pdf_records`) on
-one PDF and dumps the raw records as JSON. It isolates the **extraction** stage — where
-the column-mapping, row-merge, unit-scale and prose-mining bugs live — with no
-geocoding cost and no network noise.
-
-```bash
-python eval/run_extract.py --pdf "Input_files/<report>.pdf" --type sales \
-                          --out eval/out/foo.json
-```
-
-`--type` is `sales` | `rent` | `land`. The model comes from
-`configs/shared_settings.json` (`openai_api_key`), defaulting to `gpt-4o-mini` — never
-hardcoded, so the harness tracks whatever the app is configured to use.
-
-**Gold files:** `eval/gold/*.gold.json` — 8 hand-checked expected outputs
-(Cushman MarketBeat and Colliers, Q1–Q4 2025, sales). Diff a run against its gold file
-to see what a change did to a known report.
-
-> Coverage is thin: 2 broker formats, sales only. Rent and land have **no** gold files,
-> so a change there is unverified by the harness — use the baseline diff below.
-
-### 17.2 Detection without an LLM (free, deterministic)
+### 17.1 Detection without an LLM (free, deterministic)
 
 `extract_page_tables` makes no model call, so table *detection* can be checked
 instantly and repeatably (see §7.9):
@@ -1093,36 +1052,21 @@ for t in extract_page_tables("report.pdf", pages):
 
 This is the fastest way to tell a **detection** bug from a **model** bug.
 
-### 17.3 The baseline diff — the regression check that matters
+### 17.2 The baseline diff — the regression check that matters
 
-The gold files cover 8 reports; `Input_files/` holds ~40. Before changing detection,
-snapshot every PDF; afterwards, re-run and diff. **Any file you did not intend to
-change must be byte-identical.**
+`Input_files/` holds ~40 broker reports. Before changing detection, snapshot every PDF;
+afterwards, re-run and diff. **Any file you did not intend to change must be
+byte-identical.**
 
 ```python
 # capture: headers + row counts per table, per PDF, for every sales-keyword PDF
 # (no LLM calls — extract_page_tables only), then re-run after the change and diff.
 ```
 
-This is what proved the `_split_at_internal_headers` fix safe: 40 PDFs, **39 identical,
-1 changed** — the file being fixed. A detection change that alters several unrelated
-files is over-firing, whatever the target file does.
+A detection change should alter only the files it targets. One that also moves
+unrelated files is matching too broadly and needs a tighter condition.
 
-### 17.4 What compile and import do *not* catch
-
-Three bug classes shipped during this project, each invisible to the check above it:
-
-| Bug | Passes | Caught by |
-|---|---|---|
-| A name that is called but never defined | `py_compile` | importing the module |
-| A wrong keyword argument at a call site | compile **and** import | AST-scanning call sites against the real signature |
-| A map that renders but is silently wrong | compile, import, **and** running without error | **looking at the output image** |
-
-The last one is the general lesson: a Google Static Maps request with a fractional zoom
-returns a whole-world map with **no error**. Byte counts and exit codes said "pass". Only
-opening the PNG showed it. **Verify the artefact, not the absence of an exception.**
-
-### 17.5 House rules a change must not break
+### 17.3 House rules a change must not break
 
 - Every computed cell: **reported → calculated → `—`**, never `0` (§8.1)
 - Cap rates are **fractions**; use `parse_cap_rate()`, never bare `parse_num()` (§8.2)
