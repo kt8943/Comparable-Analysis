@@ -34,8 +34,9 @@ whether the value was **mapped** from a source, **calculated** by a rule, or
 14. [Word output format](#14-word-output-format)
 15. [Configuration reference](#15-configuration-reference)
 16. [Deployment](#16-deployment)
-17. [Known limits and review notes](#17-known-limits-and-review-notes)
-18. [Technical limitations — where we need help](#18-technical-limitations--where-we-need-help)
+17. [Verifying a change](#17-verifying-a-change)
+18. [Known limits and review notes](#18-known-limits-and-review-notes)
+19. [Technical limitations — where we need help](#19-technical-limitations--where-we-need-help)
 
 ---
 
@@ -1047,31 +1048,119 @@ Cloud cannot reach: local network drives, the 181 MB `MasterPlan2025.geojson` (o
 
 ---
 
-## 17. Known limits and review notes
+## 17. Verifying a change
+
+Read this before changing anything in `pdf_extractor.py`, the scan modules, or the
+table writers. Extraction bugs are silent — a broken change does not raise, it just
+returns fewer comps — so a change is not "done" until it has been diffed against
+known-good output.
+
+### 17.1 The eval harness — `eval/run_extract.py`
+
+Runs the **same** pipeline the app uses (each scan module's `_parse_pdf_records`) on
+one PDF and dumps the raw records as JSON. It isolates the **extraction** stage — where
+the column-mapping, row-merge, unit-scale and prose-mining bugs live — with no
+geocoding cost and no network noise.
+
+```bash
+python eval/run_extract.py --pdf "Input_files/<report>.pdf" --type sales \
+                          --out eval/out/foo.json
+```
+
+`--type` is `sales` | `rent` | `land`. The model comes from
+`configs/shared_settings.json` (`openai_api_key`), defaulting to `gpt-4o-mini` — never
+hardcoded, so the harness tracks whatever the app is configured to use.
+
+**Gold files:** `eval/gold/*.gold.json` — 8 hand-checked expected outputs
+(Cushman MarketBeat and Colliers, Q1–Q4 2025, sales). Diff a run against its gold file
+to see what a change did to a known report.
+
+> Coverage is thin: 2 broker formats, sales only. Rent and land have **no** gold files,
+> so a change there is unverified by the harness — use the baseline diff below.
+
+### 17.2 Detection without an LLM (free, deterministic)
+
+`extract_page_tables` makes no model call, so table *detection* can be checked
+instantly and repeatably (see §7.9):
+
+```python
+from scan_input_sales_comps import _PDF_SECTION_KEYWORDS
+from pdf_extractor import find_relevant_pages, extract_page_tables
+pages = find_relevant_pages("report.pdf", _PDF_SECTION_KEYWORDS)
+for t in extract_page_tables("report.pdf", pages):
+    print(t["page_num"], t["headers"][:4], len(t["rows"]))
+```
+
+This is the fastest way to tell a **detection** bug from a **model** bug.
+
+### 17.3 The baseline diff — the regression check that matters
+
+The gold files cover 8 reports; `Input_files/` holds ~40. Before changing detection,
+snapshot every PDF; afterwards, re-run and diff. **Any file you did not intend to
+change must be byte-identical.**
+
+```python
+# capture: headers + row counts per table, per PDF, for every sales-keyword PDF
+# (no LLM calls — extract_page_tables only), then re-run after the change and diff.
+```
+
+This is what proved the `_split_at_internal_headers` fix safe: 40 PDFs, **39 identical,
+1 changed** — the file being fixed. A detection change that alters several unrelated
+files is over-firing, whatever the target file does.
+
+### 17.4 What compile and import do *not* catch
+
+Three bug classes shipped during this project, each invisible to the check above it:
+
+| Bug | Passes | Caught by |
+|---|---|---|
+| A name that is called but never defined | `py_compile` | importing the module |
+| A wrong keyword argument at a call site | compile **and** import | AST-scanning call sites against the real signature |
+| A map that renders but is silently wrong | compile, import, **and** running without error | **looking at the output image** |
+
+The last one is the general lesson: a Google Static Maps request with a fractional zoom
+returns a whole-world map with **no error**. Byte counts and exit codes said "pass". Only
+opening the PNG showed it. **Verify the artefact, not the absence of an exception.**
+
+### 17.5 House rules a change must not break
+
+- Every computed cell: **reported → calculated → `—`**, never `0` (§8.1)
+- Cap rates are **fractions**; use `parse_cap_rate()`, never bare `parse_num()` (§8.2)
+- Tenure: `999` = freehold → `FH`; `0` = **unknown**, not freehold (§8.3)
+- **Two grid readers** exist (`_read_excel_preview`, `_read_pgim_grid`). Any new column,
+  notice or format must be wired into **both**, or it appears in the preview and not the
+  Word export — or vice versa (§8.5)
+- Trust **tables**, not prose. `_from_text` records must keep `_prov: null` and their
+  `_llm_parsed` flag — never launder an inference into a fact (§7.7)
+- `skills/*.md` are specs, not code. Change the module; the spec can drift (§4.4)
+
+---
+
+## 18. Known limits and review notes
 
 Ranked by what a reviewer should look at first.
 
-1. **Credentials are embedded in `configs/`.** Every `deal_config_*.json` carries a live
-   Mapbox token, and `deal_config_*.json` is **not** git-ignored (only
-   `shared_settings.json` and `tmp*.json` are). The token is already in the local git
-   history. **Before sharing this folder in any form, strip the tokens or share via the
-   cloud repo, which contains no `configs/` at all.**
-2. **`configs/` accumulates temp files.** ~800 `tmp*.json` from a failed cleanup path,
-   each carrying the Mapbox token. Safe to delete; the generating path should clean up
-   after itself.
-3. **The city tier is a radius, not a boundary** (§11.1). Documented, not fixed — fixing it
+1. **Credentials in `configs/`.** Deal configs no longer carry a map credential (the
+   Mapbox token moved to Shared Settings when geocoding split to Google), but ~800
+   `tmp*.json` left by a failed cleanup path still each contain the old token, and the
+   token remains in the local git history. `shared_settings.json` and `tmp*.json` are
+   git-ignored and the cloud repo holds no `configs/` at all — so **GitHub is clean**.
+   The exposure is only if this folder is copied or zipped. **Share via the cloud repo,
+   or clear `configs/tmp*.json` and rotate the token first.** The temp files are safe to
+   delete; the generating path should clean up after itself.
+2. **The city tier is a radius, not a boundary** (§11.1). Documented, not fixed — fixing it
    needs a locality field the geocoder does not return.
-4. **The query budget can bind before the ladder finishes** (§11.4). On a thin deal, 5
+3. **The query budget can bind before the ladder finishes** (§11.4). On a thin deal, 5
    queries may be spent before tier 3 runs, so a short comp set may reflect the budget
    rather than the market.
-5. **LLM classification is nondeterministic.** Two identical runs have returned different
+4. **LLM classification is nondeterministic.** Two identical runs have returned different
    property names from the same PDF. This is why extraction is table-first and
    prose-derived records are flagged.
-6. **Rationale quality depends on the market reports supplied.** With no reports the memo
+5. **Rationale quality depends on the market reports supplied.** With no reports the memo
    has little to anchor to, and the integrity rules will suppress rather than invent.
-7. **Bala adjustment is Singapore-only.** Global deals carry the FTM cap rate through
+6. **Bala adjustment is Singapore-only.** Global deals carry the FTM cap rate through
    unadjusted; confirm this is intended for non-SG reviews.
-8. **Location scoring is Singapore-only** and depends on the URA cache being present.
+7. **Location scoring is Singapore-only** and depends on the URA cache being present.
 
 ### Principles a reviewer should hold the code to
 
@@ -1083,7 +1172,7 @@ Ranked by what a reviewer should look at first.
 
 ---
 
-## 18. Technical limitations — where we need help
+## 19. Technical limitations — where we need help
 
 Four ceilings of the current design. Each needs a decision or a capability the project
 does not have today. Reviewer input wanted on all four.
