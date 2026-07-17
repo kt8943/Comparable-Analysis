@@ -237,6 +237,44 @@ def _hdr_has_price(headers: list) -> bool:
     return any(kw in joined for kw in ("price", "consideration", "value", "amount"))
 
 
+def _split_at_internal_headers(tables: list) -> list:
+    """Split a table that has a *comp* header row buried in its middle.
+
+    Camelot is asked for page regions, but on a multi-column layout a region can
+    swallow the whole page: title, stats, leases and the transaction table arrive
+    as ONE blob. The blob's first row is then taken as the header (giving page
+    furniture like ['MARKET STATISTICS', '', '', 'OFFICE Q1 2025']) and the real
+    header — e.g. ['PROPERTY','SUBMARKET','SELLER/BUYER','PRICE (S$M)'] at row 37 —
+    is demoted to a data row. The transaction table is present and correctly
+    columnised, but is never seen as a table.
+
+    A comp header found below row 0 therefore starts a NEW table. The split is
+    deliberately conservative: the row must look like column headers AND name both
+    a name-like and a price-like column, so ordinary ALL-CAPS data (a 'SUBMARKET'
+    value, a category label) cannot split a healthy table. That double condition is
+    what keeps this from firing on the tables that already work.
+    """
+    out = []
+    for tbl in tables:
+        if not tbl or len(tbl) < 2:
+            out.append(tbl)
+            continue
+        cuts = [i for i in range(1, len(tbl))
+                if _is_col_hdr_row(tbl[i])
+                and _hdr_has_name(tbl[i]) and _hdr_has_price(tbl[i])]
+        if not cuts:
+            out.append(tbl)
+            continue
+        bounds = [0] + cuts + [len(tbl)]
+        for a, b in zip(bounds, bounds[1:]):
+            seg = tbl[a:b]
+            if len(seg) >= 2:          # header + >=1 data row
+                out.append(seg)
+        print(f"      [blob-split] table split at row(s) {cuts} — a comp header "
+              f"(name+price) was buried inside a {len(tbl)}-row blob")
+    return out
+
+
 def _merge_h_fragments(tables: list) -> list:
     """
     Merge same-row-count tables that are horizontal fragments of one logical table.
@@ -1053,6 +1091,7 @@ def extract_page_tables(pdf_path: str, page_infos: list,
                               f"({sum(len(t) for t in _pp)} rows)")
                         raw_tbls = _pp
 
+        raw_tbls = _split_at_internal_headers(raw_tbls)
         print(f"    Page {page_num:>3}: {len(raw_tbls)} table(s) found")
 
         found_any = False
