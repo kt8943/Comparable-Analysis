@@ -21,20 +21,21 @@ whether the value was **mapped** from a source, **calculated** by a rule, or
 1. [Quick start](#1-quick-start)
 2. [Architecture](#2-architecture)
 3. [Repository layout](#3-repository-layout)
-3b. [The engine — orchestrator, agents, tools, skills](#3b-the-engine--orchestrator-agents-tools-skills)
-4. [The pipeline, end to end](#4-the-pipeline-end-to-end)
-5. [Column reference — how every cell is produced](#5-column-reference--how-every-cell-is-produced)
-6. [Calculation rules](#6-calculation-rules)
-7. [The Location column — how it is generated](#7-the-location-column--how-it-is-generated)
-8. [Map generation](#8-map-generation)
-9. [Online search rules](#9-online-search-rules)
-10. [Investment rationale rules](#10-investment-rationale-rules)
-11. [Source audit](#11-source-audit)
-12. [Word output format](#12-word-output-format)
-13. [Configuration reference](#13-configuration-reference)
-14. [Deployment](#14-deployment)
-15. [Known limits and review notes](#15-known-limits-and-review-notes)
-16. [Technical limitations — where we need help](#16-technical-limitations--where-we-need-help)
+4. [The engine — orchestrator, agents, tools, skills](#4-the-engine--orchestrator-agents-tools-skills)
+5. [The pipeline, end to end](#5-the-pipeline-end-to-end)
+6. [Column reference — how every cell is produced](#6-column-reference--how-every-cell-is-produced)
+7. [Table detection, extraction and mapping (PDF)](#7-table-detection-extraction-and-mapping-pdf)
+8. [Calculation rules](#8-calculation-rules)
+9. [The Location column — how it is generated](#9-the-location-column--how-it-is-generated)
+10. [Map generation](#10-map-generation)
+11. [Online search rules](#11-online-search-rules)
+12. [Investment rationale rules](#12-investment-rationale-rules)
+13. [Source audit](#13-source-audit)
+14. [Word output format](#14-word-output-format)
+15. [Configuration reference](#15-configuration-reference)
+16. [Deployment](#16-deployment)
+17. [Known limits and review notes](#17-known-limits-and-review-notes)
+18. [Technical limitations — where we need help](#18-technical-limitations--where-we-need-help)
 
 ---
 
@@ -145,7 +146,7 @@ PGIM-CompAnalysis/
 
 ---
 
-## 3b. The engine — orchestrator, agents, tools, skills
+## 4. The engine — orchestrator, agents, tools, skills
 
 Sections 4–12 describe what the pipeline *produces*. This section describes what
 *drives* it. Four layers, with one rule deciding which is used where:
@@ -164,7 +165,7 @@ messy broker PDF actually yielded usable comps is uncertain — an agent does th
 | **Tools** | `backend/tools/*.py` | Deterministic work — maths, parsing, geo, I/O |
 | **Skills** | `backend/skills/*/skill.md` | Written specs for each capability (see the caveat below) |
 
-### 3b.1 Orchestrator — `orchestrator.py` (148 lines)
+### 4.1 Orchestrator — `orchestrator.py` (148 lines)
 
 Rule-based, not an LLM. Given a deal config and the inputs present, it returns an
 explicit, auditable **plan**: which agent performs which task with which tool, in what
@@ -175,7 +176,7 @@ It is deliberately not an LLM picking steps: the routing is a known path
 (file type → scan tool, reports → rationale). The orchestrator names the agents and
 tools; **the agents own the judgment**.
 
-### 3b.2 Agents — narrow, bounded, three of them
+### 4.2 Agents — narrow, bounded, three of them
 
 **`comp_classifier.py` (314 lines) — "what type(s) is this file?"**
 Deterministic-first, and **multi-label**: one broker PDF may hold both a land table and
@@ -194,19 +195,19 @@ came back empty → try online search). Its rules:
 - **deterministic scoring**; the LLM is used *only* for the reflection step
 - **bounded and auditable** — every decision returns a small typed dict
 
-**Rationale writer — `generate_investment_rationale.py`** — the prose itself (§10).
+**Rationale writer — `generate_investment_rationale.py`** — the prose itself (§12).
 
-### 3b.3 Tools — `backend/tools/` (14 modules)
+### 4.3 Tools — `backend/tools/` (14 modules)
 
 The deterministic library. Every scan and search script imports from here; nothing
 forks its own copy.
 
 | Tool | Responsibility |
 |---|---|
-| `house_rules.py` | Comp-search policy — the single source of truth (§9) |
+| `house_rules.py` | Comp-search policy — the single source of truth (§11) |
 | `calculations.py` | `bala_factor`, `parse_cap_rate`, `haversine_km`, `find_same_building` |
 | `column_mapper.py` | 3-tier input-header → field mapping + unit multipliers |
-| `location_score.py` | The Location column for SG comps (§7) |
+| `location_score.py` | The Location column for SG comps (§9) |
 | `ura_landuse.py`, `ura_zone.py` | URA Master Plan lookups, local — no network at scoring time |
 | `excel_reader.py` | Sheet detection, header finding, cell parsing |
 | `llm_client.py` | Ollama wrappers + the agent loop (`run_agent_loop`, `apply_refinement`) |
@@ -217,7 +218,7 @@ forks its own copy.
 | `report_period.py` | Report period / fiscal-quarter parsing |
 | `corp_ssl.py` | Corporate SSL interception handling |
 
-### 3b.4 Skills — `backend/skills/*/skill.md` (19 specs)
+### 4.4 Skills — `backend/skills/*/skill.md` (19 specs)
 
 Each capability has a Markdown spec with YAML front-matter:
 
@@ -252,7 +253,7 @@ comp type), `classify_*_comps`, `parse_input_excel`, `extract_comps_from_pdf`,
 
 ---
 
-## 4. The pipeline, end to end
+## 5. The pipeline, end to end
 
 ### Stage 0 — New deal setup
 
@@ -261,7 +262,7 @@ cap rate, tenure. An LLM derives `country_name`, `currency`, `gfa_unit`,
 `land_zoning`, `location`, `submarket_keywords`, and `asset_search_keyword`. Written
 to `configs/deal_config_<Deal>.json`.
 
-Deal configs **do not** carry comp-search settings — those are house rules (§9). A deal
+Deal configs **do not** carry comp-search settings — those are house rules (§11). A deal
 may override any of them by adding the key to its own `online_search` / `rent_search` /
 `land_search` block.
 
@@ -304,7 +305,7 @@ Records extracted from **prose** rather than a detected table grid are tagged
 `_llm_parsed` and surfaced in the UI as an AI-judgment notice, because a table grid is
 evidence and a sentence is an inference.
 
-**B. Online path** (`search_online_*.py`) — see §9.
+**B. Online path** (`search_online_*.py`) — see §11.
 
 ### Stage 2 — Classification
 
@@ -341,12 +342,12 @@ log as noise.
 
 ---
 
-## 5. Column reference — how every cell is produced
+## 6. Column reference — how every cell is produced
 
 Legend: **Mapped** = taken from the source. **Calculated** = deterministic Python or a
 live Excel formula. **Generated** = produced by a model or a scoring rule.
 
-### 5.1 Transaction Comparables — Asset Sales
+### 6.1 Transaction Comparables — Asset Sales
 
 Schema: `backend/generate_sales_comps_table.py` → `OUTPUT_SCHEMA`
 
@@ -364,45 +365,45 @@ Schema: `backend/generate_sales_comps_table.py` → `OUTPUT_SCHEMA`
 | 10 | Price (SGD psf GFA) | `price_psf_gfa` | **Calculated** | **Reported first.** Only if the source gives no unit price: `round(price_m / stake × 1e6 / gfa)`. Missing input → `—` |
 | 11 | FTM NOI Cap Rate | `ftm_cap_rate` | Mapped | `parse_cap_rate()` normalises to a **fraction** (`4.5%` → `0.045`) because the cell format is `0.00%`. Displays `4.50%` |
 | 12 | Adj. Cap Rate | `adj_cap_rate` | **Calculated** | **Reported first.** Else a live Excel formula: `=IFERROR(I×Bala(comp_yrs)/Bala(subj_yrs),"—")`. Global (non-SG) deals skip Bala and carry FTM through |
-| 13 | Location | `location` | **Generated** | SG: URA proximity score → `Superior` / `Comparable` / `Inferior` (§7). Non-SG: LLM classification |
+| 13 | Location | `location` | **Generated** | SG: URA proximity score → `Superior` / `Comparable` / `Inferior` (§9). Non-SG: LLM classification |
 | 14 | Quality | `quality` | Generated | LLM. Office: `Grade A+/A/B`. Logistics: `Grade A (Modern)` / `Cold Storage` / … |
 | 15 | Asset Type | `asset_type` | Generated | LLM, `"<Sale Structure> (<Use>)"` e.g. `Block Sale (Office)` |
 | — | Stake % | `stake_pct` | Mapped | Hidden column, one past the last visible. Feeds the psf calculation |
 
-### 5.2 Rent Comparables
+### 6.2 Rent Comparables
 
 Schema: `backend/generate_rent_comps_table.py` → `RENT_SCHEMA_BASE`
 
 | # | Column | Field | Origin | Rule |
 |---|---|---|---|---|
-| 1–4 | Type / Source / Property / Map Marker | — | — | As §5.1 |
+| 1–4 | Type / Source / Property / Map Marker | — | — | As §6.1 |
 | 5 | Date of Lease Start | `lease_date` | Mapped | Free text as reported |
 | 6 | Leased GLA (SF) | `nla_sf` | Mapped | Required — a record without it is dropped at extraction |
 | 7 | Lease Tenure (Yrs) | `lease_term_yrs` | Mapped | Drives the effective-rent calculation |
 | 8 | Gross Face Rents (SGD psf pm) | `asking_rent` | Mapped | Required (or `eff_rent`) |
 | 9 | Effective Rents (SGD psf pm) | `eff_rent` | **Calculated** | **Reported first.** Else `compute_eff_rent()` amortises the rent-free period over the lease term |
-| 10 | Location | `location` | Generated | §7 |
+| 10 | Location | `location` | Generated | §9 |
 | 11 | Quality | `quality` | Generated | LLM |
 | 12 | Tenant | `tenant` | Mapped | As reported |
 | 13 | Type of Lease Area / Comments | `lease_type` | Mapped/Generated | Source text, else LLM label (`Whole Floor (Office)`) |
 
-### 5.3 Land Sale Comparables
+### 6.3 Land Sale Comparables
 
 Schema: `backend/generate_land_comps_table.py` → `LAND_SCHEMA_BASE`
 
 | # | Column | Field | Origin | Rule |
 |---|---|---|---|---|
-| 1–3 | Type / Source / Property | — | — | As §5.1 |
+| 1–3 | Type / Source / Property | — | — | As §6.1 |
 | 4 | Map Marker | `map_marker` | Generated | 1-based index after the **distance** sort (not relevance) — land comps rank by proximity |
 | 5 | Date of Launch | `launch_date` | Mapped | Tender launch, not award |
 | 6 | Land Zoning | `land_zoning` | Mapped | As reported; falls back to the subject's zoning |
-| 7 | Land Tenure (Y) | `tenure_yrs` | Calculated | As §5.1 #7; `999` → `FH` |
+| 7 | Land Tenure (Y) | `tenure_yrs` | Calculated | As §6.1 #7; `999` → `FH` |
 | 8 | Site Area (SF) | `site_area_sf` | Mapped | Land area, not GFA |
 | 9 | Max GFA (SF) | `max_gfa_sf` | Mapped | Permissible GFA, i.e. site area × plot ratio when reported that way |
 | 10 | Price (SGD M) | `price_sgd_m` | Mapped | Tender/award price |
 | 11 | Price (SGD psf ppr) | `price_psf_ppr` | **Calculated** | **Reported first.** Else `price ÷ max_gfa` (per plot ratio, not site area) |
 | 12 | Adj. Price (SGD psf ppr) | `adj_price_psf` | **Calculated** | Bala-adjusted to the subject's tenure |
-| 13–15 | Location / Quality / Comment | | Generated | §7 + LLM |
+| 13–15 | Location / Quality / Comment | | Generated | §9 + LLM |
 
 **Land tables are excluded from asset-sales extraction.** A GLS or land table appearing
 in a broker PDF must not populate the asset-sales comp set; the extractor filters on
@@ -410,9 +411,153 @@ table semantics, not just keywords.
 
 ---
 
-## 6. Calculation rules
+## 7. Table detection, extraction and mapping (PDF)
 
-### 6.1 Precedence — applies to every computed cell
+Section 5 says which *column* each value lands in. This section says how a table is
+found in a PDF at all — the stage a reviewer needs in order to debug an extraction
+that silently returns nothing. All of it lives in `backend/pdf_extractor.py`.
+
+### 7.1 Stage A — page discovery (`find_relevant_pages`)
+
+Every page's text is scanned for section-heading phrases (`Key Sales Transactions`,
+`Investment Sales`, `Notable Transactions`, …). Two tiers:
+
+1. **Keyword** — the phrase appears in the page text.
+2. **Embedding** — cosine similarity ≥ `0.60` against the keyword corpus, so a
+   semantically equivalent heading ("Headline Deals" ≈ "Key Transactions") is caught
+   without an exact substring. Applied **only to pages that already contain a table**,
+   to limit false positives.
+
+Returns `{page_num, section_title, matched_keywords, has_table, text_preview}`. Pages
+that match nothing are never opened again — so a heading this stage misses is a table
+the pipeline can never find.
+
+### 7.2 Stage B — table detection engines
+
+Tried in order, per page, until one yields tables:
+
+| Engine | When | Notes |
+|---|---|---|
+| **camelot** | first | Region-based. Detects ruled sections and extracts each |
+| **pdfplumber** line tables | camelot yields nothing usable | Line/border-based |
+| **img2table + easyocr** | both above fail | OCR — for scanned or image-only pages |
+
+**The known weakness.** Camelot is asked for page *regions*. On a multi-column layout
+a region can swallow the whole page, returning one blob containing the title, the
+stats table, the lease table, the contacts column and the transaction table together.
+It does not fail — it returns something plausible.
+
+### 7.3 Stage C — table repair
+
+Raw engine output is rarely a clean grid. Applied in order:
+
+| Repair | Fixes |
+|---|---|
+| `_split_at_internal_headers` | **A comp header buried inside a blob starts a new table.** Requires the row to look like column headers *and* name both a name-like and a price-like column, so ALL-CAPS data cannot split a healthy table |
+| `_merge_h_fragments` | A table horizontally shredded into fragments |
+| `_collapse_multirow_header` | A header spread over 2–6 rows collapsed into one |
+| Title-row promotion | A single-cell title row (`RECENT KEY LEASE TRANSACTIONS`) is dropped and the next row promoted to headers |
+| `_orphaned_hdr` | A header row separated from its data rows |
+| `_is_unit_subtitle_row` | A units row (`S$M`, `psf`) under the header, not data |
+| `_split_collapsed_price_cells` | Two prices collapsed into one cell |
+| `_merge_transaction_cont_rows` | A property name wrapped across rows re-joined to its transaction |
+
+> **Worked example — Cushman & Wakefield MarketBeat Office Q1 2025.** Camelot returned
+> page 2 as one 57-row blob. Row 0 was taken as the header, giving the page furniture
+> `['MARKET STATISTICS', '', '', 'OFFICE Q1 2025']`, and the real header at **row 37** —
+> `['PROPERTY','SUBMARKET','SELLER/BUYER','PRICE (S$M)']` — was demoted to a data row.
+> The transaction table was present and correctly columnised, yet was never seen as a
+> table, and the page reported "53 data rows" of nonsense. `_split_at_internal_headers`
+> is what recovers it.
+
+### 7.4 Stage D — filtering (what is refused)
+
+| Filter | Refuses |
+|---|---|
+| `reject_table_headers` | Out-of-scope tables by header marker. Asset-sales runs pass the GLS/land markers (`successful tender`, `psf ppr`, `per plot ratio`, …) so a land table is refused |
+| `_is_prose_table` | A block of prose the engine mistook for a grid |
+| `_has_header_row` | A grid with no identifiable header |
+| Summary-table filtering | Market-statistics and total rows (`CBD GRADE A TOTAL`) |
+
+A **deliberately rejected** table sets `_had_rejected_table`, which **suppresses the
+text fallback** for that page. Without it, a land table correctly refused as a grid
+would be re-mined straight out of the page's prose and leak back in — undoing the
+rejection silently.
+
+### 7.5 Stage E — the fallback gate
+
+Per page: `found_any` flips true as soon as **any** table is appended. If it is true,
+neither img2table nor the LLM text path runs.
+
+> **Reviewer note — this is a count, not a check.** The gate asks *"did I produce a
+> grid?"*, never *"is any of these a comp table?"* A page yielding three junk grids
+> looks handled, and the LLM fallback is suppressed even when a selected GPT model
+> could have read the page. In the MarketBeat case above this masked the failure
+> completely. Fixing detection removed the symptom; the gate itself is unchanged and
+> remains a latent issue for any page whose comp table genuinely cannot be gridded.
+
+### 7.6 Stage F — column mapping (`_map_cols`)
+
+Table headers → schema fields via `tools/column_mapper.py`, three tiers, LLM last:
+**exact synonym → embedding similarity → LLM**. `detect_unit_multiplier()` reads the
+header text for units (sqm→SF, S$000→S$M, psm→psf) and returns a per-field multiplier,
+so values normalise without a second pass.
+
+### 7.7 Stage G — record assembly and provenance
+
+Two paths, and **the difference is the audit trail**:
+
+| Path | When | Provenance |
+|---|---|---|
+| `_from_table` | a grid survived | **`_prov`** per field — table, row, col, header, cell. Every value was *read out of a cell* |
+| `_from_text` | no grid on this page | **`_prov: null`** + `_llm_parsed`. The LLM decided where each value starts and ends, reading unstructured text |
+
+`_from_text` records surface in the UI as the AI-judgment notice. That is the honest
+signal: a grid is evidence, a sentence is an inference. `_from_text` applies the same
+`reject_table_headers` check, so an out-of-scope table cannot re-enter through prose.
+
+### 7.8 Stage H — record qualification
+
+A row must survive all of:
+
+| Check | Drops |
+|---|---|
+| `_is_real_candidate` | Rows with no name, or no price value |
+| `_is_category_label` | `Office`, `Retail` — a section label, not a property |
+| `_is_sentence_fragment` | Prose caught as a name |
+| `_skip_subject` | The subject property itself |
+
+### 7.9 Debugging a table that will not extract
+
+In order:
+
+1. **Did Stage A find the page?** The run log prints `Page N: '<title>' keywords=[…]`.
+   No line ⇒ a heading problem, not a table problem.
+2. **What did Stage B return?** `Page N: X table(s) found`, then per table
+   `table i: N data rows, headers=[…]`. Headers that read like page furniture
+   (`MARKET STATISTICS`, `OFFICE Q1 2025`) mean a blob was mistaken for a table.
+3. **Was it refused?** Look for `skipping table (header matched reject list)` or
+   `only out-of-scope table(s) found`.
+4. **Did the fallback fire?** `camelot found no tables — trying img2table`. If absent
+   while your table is missing, the gate was satisfied by a junk grid (§7.5).
+5. **Reproduce without the UI or an LLM:**
+
+```python
+from scan_input_sales_comps import _PDF_SECTION_KEYWORDS
+from pdf_extractor import find_relevant_pages, extract_page_tables
+pages = find_relevant_pages("report.pdf", _PDF_SECTION_KEYWORDS)
+for t in extract_page_tables("report.pdf", pages):
+    print(t["page_num"], t["headers"], len(t["rows"]))
+```
+
+Because `extract_page_tables` makes no LLM call, this is free and deterministic — the
+fastest way to tell a *detection* bug from a *model* bug.
+
+---
+
+## 8. Calculation rules
+
+### 8.1 Precedence — applies to every computed cell
 
 ```
 1. Reported directly by the source   → use it as-is
@@ -431,7 +576,7 @@ This rule caused two real defects, both fixed and both worth understanding:
   rate — twice, once in Python and again in `_write_formulas`. The `_adj_reported` flag
   now short-circuits both.
 
-### 6.2 Cap rates
+### 8.2 Cap rates
 
 Stored as **fractions** (`0.045`), never percentages, because Excel cells use the
 `0.00%` format. `parse_cap_rate()` normalises: a value `≥ 1` is divided by 100.
@@ -439,7 +584,7 @@ Stored as **fractions** (`0.045`), never percentages, because Excel cells use th
 `parse_num()` alone strips `%` **without** rescaling — `"4.5%"` would become `4.5` and
 display as `450.00%`. Always use `parse_cap_rate()` for a rate.
 
-### 6.3 Tenure and the freehold convention
+### 8.3 Tenure and the freehold convention
 
 | Value | Meaning | Displays |
 |---|---|---|
@@ -452,7 +597,7 @@ display as `450.00%`. Always use `parse_cap_rate()` for a rate.
 the code; that would have converted every unknown tenure into a freehold comp.
 Corrected.
 
-### 6.4 Bala Table (Singapore leasehold adjustment)
+### 8.4 Bala Table (Singapore leasehold adjustment)
 
 `bala_factor(n)` in `tools/calculations.py`, from the SLA/SISV table:
 
@@ -467,7 +612,7 @@ reviewer can change a tenure and see the adjusted cap rate move.
 
 Singapore only. Global deals carry the FTM cap rate through unadjusted.
 
-### 6.5 Preview and export number formatting
+### 8.5 Preview and export number formatting
 
 One shared formatter, `_fmt_grid_val(cell, header)`:
 
@@ -482,7 +627,7 @@ be wired into **both**, or it will appear in one place and not the other.
 
 ---
 
-## 7. The Location column — how it is generated
+## 9. The Location column — how it is generated
 
 `backend/tools/location_score.py`. For Singapore comps this column is a **computed
 score**, not an LLM opinion.
@@ -528,7 +673,7 @@ data is Singapore-only.
 
 ---
 
-## 8. Map generation
+## 10. Map generation
 
 `backend/generate_comps_map_base.py` → `render_map()`, wrapped per comp type.
 
@@ -536,7 +681,7 @@ data is Singapore-only.
 resolves the coordinates; Mapbox draws the PNG. They share no credential and neither
 falls back to the other.
 
-### 8.1 Geocoding providers — Google
+### 10.1 Geocoding providers — Google
 
 `geocode_any()` selects on `shared_settings.geocoding_provider`, **falling back to
 Google** if the chosen provider fails or is misconfigured:
@@ -557,7 +702,7 @@ hit, so callers pass a descending-specificity list:
 config. There is deliberately **no address-sniffing heuristic** — a wrong country guess
 silently geocodes a comp onto the wrong continent.
 
-### 8.2 Rendering — Mapbox
+### 10.2 Rendering — Mapbox
 
 The map is a **Mapbox Static Images API** PNG — not an interactive widget — so it drops
 straight into Word and Excel. The token comes from `shared_settings.mapbox_token` /
@@ -595,7 +740,7 @@ were dropped.
 
 ---
 
-## 9. Online search rules
+## 11. Online search rules
 
 Policy lives in **`backend/tools/house_rules.py`** — one file, applied to every deal,
 existing and new, local and cloud. Deal configs do not carry these settings.
@@ -608,7 +753,7 @@ A deal that genuinely needs different numbers sets the key in its own `online_se
 `rent_search` / `land_search` block, and that wins. Config always beats code: nothing in
 the module overrides a value a deal explicitly states.
 
-### 9.1 The location ladder
+### 11.1 The location ladder
 
 | Tier | Radius | Escalates when |
 |---|---|---|
@@ -627,7 +772,7 @@ for a larger one.
 **Tier 3 has no radius.** Country containment comes from the country-scoped geocode and
 country-scoped queries, not from a distance test.
 
-### 9.2 Recency — independent of the ladder
+### 11.2 Recency — independent of the ladder
 
 | Comp type | `recency_months` |
 |---|---|
@@ -640,7 +785,7 @@ Unparseable dates are **kept**, not dropped; every drop is logged.
 
 Widening the search *area* never widens the *date window*.
 
-### 9.3 `years_back` vs `recency_months` — different things
+### 11.3 `years_back` vs `recency_months` — different things
 
 They act at opposite ends of the pipeline and nothing links them:
 
@@ -653,7 +798,7 @@ Setting `years_back_max` past `recency_months / 12` therefore buys rows that are
 discarded. `warn_window_vs_recency()` reports that conflict in the run log and
 deliberately does **not** silently change either number.
 
-### 9.4 Cost budget
+### 11.4 Cost budget
 
 `max_queries` = **5** per category. One query = **1 web search + 1 extract call**.
 
@@ -673,12 +818,12 @@ A healthy deal costs far less — the ladder stops as soon as a tier returns
 `--refresh` is passed. Note that on a thin deal the budget, not the ladder, is the
 binding constraint: 5 queries may be spent before tier 3 is reached.
 
-### 9.5 Result limits
+### 11.5 Result limits
 
 `max_results` = **15** per category, applied **after** classification so the cap keeps
 the most relevant comps (nearest, for land).
 
-### 9.6 Cross-source dedup
+### 11.6 Cross-source dedup
 
 Two mechanisms:
 
@@ -702,7 +847,7 @@ merge silently deletes evidence.
 > in a CBD is dozens of distinct towers, all merged into whichever was found first. This
 > capped comp counts well below `max_results`.
 
-### 9.7 Grounded connectors
+### 11.7 Grounded connectors
 
 Beyond web search, `sources/registry.py` supplies keyless registries — SG URA PMI and
 URA GLS via data.gov.sg, plus broker reports. Enable per deal with
@@ -711,11 +856,11 @@ dedup → geocode → recency pipeline, capped at the city tier.
 
 ---
 
-## 10. Investment rationale rules
+## 12. Investment rationale rules
 
 `backend/generate_investment_rationale.py`. Two LLM calls: prose, then audit.
 
-### 10.1 Structure — exactly four sections
+### 12.1 Structure — exactly four sections
 
 | # | Theme | Content |
 |---|---|---|
@@ -734,7 +879,7 @@ lead angle for office / industrial / data centre / retail / hospitality / mixed.
 Titles are model-written, 6–9 words, derived from the data actually found. Each section
 is 2 paragraphs (3 only if the data supports a third distinct point), 80–130 words each.
 
-### 10.2 Integrity rules
+### 12.2 Integrity rules
 
 - **Evidence discipline** — every conclusion anchors to a specific figure or named fact
   from the research. Plain assertions are not permitted. No paragraph may be all numbers
@@ -751,7 +896,7 @@ is 2 paragraphs (3 only if the data supports a third distinct point), 80–130 w
   fires at the start of a paragraph, so prose that legitimately says "capital markets
   remain liquid" is untouched.
 
-### 10.3 Location context
+### 12.3 Location context
 
 One `gpt-4o-mini-search-preview` call per run asks what published sources say about the
 subject's connectivity and precinct. It is **qualitative by construction**: the prompt
@@ -763,7 +908,7 @@ If nothing is found, the block is omitted and section 2 falls back to demand dri
 rather than asserting anything unsourced. Claims that match this block are cited to
 their source URL in the audit with citation type `Web Search`.
 
-### 10.4 Extraction and caching
+### 12.4 Extraction and caching
 
 `pypdf` reads each page with a `[PAGE N]` marker. Text is truncated at 14,000 chars
 keeping the **first 75% + last 25%** — executive summary and conclusions, dropping the
@@ -772,7 +917,7 @@ instantly.
 
 ---
 
-## 11. Source audit
+## 13. Source audit
 
 Every specific claim in the finished prose is extracted and matched to a source. Written
 to `Source_Audit.xlsx` (12 columns), rows needing manual verification highlighted red.
@@ -802,11 +947,11 @@ different things in each.
 
 ---
 
-## 12. Word output format
+## 14. Word output format
 
 `_build_combined_docx()` in `frontend/app.py` produces one document per deal.
 
-### 12.1 Page setup
+### 14.1 Page setup
 
 | Property | Value |
 |---|---|
@@ -816,7 +961,7 @@ different things in each.
 | Body font | **Arial Narrow 10 pt**, forced across the whole document |
 | Section headings | Arial 11 pt, navy |
 
-### 12.2 Document order
+### 14.2 Document order
 
 1. Deal name (Heading 0) + address
 2. For each comp type present — **Rent → Sales → Land** (`_COMP_TYPES` order):
@@ -828,7 +973,7 @@ different things in each.
 Comp types with no generated workbook are skipped silently; the document is built from
 whatever exists.
 
-### 12.3 The PGIM comp table
+### 14.3 The PGIM comp table
 
 Built natively as a Word table (not an image), so reviewers can edit it:
 
@@ -850,13 +995,13 @@ Built natively as a Word table (not an image), so reviewers can edit it:
 - Average row shaded `#D6DCE4`, bold; averages computed only over columns whose header
   matches that type's keywords (`psf`, `cap rate` / `tenure`)
 - Cell values come from `_read_pgim_grid` → `_fmt_grid_val`, so Word matches the
-  on-screen preview exactly (§6.5)
+  on-screen preview exactly (§8.5)
 
 ---
 
-## 13. Configuration reference
+## 15. Configuration reference
 
-### 13.1 `configs/shared_settings.json` — **secrets, never distribute**
+### 15.1 `configs/shared_settings.json` — **secrets, never distribute**
 
 Git-ignored. Contains `mapbox_token`, `google_maps_key`, `openai_api_key`,
 `kakao_api_key`, `onemap_email`, `onemap_password`, `ura_access_key`, and
@@ -865,7 +1010,7 @@ Git-ignored. Contains `mapbox_token`, `google_maps_key`, `openai_api_key`,
 On Streamlit Cloud these come from Streamlit Secrets; `_bootstrap_cloud_secrets()` merges
 them into this file at startup.
 
-### 13.2 `configs/deal_config_<Deal>.json`
+### 15.2 `configs/deal_config_<Deal>.json`
 
 | Block | Purpose |
 |---|---|
@@ -877,7 +1022,7 @@ them into this file at startup.
 | `online_search` / `rent_search` / `land_search` | **Normally empty.** Only for per-deal overrides of a house rule, or `sources: [...]` to enable grounded connectors |
 | `output_file` | Drives the output directory |
 
-### 13.3 `backend/tools/house_rules.py` — comp-search policy
+### 15.3 `backend/tools/house_rules.py` — comp-search policy
 
 `HOUSE_RULES` (radii, `min_results`, `max_results`, `max_queries`, `years_back*`,
 `max_level`), `RECENCY_MONTHS` per comp type, `BY_ASSET_CLASS` radius overrides. Change a
@@ -885,7 +1030,7 @@ number here and every deal picks it up on the next run.
 
 ---
 
-## 14. Deployment
+## 16. Deployment
 
 Streamlit Cloud, from GitHub `kt8943/Comparable-Analysis`. Push to `main`; Cloud
 auto-redeploys.
@@ -902,7 +1047,7 @@ Cloud cannot reach: local network drives, the 181 MB `MasterPlan2025.geojson` (o
 
 ---
 
-## 15. Known limits and review notes
+## 17. Known limits and review notes
 
 Ranked by what a reviewer should look at first.
 
@@ -914,9 +1059,9 @@ Ranked by what a reviewer should look at first.
 2. **`configs/` accumulates temp files.** ~800 `tmp*.json` from a failed cleanup path,
    each carrying the Mapbox token. Safe to delete; the generating path should clean up
    after itself.
-3. **The city tier is a radius, not a boundary** (§9.1). Documented, not fixed — fixing it
+3. **The city tier is a radius, not a boundary** (§11.1). Documented, not fixed — fixing it
    needs a locality field the geocoder does not return.
-4. **The query budget can bind before the ladder finishes** (§9.4). On a thin deal, 5
+4. **The query budget can bind before the ladder finishes** (§11.4). On a thin deal, 5
    queries may be spent before tier 3 runs, so a short comp set may reflect the budget
    rather than the market.
 5. **LLM classification is nondeterministic.** Two identical runs have returned different
@@ -938,7 +1083,7 @@ Ranked by what a reviewer should look at first.
 
 ---
 
-## 16. Technical limitations — where we need help
+## 18. Technical limitations — where we need help
 
 Four ceilings of the current design. Each needs a decision or a capability the project
 does not have today. Reviewer input wanted on all four.
