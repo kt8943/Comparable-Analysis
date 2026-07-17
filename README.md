@@ -21,6 +21,7 @@ whether the value was **mapped** from a source, **calculated** by a rule, or
 1. [Quick start](#1-quick-start)
 2. [Architecture](#2-architecture)
 3. [Repository layout](#3-repository-layout)
+3b. [The engine — orchestrator, agents, tools, skills](#3b-the-engine--orchestrator-agents-tools-skills)
 4. [The pipeline, end to end](#4-the-pipeline-end-to-end)
 5. [Column reference — how every cell is produced](#5-column-reference--how-every-cell-is-produced)
 6. [Calculation rules](#6-calculation-rules)
@@ -140,6 +141,114 @@ PGIM-CompAnalysis/
 │
 └── output/<Deal>/                        Generated workbooks, maps, audit, docx
 ```
+
+
+---
+
+## 3b. The engine — orchestrator, agents, tools, skills
+
+Sections 4–12 describe what the pipeline *produces*. This section describes what
+*drives* it. Four layers, with one rule deciding which is used where:
+
+> **An agent where the path is uncertain; a deterministic tool where the path is
+> known.**
+
+That rule is why there is no general "AI agent" looping over the whole deal. Routing a
+`.xlsx` to the Excel scanner is a known path — a rule does it. Deciding whether a
+messy broker PDF actually yielded usable comps is uncertain — an agent does that.
+
+| Layer | Owns | Decides |
+|---|---|---|
+| **Orchestrator** | `orchestrator.py` | Which agent runs which task with which tool, in what order |
+| **Agents** | `comp_classifier.py`, `comp_acquisition_agent.py`, the rationale writer | The uncertain judgment inside one step |
+| **Tools** | `backend/tools/*.py` | Deterministic work — maths, parsing, geo, I/O |
+| **Skills** | `backend/skills/*/skill.md` | Written specs for each capability (see the caveat below) |
+
+### 3b.1 Orchestrator — `orchestrator.py` (148 lines)
+
+Rule-based, not an LLM. Given a deal config and the inputs present, it returns an
+explicit, auditable **plan**: which agent performs which task with which tool, in what
+order. It is pure and plannable — no Streamlit, no subprocess — so the frontend calls
+`build_plan()` both to *show* the plan and to *drive* execution.
+
+It is deliberately not an LLM picking steps: the routing is a known path
+(file type → scan tool, reports → rationale). The orchestrator names the agents and
+tools; **the agents own the judgment**.
+
+### 3b.2 Agents — narrow, bounded, three of them
+
+**`comp_classifier.py` (314 lines) — "what type(s) is this file?"**
+Deterministic-first, and **multi-label**: one broker PDF may hold both a land table and
+a sales table, and is routed to *each* matching scan (each type's reject-markers keep
+the tables apart). A file that reads like market research rather than a comp table is
+flagged `is_report` so the UI nudges it to the Market Reports box. This is what lets a
+user drop every file into one box.
+
+**`comp_acquisition_agent.py` (312 lines) — "did it work, and what next?"**
+A bounded **acquire → verify → evaluate → reflect → fallback** loop over the
+deterministic scan scripts. The frontend runs the scripts as tools; the agent verifies
+the result, scores quality, and on failure reflects to pick a fallback (e.g. file scan
+came back empty → try online search). Its rules:
+
+- **verify/flag only** — it never invents or "corrects" a number
+- **deterministic scoring**; the LLM is used *only* for the reflection step
+- **bounded and auditable** — every decision returns a small typed dict
+
+**Rationale writer — `generate_investment_rationale.py`** — the prose itself (§10).
+
+### 3b.3 Tools — `backend/tools/` (14 modules)
+
+The deterministic library. Every scan and search script imports from here; nothing
+forks its own copy.
+
+| Tool | Responsibility |
+|---|---|
+| `house_rules.py` | Comp-search policy — the single source of truth (§9) |
+| `calculations.py` | `bala_factor`, `parse_cap_rate`, `haversine_km`, `find_same_building` |
+| `column_mapper.py` | 3-tier input-header → field mapping + unit multipliers |
+| `location_score.py` | The Location column for SG comps (§7) |
+| `ura_landuse.py`, `ura_zone.py` | URA Master Plan lookups, local — no network at scoring time |
+| `excel_reader.py` | Sheet detection, header finding, cell parsing |
+| `llm_client.py` | Ollama wrappers + the agent loop (`run_agent_loop`, `apply_refinement`) |
+| `vision_llm.py` | Image → comp records |
+| `json_utils.py` | JSON repair for imperfect model output |
+| `geo_utils.py` | Geo sidecar writer (excludes credentials) |
+| `onemap_auth.py` | OneMap token handling |
+| `report_period.py` | Report period / fiscal-quarter parsing |
+| `corp_ssl.py` | Corporate SSL interception handling |
+
+### 3b.4 Skills — `backend/skills/*/skill.md` (19 specs)
+
+Each capability has a Markdown spec with YAML front-matter:
+
+```yaml
+name: classify_sales_comps
+description: Classify asset sales comp records with Ollama — assigns location,
+             quality, asset type, and relevance score; falls back to keyword rules
+type: atomic
+requires:
+  config_keys: [llm.ollama.base_url, subject_property.asset_class, ...]
+  skills: []
+allowed_tools:
+  - tools.llm_client.ollama_post
+  - tools.json_utils.fix_json
+```
+
+...followed by **When to use** and numbered **Instructions**.
+
+The 19 skills are `analyse_*_comps` and `search_online_*_comps` (composite, one per
+comp type), `classify_*_comps`, `parse_input_excel`, `extract_comps_from_pdf`,
+`extract_comps_from_image`, `compute_sales_metrics`, `bala_factor`,
+`generate_bala_table`, `geocode_and_map`, `generate_investment_rationale`,
+`setup_new_deal`, and `fix_json`.
+
+> **Caveat a reviewer must know: no Python code loads `skills/` at runtime.** They are
+> *specifications*, not executed units — the contract each capability is meant to
+> honour (its inputs, its permitted tools, its steps), and the substrate for an
+> agent runtime that can read them. The behaviour that actually ships lives in the
+> `.py` modules. **They can therefore drift from the code**, and nothing detects it.
+> Treat a `skill.md` as intent and the module as truth; if the two disagree, the
+> module wins and the spec is stale.
 
 ---
 
@@ -831,95 +940,42 @@ Ranked by what a reviewer should look at first.
 
 ## 16. Technical limitations — where we need help
 
-The items below are the known ceilings of the current design. They are not bugs to be
-patched; each needs a decision or capability the project does not have today. Input
-from reviewers is specifically wanted on all four.
+Four ceilings of the current design. Each needs a decision or a capability the project
+does not have today. Reviewer input wanted on all four.
 
-### 16.1 Extraction accuracy — can a model be trained for this?
+**1. Extraction accuracy — can a model be trained for this?**
+Comps arrive as broker PDFs, headerless "tables" of floating text, bespoke Excel
+sheets, and screenshots. Today a general-purpose model that has never seen our schema
+reads them, so accuracy is capped by prompt engineering and the LLM tier is
+nondeterministic — identical runs have returned different property names. Could a model
+be fine-tuned on our own labelled comp tables (every past deal's input file plus its
+approved output is a training pair we already own) to make reading and mapping an
+unfamiliar source reliable rather than best-effort? Open: is it worth the cost versus
+better prompts, how do we evaluate it, and who signs off that it is safe for IC-facing
+numbers?
 
-**The limitation.** Comps arrive in every shape: broker PDFs with real table grids,
-PDFs whose "tables" are floating text, Excel sheets with bespoke headers, and
-screenshots. Today this is handled with a tiered mapper (exact synonym → embedding →
-LLM) plus a GPT-4o vision path, all against a **general-purpose** model that has never
-seen our schema. It works, but accuracy is bounded by prompt engineering, and the LLM
-tier is **nondeterministic** — two identical runs on the same PDF have returned
-different property names.
+**2. Deployment and shared memory across users**
+The app is single-user by construction: Streamlit state is per-session and the only
+durable store is the server's filesystem. Two analysts on the same deal silently
+overwrite each other's outputs. Can this be a proper web app with a shared persistent
+store, so a team works one deal together? Open: what backs the state, authentication
+and who may see which deal, locking or merge semantics, and an audit trail of who
+changed which cell.
 
-**Where we need help.** Could a model be fine-tuned on our own labelled comp
-tables — header → field mappings, and page-image → record pairs — so that reading and
-mapping from an unfamiliar source becomes reliable rather than best-effort? Open
-questions for a reviewer:
+**3. Narrative generation**
+The rationale is one prose call with guard-rails — no revision loop, and each section
+written independently. It cannot weigh conflicting sources or reason about the deal;
+it assembles what the research states. Can an LLM do materially better here — a
+draft → critique → revise loop, the comp tables handed over as structured evidence
+rather than prose, reviewer edits fed back as house-style examples, or a stronger model
+for the prose call only? And where is the honest limit at which judgement should stay
+with the analyst?
 
-- Is fine-tuning (or a smaller trained extraction model) justified versus continuing to
-  improve prompts and the deterministic tiers?
-- Do we have, or can we build, enough labelled examples? Every past deal's input file
-  and its approved output table is a training pair we already own.
-- How would we evaluate it? An eval harness exists (`eval/run_extract.py` with gold
-  files) but covers only a few broker formats.
-- What is the accuracy target that would justify the cost — and who signs off that a
-  trained model is safe for IC-facing numbers?
-
-### 16.2 Deployment and shared memory across users
-
-**The limitation.** The app is single-user by construction. Streamlit state is
-per-session, and everything durable is a **file on the server's disk** — deal configs,
-caches, outputs. Two analysts using the cloud app do not see each other's work; there
-is no shared store, no accounts, no concurrency control. Two people working the same
-deal will silently overwrite each other's outputs, because the only "database" is the
-`output/<Deal>/` folder.
-
-**Where we need help.** Can this be deployed as a proper web app with a shared,
-persistent store — so a team works one deal together and the analysis, edits, and
-sign-off are visible to everyone? Open questions:
-
-- What backs the shared state — a real database, or object storage plus a metadata
-  layer? What happens to the per-deal folder convention?
-- Authentication and entitlement: who may see which deal? This becomes essential the
-  moment the data is real rather than demo.
-- Locking or merge semantics for two analysts editing the same comp table.
-- An audit trail of who changed which cell, which the IC process will want anyway.
-
-### 16.3 Narrative generation
-
-**The limitation.** The investment rationale is a single prose call with heavy
-guard-rails (evidence discipline, no invention at the writing stage, repetition caps,
-banned phrases). Quality is capped by what the market reports contain and by the fact
-that the model writes each section independently, in one pass, with no revision loop.
-It cannot weigh two conflicting sources, and it cannot reason about the deal the way an
-analyst does — it can only assemble what the research states.
-
-**Where we need help.** Can we get materially better narrative out of an LLM here?
-Candidate directions a reviewer might have views on:
-
-- A draft → critique → revise loop rather than one pass, with the critic checking the
-  argument, not just the format.
-- Giving the writer the comp tables as structured evidence rather than a text summary,
-  so it can reason over the numbers instead of restating them.
-- Letting a reviewer's edits feed back as few-shot examples of house style.
-- A stronger model for the prose call specifically — the extraction path can stay cheap.
-- Where the honest limit is: some judgement should stay with the analyst, and the memo
-  should say so rather than manufacture confidence.
-
-### 16.4 Personal LLM accounts — internal data cannot be uploaded
-
-**The limitation, and the most restrictive one.** The app currently runs on a
-**personal OpenAI account**. Under that arrangement internal or confidential deal
-material **must not** be uploaded, so every cloud run is limited to demo or public
-data. This is why the pipeline is built around public sources — web search, URA
-registries, broker research — and why the on-prem paths (network-drive inboxes,
-confidential IMs) exist separately.
-
-The consequence is that the tool cannot currently be pointed at the material it would
-be most useful on: real offering memoranda and internal underwriting.
-
-**Where we need help.** Moving to an approved enterprise arrangement is a
-prerequisite for real use, not an optimisation. Open questions:
-
-- Which route does the firm sanction — an enterprise OpenAI/Azure OpenAI tenancy with
-  a no-training guarantee, a Bedrock/Vertex deployment, or a self-hosted open model?
-- What is the data-classification threshold above which material may not leave the
-  network at all? The Ollama path exists for exactly this case, at some quality cost.
-- Who owns the approval, and what evidence do they need (data flow, retention,
-  region)?
-- Until that exists, the cloud app should be treated as a **demonstrator on public
-  data**, not a production tool.
+**4. Personal LLM account — internal data cannot be uploaded**
+The most restrictive limit. The app runs on a **personal OpenAI account**, so internal
+or confidential deal material must not be uploaded and every cloud run is limited to
+demo or public data. The tool cannot be pointed at the material it would be most useful
+on: real offering memoranda and internal underwriting. An approved enterprise
+arrangement (enterprise/Azure OpenAI with a no-training guarantee, Bedrock/Vertex, or a
+self-hosted model) is a **prerequisite for real use, not an optimisation**. Until then,
+treat the cloud app as a demonstrator on public data.
