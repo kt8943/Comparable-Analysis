@@ -144,7 +144,6 @@ PGIM-CompAnalysis/
 └── output/<Deal>/                        Generated workbooks, maps, audit, docx
 ```
 
-
 ---
 
 ## 4. The engine — orchestrator, agents, tools, skills
@@ -1116,7 +1115,7 @@ Ranked by what a reviewer should look at first.
 
 ---
 
-## 19. Technical limitations — where we need help
+## 19. Technical limitations
 
 Four ceilings of the current design. Each needs a decision or a capability the project
 does not have today. Reviewer input wanted on all four.
