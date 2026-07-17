@@ -1036,33 +1036,41 @@ table writers. Extraction changes do not raise when they go wrong — they simpl
 fewer comps — so a change is not "done" until its output has been diffed against a
 known-good run.
 
-### 17.1 What has been exercised
+### 17.1 Reports the pipeline extracts from
 
-Extraction is developed and checked against a corpus of **~50 Singapore broker reports**
-in `Input_files/`. Knowing its shape tells you where the pipeline is proven and where a
-new source is genuinely new:
+Sales-comp extraction is developed against Singapore broker research and currently
+pulls comp tables from **34 reports** across four publishers. This is the proven
+surface — a source outside it is genuinely new:
 
-| Publisher | Files | Coverage |
+| Publisher | Series | Quarters extracting |
 |---|---|---|
-| **Cushman & Wakefield** MarketBeat | 22 | Capital Markets, Office, Industrial — 1Q2024 → 4Q2025 |
-| **Savills** Sales & Investment Briefing | 14 | Q3 2023 → Q1 2026 |
-| **Colliers** Investment Report / Insights | 13 | Q3 2023 → Q1 2026 |
-| **CBRE** Figures | 1 | Q1 2026 |
+| **Cushman & Wakefield** MarketBeat | Capital Markets | 4Q2023, 1Q–2Q2024, 1Q–3Q2025, 4Q2025, 1Q2026 |
+| | Office | 1Q2025, 2Q2025, 4Q2025 |
+| | Industrial | 2Q2025, 3Q2025, 4Q2025 |
+| **Savills** Sales & Investment Briefing | — | Q3–Q4 2023, Q2–Q4 2024, Q1–Q4 2025, Q1 2026 |
+| **Colliers** Investment Report / Outlook | — | Q3–Q4 2023, Q1/Q3/Q4 2024, Q1–Q2 2025 |
+| | Industrial Insights | Q1 2026 |
+| **CBRE** Figures | — | Q1 2026 |
 
-What that does **not** cover, and what a reviewer should treat as unproven:
+Extraction is checked at the **table level** — the report's comp table is found and its
+rows read into the schema. Coverage is by report, not by publisher: a series that
+extracts in one quarter can change layout in the next, so a new quarter is worth a
+check rather than an assumption.
+
+What is outside this surface, and should be treated as unproven:
 
 - **Market.** Singapore only. Korea and Japan deal configs exist and the search rules
-  are country-agnostic, but no KR/JP broker PDF is in the corpus — their table layouts
-  are untested.
-- **Comp type.** The corpus is exercised on the **sales** path. Rent and land run the
-  same four stages, but with far less coverage across formats.
-- **Publisher.** JLL, Knight Frank and Edmund Tie are absent. A new publisher means a
-  new page layout, which is exactly where Stage B/C behaviour differs (§7.2, §7.3).
+  are country-agnostic, but no KR/JP broker PDF has been run — their layouts are
+  untested.
+- **Comp type.** The surface above is the **sales** path. Rent and land run the same
+  four stages with far less coverage across formats.
+- **Publisher.** JLL, Knight Frank and Edmund Tie have not been run. A new publisher
+  means a new page layout, which is where Stage B/C behaviour differs (§7.2, §7.3).
 - **Language.** English reports only.
 
-A new publisher or market is therefore the case most likely to need work — start with
-the no-LLM detection probe below to see what the page actually yields before assuming
-a mapping problem.
+A new publisher, market or quarter is therefore where work is most likely needed. Start
+with the detection probe below to see what a page actually yields before assuming a
+mapping problem.
 
 ### 17.2 Detection without an LLM (free, deterministic)
 
