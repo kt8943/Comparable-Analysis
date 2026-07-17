@@ -1101,7 +1101,7 @@ def _show_interactive_map(geo_path, excel_path, context: str):
         return False
 
     all_comps = geo.get("comps", [])
-    mb        = geo.get("mapbox", {})
+    mb        = geo.get("map") or geo.get("mapbox", {})   # "mapbox": legacy sidecars
     token     = _get_mapbox_token()   # always from shared_settings.json
 
     # ── Build layer data — read 'hidden' flag directly from geo JSON ──────────
@@ -1403,7 +1403,7 @@ def _regen_map_from_geo(geo_path, plot_subject: bool = True):
         if c.get("lon") is not None and not c.get("hidden", False)
     ]
 
-    mb  = geo.get("mapbox", {})
+    mb  = geo.get("map") or geo.get("mapbox", {})   # "mapbox": legacy sidecars
     tok = _get_mapbox_token()   # always from shared_settings.json
     if not tok:
         return

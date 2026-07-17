@@ -5,7 +5,7 @@ Geocoding sidecar utilities shared across all comp pipelines.
 
 Public API
 ----------
-write_geo_sidecar(path, s_lon, s_lat, comps, mb_cfg) -> None
+write_geo_sidecar(path, s_lon, s_lat, comps, map_cfg) -> None
     Write a _geo.json sidecar file used by the interactive pydeck map.
 """
 
@@ -18,7 +18,7 @@ def write_geo_sidecar(
     s_lon: float,
     s_lat: float,
     comps: list,
-    mb_cfg: dict,
+    map_cfg: dict,
 ) -> None:
     """Write the _geo.json sidecar that drives the interactive pydeck map.
 
@@ -28,11 +28,11 @@ def write_geo_sidecar(
         address     str
         lon         float | None
         lat         float | None
-    Any key named 'token' in mb_cfg is excluded from the sidecar.
+    Any key named 'api_key' in map_cfg is excluded from the sidecar.
     """
     geo_data = {
         "subject": {"lon": s_lon, "lat": s_lat},
-        "mapbox":  {k: v for k, v in mb_cfg.items() if k != "token"},
+        "map":     {k: v for k, v in map_cfg.items() if k != "api_key"},
         "comps": [
             {
                 "map_marker": c["map_marker"],

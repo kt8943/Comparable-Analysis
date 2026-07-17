@@ -85,10 +85,28 @@ from tools.calculations import find_same_building as _find_same_building
 from tools.house_rules import search_rules as _house_rules, warn_window_vs_recency
 
 
+def _shared_google_key() -> str:
+    """Google Maps key: shared_settings.json (single source of truth) → env.
+    Lets a run find the key set in Shared Settings / cloud secrets even when the
+    deal config has no map.api_key."""
+    try:
+        p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
+        if p.exists():
+            k = (json.loads(p.read_text(encoding="utf-8")) or {}).get("google_maps_key", "")
+            if k:
+                return k
+    except Exception:
+        pass
+    return os.environ.get("GOOGLE_MAPS_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+
+
 def _shared_mapbox_token() -> str:
-    """Mapbox token fallback: shared_settings.json (single source of truth) → env.
-    Lets Online Search find the token set in Shared Settings / cloud secrets even
-    when the deal config has no mapbox.token."""
+    """Mapbox token for RENDERING the static map image only.
+
+    Geocoding is Google (see _shared_google_key). The two are independent: Google
+    resolves the coordinates, Mapbox draws the PNG. Deal configs carry no Mapbox
+    token — it lives only in Shared Settings / the MAPBOX_TOKEN secret.
+    """
     try:
         p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
         if p.exists():
@@ -482,7 +500,7 @@ def validate_dedup(records: list, subject_name: str = "",
     return out
 
 
-def geocode_records(records: list, mapbox_token: str,
+def geocode_records(records: list, google_keyen: str,
                     country_code: str = "", country_name: str = "") -> list:
     """Add lon/lat to each record. Only geocodes records that have a real address.
     Property names and descriptions are NOT used as geocoding queries — they
@@ -497,7 +515,7 @@ def geocode_records(records: list, mapbox_token: str,
             continue
         query = f"{addr}{suffix}" if suffix not in addr else addr
         try:
-            lon, lat, _ = geocode_with_fallbacks([query], mapbox_token, country_code)
+            lon, lat, _ = geocode_with_fallbacks([query], google_keyen, country_code)
             out.append({**r, "lon": lon, "lat": lat})
         except Exception:
             out.append({**r, "lon": None, "lat": None})
@@ -876,8 +894,8 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     subject_cfg = cfg["subject_property"]
     params      = cfg.get("parameters", {})
     bala_yield  = params.get("bala_yield", 0.06)
-    mb_cfg      = cfg.get("mapbox", {})
-    mapbox_tok  = mb_cfg.get("token", "") or _shared_mapbox_token()
+    map_cfg      = cfg.get("map", {})
+    google_key  = map_cfg.get("api_key", "") or _shared_google_key()
     oa_cfg      = cfg.get("openai", {})
     api_key      = oa_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
     search_model  = oa_cfg.get("search_model",  "gpt-4o-mini-search-preview")
@@ -927,9 +945,9 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
             "OpenAI API key not found.\n"
             "  Set openai.api_key in deal_config.json  OR  export OPENAI_API_KEY=sk-..."
         )
-    if not mapbox_tok:
-        raise ValueError("No Mapbox token found (needed for geocoding). Set it in "
-                         "Shared Settings / MAPBOX_TOKEN secret, or mapbox.token in the deal config.")
+    if not google_key:
+        raise ValueError("No Google Maps key found (needed for geocoding). Set it in "
+                         "Shared Settings / GOOGLE_MAPS_KEY secret, or map.api_key in the deal config.")
 
     try:
         from openai import OpenAI
@@ -962,7 +980,7 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     print(f"\n[0/5] Geocoding subject property")
     s_lon, s_lat, _ = geocode_with_fallbacks(
         [f"{prop_name}, {address}", address, prop_name],
-        mapbox_tok, country_code,
+        google_key, country_code,
     )
     print(f"      {prop_name} → ({s_lon}, {s_lat})")
 
@@ -1058,7 +1076,7 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                 if len(cleaned) != _b:
                     print(f"    [recency] dropped {_b - len(cleaned)} sale(s) older than "
                           f"{_rec_m}mo; kept {len(cleaned)}")
-                geocoded = geocode_records(cleaned, mapbox_tok, country_code,
+                geocoded = geocode_records(cleaned, google_key, country_code,
                                            country_name=country_name)
                 level_new += _merge_geocoded(geocoded, q_sources, max_km,
                                              source_name="web_search")
@@ -1138,7 +1156,7 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
                         if (_months_ago(str(r.get("sale_date") or "")) or 0) <= _rec_m]
             if _before != len(_cleaned):
                 print(f"  · recency ≤{_rec_m}mo: kept {len(_cleaned)}/{_before}")
-            _geo = geocode_records(_cleaned, mapbox_tok, country_code,
+            _geo = geocode_records(_cleaned, google_key, country_code,
                                    country_name=country_name)
             # Location: grounded feeds are country-scoped registries, so cap them at
             # the city tier rather than letting them pull in the whole country.
@@ -1233,7 +1251,7 @@ def run(config_path: str = "configs/deal_config.json", generate_map: bool = Fals
     if generate_map:
         print(f"\n[5/5] MAP   {out_map}")
         _generate_map(classified, subject_cfg, subj_row, s_lon, s_lat,
-                      mapbox_tok, out_map, mb_cfg)
+                      google_key, out_map, map_cfg)
     else:
         print(f"\n[5/5] MAP   skipped (pass --map to generate)")
 
@@ -1247,7 +1265,7 @@ def build_search_queries_for_level(subject_cfg: dict, level: str, years_back: in
 
 def _generate_map(classified: list, subject_cfg: dict, subj_row: dict,
                   s_lon: float, s_lat: float,
-                  mapbox_tok: str, out_map: str, mb_cfg: dict):
+                  google_key: str, out_map: str, map_cfg: dict):
     from generate_sales_comps_map import render_map
     comps_geo = [
         (r["map_marker"], r["lon"], r["lat"])
@@ -1257,13 +1275,13 @@ def _generate_map(classified: list, subject_cfg: dict, subj_row: dict,
     render_map(
         subject_lonlat = (s_lon, s_lat),
         comps          = comps_geo,
-        token          = mapbox_tok,
+        token            = _shared_mapbox_token(),
         output_path    = out_map,
-        style          = mb_cfg.get("style",    "streets-v12"),
-        width          = mb_cfg.get("width",    1200),
-        height         = mb_cfg.get("height",   900),
-        padding        = mb_cfg.get("padding",  100),
-        pin_size       = mb_cfg.get("pin_size", "xl"),
+        style          = map_cfg.get("style",    "streets-v12"),
+        width          = map_cfg.get("width",    1200),
+        height         = map_cfg.get("height",   900),
+        padding        = map_cfg.get("padding",  100),
+        pin_size       = map_cfg.get("pin_size", "xl"),
     )
 
 

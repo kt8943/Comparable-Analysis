@@ -57,6 +57,7 @@ from generate_sales_comps_table import (
 from generate_sales_comps_map import render_map
 import generate_global_sales_comps_table as _global_sales_tbl
 from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
+from generate_comps_map_base import shared_mapbox_token as _shared_mapbox_token
 from tools.calculations import (
     haversine_km as _haversine_km,
     parse_cap_rate as _cap_rate,
@@ -1226,7 +1227,7 @@ def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.2,
     return records
 
 
-def _geocode_comps(records: list, mapbox_tok: str,
+def _geocode_comps(records: list, google_key: str,
                    country_code: str, country_name: str,
                    s_lon: float, s_lat: float) -> list:
     """Geocode each comp; attach lon / lat / distance_km.
@@ -1291,7 +1292,7 @@ def _geocode_comps(records: list, mapbox_tok: str,
             source  = "name"
 
         try:
-            lon, lat, geo_note = geocode_with_fallbacks(queries, mapbox_tok, country_code)
+            lon, lat, geo_note = geocode_with_fallbacks(queries, google_key, country_code)
             dist = _haversine_km(lon, lat, s_lon, s_lat)
             r["lon"], r["lat"], r["distance_km"] = lon, lat, dist
             r["_geo_provider"] = geo_note
@@ -1330,17 +1331,17 @@ def run(config_path: str = "configs/deal_config.json",
         cfg = json.load(f)
 
     subject_cfg  = cfg["subject_property"]
-    mb_cfg       = cfg.get("mapbox", {})
+    map_cfg       = cfg.get("map", {})
 
-    # Mapbox token — always read from shared_settings.json (single source of truth).
+    # Google Maps key — always read from shared_settings.json (single source of truth).
     # Fall back to the deal config's mapbox.token only if shared_settings is absent.
     _ss_path = Path(__file__).parent.parent / "configs" / "shared_settings.json"
     try:
         _ss = json.loads(_ss_path.read_text(encoding="utf-8"))
-        mapbox_tok   = _ss.get("mapbox_token", "")
+        google_key   = _ss.get("google_keyen", "")
         onemap_token = _ss.get("onemap_token", "")
     except Exception:
-        mapbox_tok   = mb_cfg.get("token", "")
+        google_key   = map_cfg.get("api_key", "")
         onemap_token = ""
     llm_cfg      = cfg.get("llm", {"provider": "ollama",
                                     "ollama": {"base_url": "http://localhost:11434",
@@ -1422,22 +1423,22 @@ def run(config_path: str = "configs/deal_config.json",
         print(f"  Image{_lbl} → {_imf}")
     print(f"  Output → {output_file}")
 
-    # ── 1. Geocode subject (only if mapbox token present) ─────────────────────
+    # ── 1. Geocode subject (only if Google Maps key present) ─────────────────────
     s_lon = s_lat = None
-    if mapbox_tok:
+    if google_key:
         address = subject_cfg.get("address", "")
         print(f"\n[1/5] Geocoding subject property")
         try:
             s_lon, s_lat, _ = geocode_with_fallbacks(
                 [f"{prop_name}, {address}", address, prop_name],
-                mapbox_tok, country_code,
+                google_key, country_code,
             )
             print(f"      {prop_name}  →  ({s_lon:.5f}, {s_lat:.5f})")
         except Exception as e:
             print(f"      Geocoding failed: {e}  (distance sorting skipped)")
             s_lon = s_lat = None
     else:
-        print(f"\n[1/5] No Mapbox token — geocoding skipped (comps ranked by relevance)")
+        print(f"\n[1/5] No Google Maps key — geocoding skipped (comps ranked by relevance)")
 
     # ── 2. Parse input files (Excel, PDF, and/or Image) ──────────────────────
     out_records = str(out_dir / f"{excel_stem}_records.json")
@@ -1642,9 +1643,9 @@ def run(config_path: str = "configs/deal_config.json",
     print(f"\n[4/5] Calculating metrics")
     processed = compute_metrics(classified, subject_cfg)
 
-    if mapbox_tok and s_lon is not None:
+    if google_key and s_lon is not None:
         print(f"      Geocoding comparables …")
-        processed = _geocode_comps(processed, mapbox_tok, country_code,
+        processed = _geocode_comps(processed, google_key, country_code,
                                    country_name, s_lon, s_lat)
 
         # Flag same-building cross-source value disagreements BEFORE merging, so
@@ -1806,12 +1807,12 @@ def run(config_path: str = "configs/deal_config.json",
              "lon": r.get("lon"), "lat": r.get("lat")}
             for r in processed
         ]
-        write_geo_sidecar(out_geo, s_lon, s_lat, _geo_comps, mb_cfg)
+        write_geo_sidecar(out_geo, s_lon, s_lat, _geo_comps, map_cfg)
         print(f"  Geo   → {out_geo}")
 
     if generate_map:
-        if not mapbox_tok:
-            print("  Map skipped  (no Mapbox token in config)")
+        if not google_key:
+            print("  Map skipped  (no Google Maps key in config)")
         elif s_lon is None:
             print("  Map skipped  (subject geocoding failed)")
         else:
@@ -1822,13 +1823,13 @@ def run(config_path: str = "configs/deal_config.json",
             render_map(
                 subject_lonlat = (s_lon, s_lat),
                 comps          = comps_geo,
-                token          = mapbox_tok,
+                token            = _shared_mapbox_token(),
                 output_path    = out_map,
-                style          = mb_cfg.get("style",    "streets-v12"),
-                width          = mb_cfg.get("width",    1200),
-                height         = mb_cfg.get("height",   900),
-                padding        = mb_cfg.get("padding",  100),
-                pin_size       = mb_cfg.get("pin_size", "l"),
+                style          = map_cfg.get("style",    "streets-v12"),
+                width          = map_cfg.get("width",    1200),
+                height         = map_cfg.get("height",   900),
+                padding        = map_cfg.get("padding",  100),
+                pin_size       = map_cfg.get("pin_size", "l"),
             )
             print(f"  Map   → {out_map}")
     else:

@@ -43,14 +43,14 @@ _ASSET_CLASSES = ("office", "retail", "logistics", "industrial", "mixed-use")
 
 
 def _load_shared_settings() -> dict:
-    """Read mapbox token + ollama config from the first existing deal config (any deal)."""
+    """Read the Google Maps key + ollama config from the first existing deal config."""
     configs_dir = Path("configs")
     candidates = sorted(configs_dir.glob("deal_config*.json")) if configs_dir.exists() else []
     for p in candidates:
         try:
             cfg = json.loads(p.read_text(encoding="utf-8"))
             return {
-                "mapbox_token": cfg.get("mapbox", {}).get("token", ""),
+                "google_maps_key": cfg.get("map", {}).get("api_key", ""),
                 "ollama_base":  cfg.get("llm", {}).get("ollama", {}).get("base_url",
                                                                           "http://localhost:11434"),
                 "ollama_model": cfg.get("llm", {}).get("ollama", {}).get("model", "qwen2.5:3b"),
@@ -58,7 +58,7 @@ def _load_shared_settings() -> dict:
         except Exception:
             continue
     return {
-        "mapbox_token": "",
+        "google_maps_key": "",
         "ollama_base":  "http://localhost:11434",
         "ollama_model": "qwen2.5:3b",
     }
@@ -116,59 +116,6 @@ def _llm_post(messages: list, llm_cfg: dict, openai_key: str = "",
             timeout=timeout,
         )
 
-
-def _mapbox_geocode(address: str, token: str) -> dict:
-    """
-    Forward geocode an address using the Mapbox Geocoding API.
-    Returns a dict with whatever place hierarchy Mapbox finds:
-      neighborhood, locality, district, place, region, country
-    Uses the same Mapbox token already stored in the deal config.
-    """
-    if not token:
-        return {}
-    try:
-        encoded = urllib.parse.quote(address)
-        url = (
-            f"https://api.mapbox.com/geocoding/v5/mapbox.places/{encoded}.json"
-            f"?access_token={token}&limit=1"
-        )
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-
-        if not data.get("features"):
-            return {}
-
-        feature = data["features"][0]
-        result  = {}
-
-        # Walk the context array — each entry is a level of the place hierarchy
-        for ctx in feature.get("context", []):
-            ctx_id = ctx.get("id", "")
-            text   = ctx.get("text", "").strip()
-            if not text:
-                continue
-            if ctx_id.startswith("neighborhood"):
-                result["neighborhood"] = text
-            elif ctx_id.startswith("locality"):
-                result["locality"] = text
-            elif ctx_id.startswith("district"):
-                result["district"] = text
-            elif ctx_id.startswith("place"):
-                result["place"] = text
-            elif ctx_id.startswith("region"):
-                result["region"] = text
-            elif ctx_id.startswith("country"):
-                result["country"] = text
-
-        # The feature itself may be a neighborhood-level result
-        if "neighborhood" in feature.get("place_type", []):
-            result.setdefault("neighborhood", feature.get("text", "").strip())
-
-        return result
-    except Exception as e:
-        print(f"  [mapbox geocode] failed: {e}")
-        return {}
 
 
 def _google_geocode(address: str, api_key: str, country_code: str = "") -> dict:
@@ -540,8 +487,8 @@ def main():
 
         "online_search": search_cfg,
 
-        "mapbox": {
-            "token":    shared["mapbox_token"],
+        "map": {
+            "api_key":  shared["google_maps_key"],
             "style":    "streets-v12",
             "width":    1200,
             "height":   900,
@@ -709,7 +656,7 @@ def extract_from_document(text: str, llm_cfg: dict, openai_key: str = "") -> dic
 def _load_geocoding_settings() -> dict:
     """Read configs/shared_settings.json — the actual single source of truth
     for geocoding_provider / google_maps_key (NOT the guessed-from-any-deal-
-    config _load_shared_settings() above, which only ever had mapbox_token)."""
+    config _load_shared_settings() above, which only ever had google_maps_key)."""
     p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
     try:
         return json.loads(p.read_text(encoding="utf-8"))
@@ -719,7 +666,7 @@ def _load_geocoding_settings() -> dict:
 
 def derive_market_fields(address: str, asset_class: str,
                           llm_cfg: dict, openai_key: str = "",
-                          mapbox_token: str = "") -> dict:
+                          ) -> dict:
     """
     Use the LLM to infer all market / location config fields from an address,
     then override location and submarket_keywords with real geodata from a
@@ -735,7 +682,7 @@ def derive_market_fields(address: str, asset_class: str,
     (default). This matches generate_comps_map_base.geocode_any()'s provider
     selection, used for comp-pin geocoding, so New Deal and the comp scans
     agree on which geocoder is authoritative. If the selected provider fails
-    or returns nothing, falls back to Mapbox (using the mapbox_token param,
+    or returns nothing, falls back to Mapbox (using the google_maps_key param,
     which the caller reads from the same shared_settings.json).
     Either way, the real place hierarchy REPLACES the LLM's guessed
     submarket_keywords, which are often inaccurate (LLMs frequently invent
@@ -755,20 +702,19 @@ def derive_market_fields(address: str, asset_class: str,
         fields = _derive_fields_with_llm(address, asset_class, llm_cfg, openai_key)
 
     settings           = _load_geocoding_settings()
-    geocoding_provider  = settings.get("geocoding_provider", "mapbox").lower()
+    geocoding_provider  = settings.get("geocoding_provider", "google").lower()
     google_maps_key     = settings.get("google_maps_key", "")
     country_code        = fields.get("country_code", "")
 
     geo = {}
     geo_source = ""
-    if geocoding_provider == "google" and google_maps_key:
+    if google_maps_key:
         geo = _google_geocode(address, google_maps_key, country_code)
         geo_source = "google"
         if not geo:
-            print("  [geocode] Google Maps returned nothing — falling back to Mapbox")
-    if not geo:
-        geo = _mapbox_geocode(address, mapbox_token)
-        geo_source = "mapbox"
+            print("  [geocode] Google Maps returned nothing for this address")
+    else:
+        print("  [geocode] no google_maps_key set — skipping submarket derivation")
 
     if geo:
         # Build submarket keywords from the place hierarchy the geocoder returned.
@@ -868,8 +814,8 @@ def build_config(fields: dict, shared: dict = None) -> tuple:
             "city_km":        25.0,
             "recency_months": 36,   # tighter than sales/land — rents date faster
         },
-        "mapbox": {
-            "token":    shared.get("mapbox_token", ""),
+        "map": {
+            "api_key":  shared.get("google_maps_key", ""),
             "style":    "streets-v12",
             "width":    1200,
             "height":   900,

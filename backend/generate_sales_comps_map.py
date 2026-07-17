@@ -33,6 +33,7 @@ from generate_comps_map_base import (
     render_map,
     _parse_property_text,
 )
+from generate_comps_map_base import shared_mapbox_token as _shared_mapbox_token
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,17 +68,17 @@ def run(config_path: str = "configs/deal_config.json"):
     subject_cfg  = cfg["subject_property"]
     output_excel = cfg["output_file"]
     Path(output_excel).parent.mkdir(parents=True, exist_ok=True)
-    mb_cfg       = cfg.get("mapbox", {})
-    token        = mb_cfg.get("token")
-    style        = mb_cfg.get("style",    "streets-v12")
-    width        = mb_cfg.get("width",    1200)
-    height       = mb_cfg.get("height",   900)
-    padding      = mb_cfg.get("padding",  100)
-    pin_size     = mb_cfg.get("pin_size", "l")
-    bounds_tuple = tuple(mb_cfg["geocode_bounds"]) if mb_cfg.get("geocode_bounds") else None
+    map_cfg       = cfg.get("map", {})
+    token        = map_cfg.get("token")
+    style        = map_cfg.get("style",    "streets-v12")
+    width        = map_cfg.get("width",    1200)
+    height       = map_cfg.get("height",   900)
+    padding      = map_cfg.get("padding",  100)
+    pin_size     = map_cfg.get("pin_size", "l")
+    bounds_tuple = tuple(map_cfg["geocode_bounds"]) if map_cfg.get("geocode_bounds") else None
 
     if not token:
-        raise ValueError("mapbox.token missing in deal config.")
+        raise ValueError("map.api_key missing in deal config and no google_maps_key in Shared Settings.")
 
     deal_name    = subject_cfg.get("deal_name", subject_cfg["property_name"])
     map_output   = str(Path(output_excel).with_suffix("")) + "_map.png"
@@ -118,7 +119,7 @@ def run(config_path: str = "configs/deal_config.json"):
     render_map(
         subject_lonlat = (s_lon, s_lat),
         comps          = comps_geo,
-        token          = token,
+        token          = _shared_mapbox_token(),
         output_path    = map_output,
         style          = style,
         width          = width,

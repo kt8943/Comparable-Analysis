@@ -60,6 +60,7 @@ import openpyxl
 
 from generate_land_comps_map import render_map
 from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
+from generate_comps_map_base import shared_mapbox_token as _shared_mapbox_token
 from generate_land_comps_table import (
     get_land_schema, bala_factor,
     subject_to_row, comp_to_row, build_workbook,
@@ -715,7 +716,7 @@ def _classify_rules(records: list, subject_cfg: dict = None):
 # GEOCODING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _geocode_comps(records: list, mapbox_tok: str,
+def _geocode_comps(records: list, google_key: str,
                    country_code: str, country_name: str,
                    s_lon: float, s_lat: float) -> list:
     suffix = f", {country_name}" if country_name else ""
@@ -747,7 +748,7 @@ def _geocode_comps(records: list, mapbox_tok: str,
         source  = "address" if _real_addr else "name"
 
         try:
-            lon, lat, geo_note = geocode_with_fallbacks(queries, mapbox_tok, country_code)
+            lon, lat, geo_note = geocode_with_fallbacks(queries, google_key, country_code)
             r["lon"], r["lat"] = lon, lat
             r["distance_km"]   = _haversine_km(lon, lat, s_lon, s_lat)
             r["_geo_provider"] = geo_note
@@ -781,20 +782,20 @@ def run(config_path: str = "configs/deal_config.json",
         cfg = json.load(f)
 
     subject_cfg  = cfg["subject_property"]
-    mb_cfg       = cfg.get("mapbox", {})
+    map_cfg       = cfg.get("map", {})
 
-    # Mapbox token — always read from shared_settings.json (single source of truth,
+    # Google Maps key — always read from shared_settings.json (single source of truth,
     # same as scan_input_sales_comps.py). Fall back to the deal config's own
     # mapbox.token only if shared_settings is absent. Previously this only read
-    # mb_cfg, so a deal config missing/blank on "mapbox.token" silently skipped
+    # map_cfg, so a deal config missing/blank on "mapbox.token" silently skipped
     # the map for LAND (while sales still worked via the shared_settings fallback).
     _ss_path = Path(__file__).parent.parent / "configs" / "shared_settings.json"
     try:
-        mapbox_tok = json.loads(_ss_path.read_text(encoding="utf-8")).get("mapbox_token", "")
+        google_key = json.loads(_ss_path.read_text(encoding="utf-8")).get("google_keyen", "")
     except Exception:
-        mapbox_tok = ""
-    if not mapbox_tok:
-        mapbox_tok = mb_cfg.get("token", "")
+        google_key = ""
+    if not google_key:
+        google_key = map_cfg.get("api_key", "")
 
     llm_cfg      = cfg.get("llm", {"provider": "ollama",
                                     "ollama": {"base_url": "http://localhost:11434",
@@ -874,22 +875,22 @@ def run(config_path: str = "configs/deal_config.json",
         print(f"  Image{_lbl} → {_imf}")
     print(f"  Output → {out_excel}")
 
-    # ── 1. Geocode subject (only if mapbox token present) ─────────────────────
+    # ── 1. Geocode subject (only if Google Maps key present) ─────────────────────
     s_lon = s_lat = None
-    if mapbox_tok:
+    if google_key:
         address = subject_cfg.get("address", "")
         print(f"\n[1/5] Geocoding subject property")
         try:
             s_lon, s_lat, _ = geocode_with_fallbacks(
                 [f"{prop_name}, {address}", address, prop_name],
-                mapbox_tok, country_code,
+                google_key, country_code,
             )
             print(f"      {prop_name}  →  ({s_lon:.5f}, {s_lat:.5f})")
         except Exception as e:
             print(f"      Geocoding failed: {e}  (distance sorting skipped)")
             s_lon = s_lat = None
     else:
-        print(f"\n[1/5] No Mapbox token — geocoding skipped (comps ranked by order)")
+        print(f"\n[1/5] No Google Maps key — geocoding skipped (comps ranked by order)")
 
     # ── 2. Parse input files OR load from saved records ──────────────────────
     out_records = str(out_dir / f"Land_Sale_Comps_{deal_slug}_records.json")
@@ -1057,9 +1058,9 @@ def run(config_path: str = "configs/deal_config.json",
         r["quality"]  = ""
 
     # ── 4. Geocode + sort by distance (if token available) ────────────────────
-    if mapbox_tok and s_lon is not None:
+    if google_key and s_lon is not None:
         print(f"\n[4/5] Geocoding comparables")
-        records = _geocode_comps(records, mapbox_tok, country_code, country_name,
+        records = _geocode_comps(records, google_key, country_code, country_name,
                                   s_lon, s_lat)
     else:
         print(f"\n[4/5] Geocoding skipped — comps kept in input order")
@@ -1106,7 +1107,7 @@ def run(config_path: str = "configs/deal_config.json",
              "lon": r.get("lon"), "lat": r.get("lat")}
             for r in records
         ]
-        write_geo_sidecar(out_geo, s_lon, s_lat, _geo_comps, mb_cfg)
+        write_geo_sidecar(out_geo, s_lon, s_lat, _geo_comps, map_cfg)
         print(f"  Geo   → {out_geo}")
 
     # ── Write lon/lat + map_marker back into _records.json ───────────────────
@@ -1143,8 +1144,8 @@ def run(config_path: str = "configs/deal_config.json",
         pass
 
     if generate_map:
-        if not mapbox_tok:
-            print("  Map skipped  (no Mapbox token in config)")
+        if not google_key:
+            print("  Map skipped  (no Google Maps key in config)")
         elif s_lon is None:
             print("  Map skipped  (subject geocoding failed)")
         else:
@@ -1155,13 +1156,13 @@ def run(config_path: str = "configs/deal_config.json",
             render_map(
                 subject_lonlat = (s_lon, s_lat),
                 comps          = comps_geo,
-                token          = mapbox_tok,
+                token            = _shared_mapbox_token(),
                 output_path    = out_map,
-                style          = mb_cfg.get("style",    "streets-v12"),
-                width          = mb_cfg.get("width",    1200),
-                height         = mb_cfg.get("height",   900),
-                padding        = mb_cfg.get("padding",  100),
-                pin_size       = mb_cfg.get("pin_size", "l"),
+                style          = map_cfg.get("style",    "streets-v12"),
+                width          = map_cfg.get("width",    1200),
+                height         = map_cfg.get("height",   900),
+                padding        = map_cfg.get("padding",  100),
+                pin_size       = map_cfg.get("pin_size", "l"),
             )
             print(f"  Map   → {out_map}")
     else:

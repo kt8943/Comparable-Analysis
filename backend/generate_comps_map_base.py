@@ -15,6 +15,7 @@ and Pillow pin-drawing code.
 
 import io
 import json
+import os
 import math
 import re
 import ssl
@@ -64,66 +65,30 @@ def _parse_property_text(raw: str) -> tuple:
     return name, addr
 
 
-def geocode(query: str, token: str, country_code: str = "",
+def geocode(query: str, api_key: str, country_code: str = "",
             bounds: tuple = None) -> tuple:
+    """Return (lon, lat) for *query* using the Google Maps Geocoding API.
+
+    Geocoding is Google; the static map image is still rendered by Mapbox
+    (see render_map). The two are independent and use different credentials.
+
+    bounds : optional (lon_min, lat_min, lon_max, lat_max); checked when provided.
     """
-    Return (lon, lat) for *query* using Mapbox Geocoding API.
-
-    bounds : optional (lon_min, lat_min, lon_max, lat_max).
-             When provided the result is checked against it.
-
-    Retries up to 3 times with back-off to handle transient WinError 10054
-    (connection reset) and other network hiccups on Windows.
-    """
-    encoded = urllib.parse.quote(query)
-    url = (f"https://api.mapbox.com/geocoding/v5/mapbox.places/{encoded}.json"
-           f"?limit=1&access_token={token}"
-           + (f"&country={country_code}" if country_code else ""))
-    req = urllib.request.Request(url, headers={"User-Agent": "pgim-comps-map/1.0"})
-
-    last_err = None
-    for attempt in range(3):
-        try:
-            open_kwargs = {"timeout": 15}
-            if _SSL_CTX is not None:
-                open_kwargs["context"] = _SSL_CTX
-            with urllib.request.urlopen(req, **open_kwargs) as resp:
-                data = json.loads(resp.read())
-            break   # success — exit retry loop
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))   # 1.5 s, 3 s
-            else:
-                raise ValueError(
-                    f"Geocoding failed after 3 attempts for {query!r}: {e}"
-                ) from e
-
-    features = data.get("features", [])
-    if not features:
-        raise ValueError(f"No geocoding result for: {query!r}")
-
-    feat = features[0]
-
-    lon, lat = feat["geometry"]["coordinates"]
-    lon, lat = round(lon, 6), round(lat, 6)
-    if bounds:
-        lo, la, hi, ha = bounds
-        if not (lo <= lon <= hi and la <= lat <= ha):
-            raise ValueError(
-                f"Geocoding result ({lon}, {lat}) is outside config bounds for '{query}'"
-            )
-    return lon, lat
+    return _geocode_google(query, api_key, country_code, bounds=bounds)
 
 
-def geocode_with_fallbacks(queries: list, token: str, country_code: str = "",
+def geocode_with_fallbacks(queries: list, api_key: str, country_code: str = "",
                            bounds: tuple = None) -> tuple:
-    """Try each query in order; return (lon, lat, note) for first that succeeds."""
+    """Try each query in order; return (lon, lat, note) for the first that succeeds.
+
+    Callers pass a descending-specificity list, e.g.
+    ["<name>, <address>", "<address>", "<name>"].
+    """
     last_err = None
     for q in queries:
         try:
-            lon, lat = geocode(q, token, country_code, bounds=bounds)
-            return lon, lat, "mapbox"
+            lon, lat = geocode(q, api_key, country_code, bounds=bounds)
+            return lon, lat, "google"
         except Exception as e:
             last_err = e
     raise ValueError(f"All geocoding attempts failed. Last: {last_err}")
@@ -349,20 +314,40 @@ def _load_shared_settings() -> dict:
         return {}
 
 
-def geocode_any(queries: list, mapbox_token: str, country_code: str = "",
+def shared_mapbox_token() -> str:
+    """Mapbox token for RENDERING the static map image only.
+
+    Geocoding is Google (geocode_any / geocode_with_fallbacks). The two are
+    independent: Google resolves the coordinates, Mapbox draws the PNG. Deal
+    configs carry no Mapbox token — it lives only in Shared Settings / the
+    MAPBOX_TOKEN secret.
+    """
+    tok = (_load_shared_settings() or {}).get("mapbox_token", "")
+    if tok:
+        return tok
+    return os.environ.get("MAPBOX_TOKEN", "") or os.environ.get("MAPBOX_API_KEY", "")
+
+
+def geocode_any(queries: list, api_key: str = "", country_code: str = "",
                 bounds: tuple = None) -> tuple:
     """
     Geocode using whichever provider is configured in shared_settings.json.
 
-    geocoding_provider = "mapbox"   → Mapbox (default, global)
-    geocoding_provider = "google"   → Google Maps (requires google_maps_key)
+    geocoding_provider = "google"   → Google Maps (default, global; google_maps_key)
     geocoding_provider = "onemap"   → OneMap Singapore (free, best SG accuracy)
-    geocoding_provider = "kakao"    → Kakao Maps (Korea, requires kakao_api_key)
+    geocoding_provider = "kakao"    → Kakao Maps (Korea; kakao_api_key)
 
-    Falls back to Mapbox if the selected provider fails or is misconfigured.
+    Falls back to Google if the selected provider fails or is misconfigured.
+    `api_key` is the GOOGLE key; when omitted it is read from shared_settings.
+
+    Note this is geocoding only. The static map PNG is rendered by Mapbox
+    (render_map) and uses a separate Mapbox token — the two are independent.
+
+    Returns (lon, lat, note) where note names the provider that actually resolved it.
     """
-    settings = _load_shared_settings()
-    provider = settings.get("geocoding_provider", "mapbox").lower()
+    settings   = _load_shared_settings()
+    provider   = settings.get("geocoding_provider", "google").lower()
+    google_key = api_key or settings.get("google_maps_key", "")
     _fallback_reason = ""
 
     if provider == "onemap":
@@ -371,37 +356,29 @@ def geocode_any(queries: list, mapbox_token: str, country_code: str = "",
             return lon, lat, "onemap"
         except Exception as e:
             _fallback_reason = str(e)
-            print(f"  [geocode] OneMap failed ({e}) — falling back to Mapbox")
+            print(f"  [geocode] OneMap failed ({e}) — falling back to Google")
 
     elif provider == "kakao":
-        api_key = settings.get("kakao_api_key", "")
-        if api_key:
+        kkey = settings.get("kakao_api_key", "")
+        if kkey:
             try:
-                lon, lat = _geocode_kakao_with_fallbacks(queries, api_key, bounds=bounds)
+                lon, lat = _geocode_kakao_with_fallbacks(queries, kkey, bounds=bounds)
                 return lon, lat, "kakao"
             except Exception as e:
                 _fallback_reason = str(e)
-                print(f"  [geocode] Kakao failed ({e}) — falling back to Mapbox")
+                print(f"  [geocode] Kakao failed ({e}) — falling back to Google")
         else:
             _fallback_reason = "kakao_api_key not set"
-            print("  [geocode] kakao_api_key not set — falling back to Mapbox")
+            print("  [geocode] kakao_api_key not set — falling back to Google")
 
-    elif provider == "google":
-        api_key = settings.get("google_maps_key", "")
-        if api_key:
-            try:
-                lon, lat = _geocode_google_with_fallbacks(
-                    queries, api_key, country_code, bounds=bounds)
-                return lon, lat, "google"
-            except Exception as e:
-                _fallback_reason = str(e)
-                print(f"  [geocode] Google Maps failed ({e}) — falling back to Mapbox")
-        else:
-            _fallback_reason = "google_maps_key not set"
-            print("  [geocode] google_maps_key not set — falling back to Mapbox")
+    if not google_key:
+        raise ValueError(
+            "No Google Maps key found (needed for geocoding). Set google_maps_key in "
+            "Shared Settings / the GOOGLE_MAPS_KEY secret.")
 
-    lon, lat, _ = geocode_with_fallbacks(queries, mapbox_token, country_code, bounds=bounds)
-    note = f"mapbox ({_fallback_reason})" if _fallback_reason else "mapbox"
+    lon, lat = _geocode_google_with_fallbacks(
+        queries, google_key, country_code, bounds=bounds)
+    note = f"google ({_fallback_reason})" if _fallback_reason else "google"
     return lon, lat, note
 
 
@@ -725,7 +702,7 @@ def render_map(subject_lonlat: tuple,
     pin_size = "xl"/"xxl" → custom oversized pins drawn with Pillow
     """
     slon, slat = subject_lonlat
-    geocoding_provider = _load_shared_settings().get("geocoding_provider", "mapbox")
+    geocoding_provider = _load_shared_settings().get("geocoding_provider", "google")
     # When the subject star is hidden, render comps in red (no subject to contrast).
     _comp_clr = _COMP_COLOR if plot_subject else _SUBJECT_COLOR
 

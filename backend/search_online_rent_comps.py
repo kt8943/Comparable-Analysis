@@ -56,8 +56,28 @@ from tools.house_rules import search_rules as _house_rules, warn_window_vs_recen
 from tools.calculations import find_same_building as _find_same_building
 
 
+def _shared_google_key() -> str:
+    """Google Maps key: shared_settings.json (single source of truth) → env.
+    Lets a run find the key set in Shared Settings / cloud secrets even when the
+    deal config has no map.api_key."""
+    try:
+        p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
+        if p.exists():
+            k = (json.loads(p.read_text(encoding="utf-8")) or {}).get("google_maps_key", "")
+            if k:
+                return k
+    except Exception:
+        pass
+    return os.environ.get("GOOGLE_MAPS_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+
+
 def _shared_mapbox_token() -> str:
-    """Mapbox token fallback: shared_settings.json (single source of truth) → env."""
+    """Mapbox token for RENDERING the static map image only.
+
+    Geocoding is Google (see _shared_google_key). The two are independent: Google
+    resolves the coordinates, Mapbox draws the PNG. Deal configs carry no Mapbox
+    token — it lives only in Shared Settings / the MAPBOX_TOKEN secret.
+    """
     try:
         p = Path(__file__).parent.parent / "configs" / "shared_settings.json"
         if p.exists():
@@ -289,7 +309,7 @@ def validate_dedup_rent(records: list, subject_name: str = "",
     return cleaned
 
 
-def geocode_records(records: list, mapbox_token: str,
+def geocode_records(records: list, google_keyen: str,
                     country_code: str = "", country_name: str = "") -> list:
     """Add lon/lat to each record. Only geocodes records that have a real address.
     Property names and descriptions are NOT used as geocoding queries — they
@@ -302,7 +322,7 @@ def geocode_records(records: list, mapbox_token: str,
             continue
         query = f"{addr}{suffix}" if suffix not in addr else addr
         try:
-            lon, lat, _ = geocode_with_fallbacks([query], mapbox_token, country_code)
+            lon, lat, _ = geocode_with_fallbacks([query], google_keyen, country_code)
             r["lon"], r["lat"] = lon, lat
         except Exception:
             r["lon"], r["lat"] = None, None
@@ -496,8 +516,8 @@ def run(config_path: str = "configs/deal_config.json",
         cfg = json.load(f)
 
     subject_cfg   = cfg["subject_property"]
-    mb_cfg        = cfg.get("mapbox", {})
-    mapbox_tok    = mb_cfg.get("token", "") or _shared_mapbox_token()
+    map_cfg        = cfg.get("map", {})
+    google_key    = map_cfg.get("api_key", "") or _shared_google_key()
     oa_cfg        = cfg.get("openai", {})
     api_key       = oa_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
     search_model  = oa_cfg.get("search_model",  "gpt-4o-mini-search-preview")
@@ -541,8 +561,8 @@ def run(config_path: str = "configs/deal_config.json",
     if not api_key:
         raise ValueError("OpenAI API key not found. "
                          "Set OPENAI_API_KEY or openai.api_key in config.")
-    if not mapbox_tok:
-        raise ValueError("Mapbox token missing — add mapbox.token to config.")
+    if not google_key:
+        raise ValueError("Google Maps key missing — set google_maps_key in Shared Settings or map.api_key in the deal config.")
 
     try:
         from openai import OpenAI
@@ -569,7 +589,7 @@ def run(config_path: str = "configs/deal_config.json",
     print(f"\n[0/5] Geocoding subject property")
     s_lon, s_lat, _ = geocode_with_fallbacks(
         [f"{prop_name}, {address}", address, prop_name],
-        mapbox_tok, country_code,
+        google_key, country_code,
     )
     print(f"      {prop_name} → ({s_lon}, {s_lat})")
 
@@ -627,7 +647,7 @@ def run(config_path: str = "configs/deal_config.json",
                 if len(cleaned) != _b:
                     print(f"    [recency] dropped {_b - len(cleaned)} lease(s) older than "
                           f"{_rec_m}mo; kept {len(cleaned)}")
-                geocoded = geocode_records(cleaned, mapbox_tok, country_code, country_name)
+                geocoded = geocode_records(cleaned, google_key, country_code, country_name)
                 for r in geocoded:
                     rent  = float(r.get("asking_rent") or r.get("eff_rent") or 0)
                     key   = re.sub(r"\W+", "", str(r.get("property_name","")).lower())[:24] \
@@ -711,7 +731,7 @@ def run(config_path: str = "configs/deal_config.json",
             _cleaned = validate_dedup_rent(
                 _raw, subject_name=prop_name, subject_country=country_name,
                 subject_asset_class=subject_cfg.get("asset_class", ""))
-            _geo = geocode_records(_cleaned, mapbox_tok, country_code, country_name)
+            _geo = geocode_records(_cleaned, google_key, country_code, country_name)
             _base_srcs = _srcs or [{"title": _conn.label or _conn.name, "url": ""}]
             _added = 0
             for r in _geo:
@@ -826,13 +846,13 @@ def run(config_path: str = "configs/deal_config.json",
         render_map(
             subject_lonlat=(s_lon, s_lat),
             comps=comps_geo,
-            token=mapbox_tok,
+            token=_shared_mapbox_token(),
             output_path=out_map,
-            style=mb_cfg.get("style", "streets-v12"),
-            width=mb_cfg.get("width", 1200),
-            height=mb_cfg.get("height", 900),
-            padding=mb_cfg.get("padding", 100),
-            pin_size=mb_cfg.get("pin_size", "l"),
+            style=map_cfg.get("style", "streets-v12"),
+            width=map_cfg.get("width", 1200),
+            height=map_cfg.get("height", 900),
+            padding=map_cfg.get("padding", 100),
+            pin_size=map_cfg.get("pin_size", "l"),
         )
     else:
         print(f"\n[5/5] MAP   skipped (pass --map to generate)")
