@@ -1036,7 +1036,35 @@ table writers. Extraction changes do not raise when they go wrong — they simpl
 fewer comps — so a change is not "done" until its output has been diffed against a
 known-good run.
 
-### 17.1 Detection without an LLM (free, deterministic)
+### 17.1 What has been exercised
+
+Extraction is developed and checked against a corpus of **~50 Singapore broker reports**
+in `Input_files/`. Knowing its shape tells you where the pipeline is proven and where a
+new source is genuinely new:
+
+| Publisher | Files | Coverage |
+|---|---|---|
+| **Cushman & Wakefield** MarketBeat | 22 | Capital Markets, Office, Industrial — 1Q2024 → 4Q2025 |
+| **Savills** Sales & Investment Briefing | 14 | Q3 2023 → Q1 2026 |
+| **Colliers** Investment Report / Insights | 13 | Q3 2023 → Q1 2026 |
+| **CBRE** Figures | 1 | Q1 2026 |
+
+What that does **not** cover, and what a reviewer should treat as unproven:
+
+- **Market.** Singapore only. Korea and Japan deal configs exist and the search rules
+  are country-agnostic, but no KR/JP broker PDF is in the corpus — their table layouts
+  are untested.
+- **Comp type.** The corpus is exercised on the **sales** path. Rent and land run the
+  same four stages, but with far less coverage across formats.
+- **Publisher.** JLL, Knight Frank and Edmund Tie are absent. A new publisher means a
+  new page layout, which is exactly where Stage B/C behaviour differs (§7.2, §7.3).
+- **Language.** English reports only.
+
+A new publisher or market is therefore the case most likely to need work — start with
+the no-LLM detection probe below to see what the page actually yields before assuming
+a mapping problem.
+
+### 17.2 Detection without an LLM (free, deterministic)
 
 `extract_page_tables` makes no model call, so table *detection* can be checked
 instantly and repeatably (see §7.9):
@@ -1051,9 +1079,9 @@ for t in extract_page_tables("report.pdf", pages):
 
 This is the fastest way to tell a **detection** bug from a **model** bug.
 
-### 17.2 The baseline diff — the regression check that matters
+### 17.3 The baseline diff — the regression check that matters
 
-`Input_files/` holds ~40 broker reports. Before changing detection, snapshot every PDF;
+Before changing detection, snapshot every PDF;
 afterwards, re-run and diff. **Any file you did not intend to change must be
 byte-identical.**
 
@@ -1065,7 +1093,7 @@ byte-identical.**
 A detection change should alter only the files it targets. One that also moves
 unrelated files is matching too broadly and needs a tighter condition.
 
-### 17.3 House rules a change must not break
+### 17.4 House rules a change must not break
 
 - Every computed cell: **reported → calculated → `—`**, never `0` (§8.1)
 - Cap rates are **fractions**; use `parse_cap_rate()`, never bare `parse_num()` (§8.2)
