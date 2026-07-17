@@ -3244,19 +3244,10 @@ def render_new_deal_form():
                 if not fields.get("deal_name", "").strip():
                     fields["deal_name"] = fields["address"].split(",")[0].strip()
 
-                # Get Mapbox token directly from shared_settings.json for geocoding
-                _ss_file      = ROOT / "configs" / "shared_settings.json"
-                _mapbox_token = ""
-                if _ss_file.exists():
-                    try:
-                        _mapbox_token = json.loads(
-                            _ss_file.read_text(encoding="utf-8")).get("mapbox_token", "")
-                    except Exception:
-                        pass
-
+                # derive_market_fields geocodes with Google and reads google_maps_key
+                # from shared_settings itself — no map credential is passed in.
                 derived = derive_market_fields(
-                    fields["address"], fields["asset_class"], llm_cfg, _openai_key,
-                    mapbox_token=_mapbox_token)
+                    fields["address"], fields["asset_class"], llm_cfg, _openai_key)
                 fields.update(derived)
 
                 if not fields.get("asset_type"):
