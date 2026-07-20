@@ -1036,13 +1036,19 @@ table writers. Extraction changes do not raise when they go wrong — they simpl
 fewer comps — so a change is not "done" until its output has been diffed against a
 known-good run.
 
-### 17.1 Reports the pipeline extracts from
+### 17.1 Reports where a comp table is detected
 
-Sales-comp extraction is developed against Singapore broker research and currently
-pulls comp tables from **34 reports** across four publishers. This is the proven
-surface — a source outside it is genuinely new:
+**Read this table as "a grid was found," not "the values are correct."** It comes from
+the no-LLM detection probe (§17.2) — the report's comp table is located and its rows
+land in a grid shape. It does **not** mean the values were mapped to the right fields,
+survived qualification, or were checked against the source page. Detection is a
+necessary condition for a correct comp, not a sufficient one.
 
-| Publisher | Series | Quarters extracting |
+Only **one** report in this corpus has been checked at that deeper level — its rows
+compared by hand against the source page: `singapore-office-mb-1q2025.pdf` (§7.3's
+worked example). Everything else below is detection-only.
+
+| Publisher | Series | Quarters — grid detected |
 |---|---|---|
 | **Cushman & Wakefield** MarketBeat | Capital Markets | 4Q2023, 1Q–2Q2024, 1Q–3Q2025, 4Q2025, 1Q2026 |
 | | Office | 1Q2025, 2Q2025, 4Q2025 |
@@ -1052,10 +1058,11 @@ surface — a source outside it is genuinely new:
 | | Industrial Insights | Q1 2026 |
 | **CBRE** Figures | — | Q1 2026 |
 
-Extraction is checked at the **table level** — the report's comp table is found and its
-rows read into the schema. Coverage is by report, not by publisher: a series that
-extracts in one quarter can change layout in the next, so a new quarter is worth a
-check rather than an assumption.
+Coverage is by report, not by publisher: a series whose grid is detected in one quarter
+can change layout in the next, so a new quarter needs its own check rather than an
+assumption from the publisher name. Detection changing without warning is exactly what
+happened to `singapore-office-mb-1q2025.pdf` before the fix in §7.3 — that report would
+have appeared in a table like this one while silently returning zero real transactions.
 
 What is outside this surface, and should be treated as unproven:
 
