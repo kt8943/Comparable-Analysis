@@ -110,18 +110,20 @@ _SCALED_AMOUNT_RE = re.compile(r"\b(million|mil|mn|billion|bn)\b", re.I)
 
 
 def _split_psf_value(raw_psf, sale_type: str) -> tuple:
-    """Return (price_psf_gfa_float_or_None, sale_type). A genuine plain psf number
-    is parsed normally. A scaled absolute amount (e.g. a hotel '1.59 million/per
-    key') is NOT a per-sf price, so price_psf_gfa is left blank and no wrong psf
-    number is fabricated. The original phrase is deliberately NOT written into
-    sale_type — it stays in the record's provenance (_prov['price_psf_gfa']['cell'])
-    and remains answerable via the 'Ask this Deal' chat, which reads the source
-    PDF directly. This keeps sale_type clean (it drives stake % + asset-type
-    classification) and keeps the table uncluttered."""
+    """Return (price_psf_gfa_float_or_None, sale_type, price_psf_gfa_display).
+    A genuine plain psf number is parsed normally (display is None — nothing to
+    override). A scaled absolute amount (e.g. a hotel '1.59 million/per key') is
+    NOT a per-sf price, so the numeric price_psf_gfa is left blank (no wrong psf
+    number is fabricated / no calculation is attempted from it) — but the
+    original phrase IS preserved as-is in price_psf_gfa_display, the same
+    "keep the reported figure visible even when we can't compute from it"
+    pattern price_sgd_m_display already uses for a price range like "600-630".
+    sale_type is untouched by this (kept clean for stake % + asset-type
+    classification)."""
     s = str(raw_psf or "").strip()
     if s and _SCALED_AMOUNT_RE.search(s):
-        return None, sale_type
-    return _num(raw_psf), sale_type
+        return None, sale_type, s
+    return _num(raw_psf), sale_type, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,7 +484,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
         price_display = re.sub(r"[*†#]+", "", price_raw_str).strip() if _range_m else None
 
         sale_type = str(item.get("sale_type") or "").strip()
-        psf_val, sale_type = _split_psf_value(item.get("price_psf_gfa"), sale_type)
+        psf_val, sale_type, psf_display = _split_psf_value(item.get("price_psf_gfa"), sale_type)
         combined  = f"{sale_type} {name} {addr}"
         pct_m     = re.search(r"(\d+(?:\.\d+)?)\s*%", combined)
         frac_m    = re.search(r"\((\d+)\s*/\s*(\d+)\s*stake", combined, re.I)
@@ -503,6 +505,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "gfa_sf":              int(gfa) if gfa else None,
             "price_sgd_m":         price_m,
             "price_psf_gfa":       psf_val,
+            "price_psf_gfa_display": psf_display,
             "price_sgd_m_display": price_display,
             "remaining_yrs":   _yrs_or_none(item.get("remaining_yrs")),
             "adj_npi_yield":   _cap_rate(item.get("adj_npi_yield")),
@@ -701,7 +704,7 @@ def _parse_image_records(image_path: str, llm_cfg: dict, openai_key: str = "",
         price_display = re.sub(r"[*†#]+", "", price_raw_str).strip() if _range_m else None
 
         sale_type = str(item.get("sale_type") or "").strip()
-        psf_val, sale_type = _split_psf_value(item.get("price_psf_gfa"), sale_type)
+        psf_val, sale_type, psf_display = _split_psf_value(item.get("price_psf_gfa"), sale_type)
         combined = f"{sale_type} {name} {addr}"
         pct_m  = re.search(r"(\d+(?:\.\d+)?)\s*%", combined)
         frac_m = re.search(r"\((\d+)\s*/\s*(\d+)\s*stake", combined, re.I)
@@ -721,6 +724,7 @@ def _parse_image_records(image_path: str, llm_cfg: dict, openai_key: str = "",
             "gfa_sf":           int(gfa) if gfa else None,
             "price_sgd_m":      price_m,
             "price_psf_gfa":    psf_val,
+            "price_psf_gfa_display": psf_display,
             "price_sgd_m_display": price_display,  # "600-630" range string for Excel
             "remaining_yrs":   _yrs_or_none(item.get("remaining_yrs")),
             "adj_npi_yield":   _cap_rate(item.get("adj_npi_yield")),

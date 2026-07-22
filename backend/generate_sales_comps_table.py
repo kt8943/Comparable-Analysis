@@ -224,7 +224,11 @@ def comp_to_row(c: dict, price_unit: str = "M") -> dict:
         # string as the display value; use the numeric midpoint for psf computation.
         "price_sgd_m":   (c.get("price_sgd_m_display")
                           or _m_to_display(c.get("price_sgd_m"), price_unit)),
-        "price_psf_gfa": _calc_price_psf(c),
+        # If the source reported a scaled/qualified value we can't compute a psf
+        # from (e.g. a hotel "1.59 million/per key"), show that original figure
+        # rather than a blank — same "preserve what was reported" precedent as
+        # price_sgd_m_display above, just for this column.
+        "price_psf_gfa": (c.get("price_psf_gfa_display") or _calc_price_psf(c)),
         "ftm_cap_rate":  _blank_if_absent(c.get("ftm_cap_rate")),
         # Written statically here; _write_formulas replaces it with the live Bala
         # formula UNLESS the source reported an Adj. Cap Rate of its own, which

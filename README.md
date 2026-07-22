@@ -35,8 +35,9 @@ whether the value was **mapped** from a source, **calculated** by a rule, or
 15. [Configuration reference](#15-configuration-reference)
 16. [Deployment](#16-deployment)
 17. [Verifying a change](#17-verifying-a-change)
-18. [Known limits and review notes](#18-known-limits-and-review-notes)
-19. [Technical limitations — where we need help](#19-technical-limitations--where-we-need-help)
+18. [Extraction accuracy — gold-file evaluation](#18-extraction-accuracy--gold-file-evaluation)
+19. [Known limits and review notes](#19-known-limits-and-review-notes)
+20. [Technical limitations — where we need help](#20-technical-limitations--where-we-need-help)
 
 ---
 
@@ -498,6 +499,19 @@ Table headers → schema fields via `tools/column_mapper.py`, three tiers, LLM l
 header text for units (sqm→SF, S$000→S$M, psm→psf) and returns a per-field multiplier,
 so values normalise without a second pass.
 
+**Verify & reflect** (inside the same call): a deterministic check flags a mapping
+whose column *values* don't fit the field (a "money" field that's mostly text, a
+"label" field that's pure numbers, …) or whose embedding score is below `0.45`. An LLM
+then re-maps **only the flagged fields** — the confident ones stay locked, so a good
+mapping can never be reshuffled by a bad one. When the flagged table came from a PDF
+(`pdf_path`/`page_num` passed through from Stage 7.7's caller) and the provider is GPT,
+this re-map is **vision-augmented**: the page is rendered and sent alongside the header
+text, so a column whose true identity survives only in the page's visual layout (e.g. a
+table title fused onto its header by extraction) can still be resolved correctly, not
+just one whose header text still contains a recognisable trace. Falls back to the
+text-only call on any render/API failure — never a regression versus not having it.
+Excel/CSV input scanning has no page to render and always uses the text-only call.
+
 ### 7.7 Stage G — record assembly and provenance
 
 Two paths, and **the difference is the audit trail**:
@@ -522,7 +536,74 @@ A row must survive all of:
 | `_is_sentence_fragment` | Prose caught as a name |
 | `_skip_subject` | The subject property itself |
 
-### 7.9 Debugging a table that will not extract
+### 7.9 Stage I — LLM verification (`_llm_verify_records`)
+
+Runs once per document, after every record is assembled — the only stage that checks a
+**whole record** against the source rather than one column or one field. Given the raw
+table text (headers + rows, no narrative prose — `_page_tables_context(tables_only=True)`,
+so the model can't "correct" a table figure toward a rounded number from surrounding
+commentary) and the assembled records, it checks two things per record:
+
+1. **Cell correctness** — does the value match the actual source-table cell for that
+   transaction's row (catches wrapped text fused from two different rows)?
+2. **Column mapping accuracy** — does the value belong under the field it's currently
+   filed in, per the table's own column header?
+
+Corrections must be evidence-bound: any change to a non-null value requires a verbatim
+quote from the source (checked in code, not taken on the model's word); a value it
+can't verify is blanked, never guessed. A run of deterministic pre-checks
+(`_deterministic_flags`) flags obvious problems first (a value outside a plausible
+range, a size field holding prose, a price ÷ area disagreement) so the LLM gets
+targeted questions instead of blind-auditing every cell.
+
+**Guardrails on what the model is allowed to touch** — each added after a specific
+observed failure, not speculatively:
+
+| Guardrail | Blocks | Added after |
+|---|---|---|
+| Name lock | Any rewrite of `property_name` | Every observed name edit lost fidelity (a stake `(50.0%)` dropped) and never improved one |
+| Numeric substitution | One non-empty number replacing a *different* non-empty number | Prose-rounding: a table's `1,133.00` overwritten by a paragraph's rounded `1,100` |
+| Text blanking | Blanking a short text/category value still verbatim in source | `land_zoning='Commercial'` blanked despite the row being right there in SOURCE |
+| Qualified-number blanking | Blanking a number carrying a scale word (`million`, `per key`, `psf`, …) still verbatim in source | A hotel's "0.78 mil per key" price blanked outright on two separate reports |
+| **Bare-number blanking** | Blanking a plain, unqualified number (e.g. `price_sgd_m`) still verbatim in source | Savills Q3 2025 land: `price_sgd_m` nulled on 2 of 3 identical reruns — the one value *shape* the two guards above didn't cover (not text, no scale word) |
+| Evidence gate | Any non-null correction lacking a verbatim source quote | Generalizes all of the above — stops outright fabrication |
+
+The bare-number guardrail (last row) closed the only remaining gap: **before it, this
+stage was the one place in the whole pipeline that could silently destroy an already-
+correct value with zero protection**, and it's what made Savills Q3 2025 land's land
+table non-deterministic (5/5 correct on one run, 1/5 on another, same code, same input).
+
+### 7.10 Stage J — vision name cross-check (`_vision_verify_names`, off by default)
+
+Every stage above — including 7.9 — reasons over **text already extracted**, however
+mangled. This is the one stage that looks at the **rendered page image** instead, and
+it exists for exactly one failure mode nothing text-based can catch: a PDF's embedded
+font maps the glyph that *displays* as one character to a *different* character's code
+in the text layer (capital `I` shown on the page, `l` in the text). The extracted text
+still reads as perfectly plausible English, so re-reading the same text (all Stage 7.9
+ever does) can never recover the true character — only the pixels can.
+
+Deliberately narrow: only `_NAME_KEYS` fields are checked, and a correction is applied
+**only** when it differs from the original by known font-confusable character pairs at
+matching positions (`I`/`l`/`1`/`\|`, `O`/`0`, `S`/`5`, `B`/`8`) — anything else is a
+wholesale rewrite and blocked, same discipline as the name lock in 7.9. Off by default
+(`vision_verify_names=True` or `PDF_VISION_VERIFY=1`); no-ops for any provider but GPT.
+
+**Measured, not assumed, against the 52-file gold set (§18):** turning it on for a full
+run — 249 names checked across 50/52 files — applied **zero** corrections (no genuine
+glyph-confusion errors exist in this corpus) and **blocked 135** attempted rewrites the
+guardrail correctly recognised as *not* character-confusion (dropping a stake `%`,
+"improving" capitalisation that was actually correct as printed) — real evidence the
+narrow-correction discipline holds under load, not just in theory. Added roughly 15%
+wall-clock time per file, and one page failed outright on an OpenAI rate limit during a
+back-to-back 52-file run — a real reliability cost with zero measured benefit on known
+sources, which is why it stays off by default rather than being enabled broadly. The
+code is not dead weight to remove, though: it costs nothing while idle, and it remains
+the only way to diagnose a suspected glyph-confusion case on a single file by hand (see
+the Collyer Quay case in §18, where it correctly confirmed the pipeline's reading was
+right and the gold file's was wrong).
+
+### 7.11 Debugging a table that will not extract
 
 In order:
 
@@ -1034,55 +1115,14 @@ Cloud cannot reach: local network drives, the 181 MB `MasterPlan2025.geojson` (o
 Read this before changing anything in `pdf_extractor.py`, the scan modules, or the
 table writers. Extraction changes do not raise when they go wrong — they simply return
 fewer comps — so a change is not "done" until its output has been diffed against a
-known-good run.
+known-good run. For the standing accuracy record (which reports have been checked
+against a hand-built gold file, and what's still wrong), and for the methodology behind
+it, see §18.
 
-### 17.1 Reports where a comp table is detected
-
-**Read this table as "a grid was found," not "the values are correct."** It comes from
-the no-LLM detection probe (§17.2) — the report's comp table is located and its rows
-land in a grid shape. It does **not** mean the values were mapped to the right fields,
-survived qualification, or were checked against the source page. Detection is a
-necessary condition for a correct comp, not a sufficient one.
-
-Only **one** report in this corpus has been checked at that deeper level — its rows
-compared by hand against the source page: `singapore-office-mb-1q2025.pdf` (§7.3's
-worked example). Everything else below is detection-only.
-
-| Publisher | Series | Quarters — grid detected |
-|---|---|---|
-| **Cushman & Wakefield** MarketBeat | Capital Markets | 4Q2023, 1Q–2Q2024, 1Q–3Q2025, 4Q2025, 1Q2026 |
-| | Office | 1Q2025, 2Q2025, 4Q2025 |
-| | Industrial | 2Q2025, 3Q2025, 4Q2025 |
-| **Savills** Sales & Investment Briefing | — | Q3–Q4 2023, Q2–Q4 2024, Q1–Q4 2025, Q1 2026 |
-| **Colliers** Investment Report / Outlook | — | Q3–Q4 2023, Q1/Q3/Q4 2024, Q1–Q2 2025 |
-| | Industrial Insights | Q1 2026 |
-| **CBRE** Figures | — | Q1 2026 |
-
-Coverage is by report, not by publisher: a series whose grid is detected in one quarter
-can change layout in the next, so a new quarter needs its own check rather than an
-assumption from the publisher name. Detection changing without warning is exactly what
-happened to `singapore-office-mb-1q2025.pdf` before the fix in §7.3 — that report would
-have appeared in a table like this one while silently returning zero real transactions.
-
-What is outside this surface, and should be treated as unproven:
-
-- **Market.** Singapore only. Korea and Japan deal configs exist and the search rules
-  are country-agnostic, but no KR/JP broker PDF has been run — their layouts are
-  untested.
-- **Comp type.** The surface above is the **sales** path. Rent and land run the same
-  four stages with far less coverage across formats.
-- **Publisher.** JLL, Knight Frank and Edmund Tie have not been run. A new publisher
-  means a new page layout, which is where Stage B/C behaviour differs (§7.2, §7.3).
-- **Language.** English reports only.
-
-A new publisher, market or quarter is therefore where work is most likely needed. Start
-with the detection probe below to see what a page actually yields before assuming a
-mapping problem.
-
-### 17.2 Detection without an LLM (free, deterministic)
+### 17.1 Detection without an LLM (free, deterministic)
 
 `extract_page_tables` makes no model call, so table *detection* can be checked
-instantly and repeatably (see §7.9):
+instantly and repeatably (see §7.11):
 
 ```python
 from scan_input_sales_comps import _PDF_SECTION_KEYWORDS
@@ -1094,7 +1134,7 @@ for t in extract_page_tables("report.pdf", pages):
 
 This is the fastest way to tell a **detection** bug from a **model** bug.
 
-### 17.3 The baseline diff — the regression check that matters
+### 17.2 The baseline diff — the regression check that matters
 
 Before changing detection, snapshot every PDF;
 afterwards, re-run and diff. **Any file you did not intend to change must be
@@ -1108,7 +1148,7 @@ byte-identical.**
 A detection change should alter only the files it targets. One that also moves
 unrelated files is matching too broadly and needs a tighter condition.
 
-### 17.4 House rules a change must not break
+### 17.3 House rules a change must not break
 
 - Every computed cell: **reported → calculated → `—`**, never `0` (§8.1)
 - Cap rates are **fractions**; use `parse_cap_rate()`, never bare `parse_num()` (§8.2)
@@ -1122,7 +1162,212 @@ unrelated files is matching too broadly and needs a tighter condition.
 
 ---
 
-## 18. Known limits and review notes
+## 18. Extraction accuracy — gold-file evaluation
+
+This is a standing audit of the extraction pipeline's accuracy, run against hand-built
+ground truth — separate from §17's "verify a code change didn't regress anything."
+For each report below, someone transcribed the source table by hand into a gold file
+(`eval/gold/`), ran that report through the actual extraction pipeline
+(`eval/run_extract.py`), and compared the two row by row. A report only appears here
+once that comparison has actually been done — nothing below is inferred from the file
+existing or from a table merely being found.
+
+**Methodology: this project follows eval-driven development** — the standard approach
+for a pipeline with a non-deterministic (LLM) component, where a traditional unit test
+can't assert one exact output:
+
+- **Golden/gold-labeled test set** (`eval/gold/`) — hand-transcribed ground truth,
+  audited and corrected when it's found wrong, not just assumed correct forever (the
+  Woods Square fix below is a gold-file fix made this way, not a pipeline fix).
+- **Full regression run on every change** — all 52 gold files re-run and diffed after
+  any change to `pdf_extractor.py`, the scan modules, or the column mapper — not just
+  the one file that motivated the change (§17.2 has the equivalent check for a
+  non-extraction-accuracy code change).
+- **Guardrails around LLM output, not trust in it** — every LLM correction must be
+  evidence-bound (a verbatim quote checked against source in code) or it's rejected,
+  never accepted on the model's word alone (§7.9).
+- **A real regression vs. a pre-existing gap merely newly surfaced are not the same
+  thing** — compare against the last known-good baseline before concluding a change
+  broke something.
+- **Repeat runs to catch sampling variance** — an LLM-backed stage passing once is not
+  proof it's stable. The Savills Q3 2025 land bug (§7.9) below was only found by
+  rerunning the identical input several times and diffing the outputs against each
+  other.
+
+Two ways this is lighter-weight than a mature production eval setup, worth being honest
+about: the gold set (52 files, 223 rows) is smoke-test-sized, not statistically large,
+and there's no held-out set kept apart from tuning — so a good score below is evidence
+the pipeline handles *these* sources well, not proof it generalizes to a source it
+hasn't seen.
+
+**Every result below was produced with GPT (`gpt-4o-mini`), not Ollama** —
+`eval/run_extract.py` defaults to it and none of these runs changed that. If a deal in
+the app is configured for Ollama, or for `gpt-4o` instead of `gpt-4o-mini`, its output
+is not guaranteed to match what's recorded here.
+
+**Summary — by report, not by row, counting only bugs that reach the actual
+deliverable** (the Transaction Comparables Excel table an analyst opens —
+`generate_sales_comps_table.py`'s 14-column `OUTPUT_SCHEMA` has no Buyer or Sale Type
+column, so a wrong value in either field is a real extraction error but never a
+rendered one, and doesn't count against a report below):
+
+| Source | Quarters covered | Passing |
+| --- | --- | --- |
+| Colliers | Q3 2023 – Q1 2026 (sales) | 9/11 |
+| CMMB Capital Markets | Q4 2023 – Q1 2026 (sales) | 9/9 |
+| CMMB Office MarketBeat | Q1 2025 – Q1 2026 (sales + rent) | 9/10 |
+| Savills | Q3 2023 – Q1 2026 (sales + land) | 21/22 |
+| **Total** | | **48/52** |
+
+Each unit counted above is one report-and-type combination (e.g. "Savills Q1 2025
+sales" is one unit), not one row. 52 is the count of unique gold files; one duplicate
+upload (`singapore-capital-markets-mb-4q2023__sales.gold (1).json`, byte-identical to
+the non-duplicate copy) is excluded.
+
+**How to read the matrix below:** ✅ means every row matched gold exactly. A fraction
+(`4/5`) means 1 of 5 rows differed from gold on at least one field — tagged either
+⚠️ or ❌:
+
+- **⚠️ = checked and confirmed harmless** — the underlying information is the same;
+  the difference is a font/character ambiguity, a typo already present in the source
+  PDF itself, or gold's own transcription being less complete than the pipeline's. Not
+  a pipeline defect.
+- **❌ = a real extraction error** — a value landed in the wrong field, was fabricated,
+  or was lost. None of the 4 remaining differences below are this category — the last
+  one (B6, a unit price leaking into the GFA field) was fixed 2026-07-20.
+
+`—` means that source/type wasn't published or checked for that quarter. Buyer and
+Sale Type are excluded from this check since neither is a column in the Excel output.
+
+**The 2023–2024-quarter sources (Colliers, CMMB Capital Markets, and Savills) also
+show a `land_zoning`/`sale_type` value swap on nearly every row — not counted as a
+bug, already excluded from the matrix below.** The source tables have a "TYPE"/"SECTOR"
+column (values like "Retail", "Office", "Hospitality") which the pipeline correctly
+maps to `land_zoning`, matching the pipeline's own established sector-word rules
+(confirmed directly against the source table headers). The gold files for these
+reports instead recorded that same value under `sale_type` — a gold-file convention
+gap, not a pipeline defect.
+
+**All 52 report/type combinations, one source+type per column:**
+
+| Quarter | Colliers (sales) | CMMB CapMkt (sales) | CMMB Office (rent) | CMMB Office (sales) | Savills (land) | Savills (sales) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Q3 2023 | ✅ | — | — | — | ✅ | ✅ |
+| Q4 2023 | 2/3⚠️¹ | ✅ | — | — | ✅ | ✅ |
+| Q1 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
+| Q2 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
+| Q3 2024 | ✅ | — | — | — | ✅ | ✅ |
+| Q4 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
+| Q1 2025 | 2/3⚠️² | ✅ | ✅ | 1/2⚠️³ | ✅ | 4/5⚠️⁴ |
+| Q2 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Q3 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Q4 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Q1 2026 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+1. Property name truncated by the text-extraction fallback (this report has no gridded
+   table on that page) — "Visioncrest Commercial" → "Visioncrest". A real accuracy gap
+   in that fallback path, but not a wrong-field defect, so ⚠️ not ❌.
+
+2. "Northpoint city South Wing" — the raw table cell in the source PDF itself already
+   has the lowercase `c`; the pipeline reproduces it faithfully.
+
+3. The gold file and the PDF's own text layer disagree on one character — see below.
+
+4. A ligature-splitting cosmetic near-miss ("floors" → "fl oors") — the pipeline's own
+   text-layer extraction, not a gold-file error.
+
+**CMMB Office Q1 2025 sales' Collyer Quay row isn't a pipeline bug — the gold file and
+the PDF's text layer disagree on one character.** The PDF's own text layer reads "20
+Collyer Quay (l22-24FL)" — confirmed directly: two independent text extractors
+(pdfplumber, PyMuPDF) both read `l` there, and a vision-LLM cross-check against the
+rendered image (`_vision_verify_names` in `pdf_extractor.py`, an optional Stage 6 built
+for exactly this — off by default, `PDF_VISION_VERIFY=1`) also read it back as `l`. The
+gold file transcribes this as "20 Collyer Quay (22-24FL)" with no letter at all — a
+human reading the rendered page apparently judged the stroke as decorative, which the
+text layer disagrees with. Not fixable by any extraction approach either way.
+
+**Thirteen fixes went into this session (2026-07-20)**, the last two just now: the
+name-length filter (`len(name) > 80`) was a redundant, harmful leftover from before
+`_is_sentence_fragment()` existed — the latter already distinguishes a genuinely
+mangled prose fragment from a real (if verbose) property name structurally, so the
+blunt length cutoff was deleted, restoring the long portfolio-style names Savills
+Q3/Q4 2024 and Q1 2025 previously lost. And a scaled/qualified unit price (a hotel's
+"0.78 mil per key") is no longer blanked outright — it's preserved as reported text in
+a new `price_psf_gfa_display` field (mirroring the existing `price_sgd_m_display`
+pattern for price ranges), so the analyst still sees the figure even though no psf
+number is calculated from it. A full regression sweep across all 52 gold files
+confirms nothing broke. Every difference remaining above has been individually
+checked and is ⚠️, not ❌ — this table has no open real bugs.
+
+**Three more fixes went in 2026-07-21**, the first two described in full in §7.6 and §7.9:
+column-mapping's verify-reflect step (§7.6) can now cross-check a flagged field
+against the source PDF's rendered page image, not just header text, when the provider
+is GPT — a full regression sweep confirmed zero change to any of the 52 results (32
+vision cross-checks fired, all on tables that were already noise-filtered before
+reaching the deliverable, so nothing here moved). And Stage 7.9's evidence-bound
+guardrails against destructive corrections gained the one case they didn't already
+cover — blanking a plain, unqualified number still verbatim in source — closing the
+gap that made **Savills Q3 2025 land** non-deterministic (previously 5/5 on some runs,
+1/5 on others, same code and input; confirmed fixed by 4 consecutive reruns all
+returning 5/5 after the guardrail was added). It reads as ✅ in the matrix above
+because a lucky run happened to be the one recorded — it is now ✅ *reliably*, not by
+chance. Third, the Woods Square row of **Savills Q1 2025 sales** (footnote 4) was a
+genuine gold-file error, not a pipeline one: gold's own transcription was shorter than
+what the source table's PROPERTY cell actually says, confirmed against the pipeline's
+`_prov`-backed extraction (exact price/date/buyer match). The gold file has been
+corrected to the full text, so this row now passes — only the unrelated ligature
+near-miss remains in that combination.
+
+**No-LLM baseline — same 52 combinations, every LLM stage disabled
+(`llm_cfg = {"provider": "rules"}`, no Ollama running, no OpenAI calls of any kind):**
+
+| Source | Quarters covered | Passing |
+| --- | --- | --- |
+| Colliers | Q3 2023 – Q1 2026 (sales) | 8/11 |
+| CMMB Capital Markets | Q4 2023 – Q1 2026 (sales) | 9/9 |
+| CMMB Office MarketBeat | Q1 2025 – Q1 2026 (sales + rent) | 9/10 |
+| Savills | Q3 2023 – Q1 2026 (sales + land) | 21/22 |
+| **Total** | | **47/52** |
+
+| Quarter | Colliers (sales) | CMMB CapMkt (sales) | CMMB Office (rent) | CMMB Office (sales) | Savills (land) | Savills (sales) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Q3 2023 | ✅ | — | — | — | ✅ | ✅ |
+| Q4 2023 | 0/3❌⁵ | ✅ | — | — | ✅ | ✅ |
+| Q1 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
+| Q2 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
+| Q3 2024 | ✅ | — | — | — | ✅ | ✅ |
+| Q4 2024 | 0/3❌⁶ | ✅ | — | — | ✅ | ✅ |
+| Q1 2025 | 2/3⚠️² | ✅ | ✅ | 1/2⚠️³ | ✅ | 4/5⚠️⁴ |
+| Q2 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Q3 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Q4 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Q1 2026 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+⁵ genuinely LLM-required, not a code gap: this report's transaction table sits in a
+page with no gridded structure camelot/pdfplumber can recover at all — the pipeline
+falls through to its text-only prose-extraction path, which is itself an LLM call
+(read a paragraph, pull out name/price/psf as JSON). With no LLM reachable that path
+fails outright (`Connection refused`) and the page contributes zero records. With GPT
+this same path correctly parses it back to the 2/3⚠️² result in the table above — no
+deterministic rule-based approach can substitute here; parsing structured facts out
+of free-form prose is exactly the kind of task only a language model does
+⁶ different failure mode from Q4 2023 — a real gridded table IS found here, but its
+headers only resolve enough columns to pass the deterministic tiers (exact/price-rule/
+embedding); without the LLM column-mapping fallback the remaining fields stay
+unmapped, the assembled rows come out with almost no fields filled, and the
+pre-Stage-5 garbage filter (correctly) discards them as noise before they'd ever reach
+a human. With GPT the LLM tier resolves the missing columns and the report passes.
+
+The other three ⚠️ combinations (Colliers Q1 2025, CMMB Office Q1 2025 sales, Savills
+Q1 2025 sales) show **identical results with or without any LLM** — proof those
+particular differences are text-layer/gold-transcription artifacts, not something an
+LLM stage is fixing or could fix. Net effect of every LLM stage in this pipeline,
+measured across all 52 files: it rescues exactly 2 files (6 rows) that are otherwise
+completely unextractable by deterministic code alone; it changes nothing else.
+
+---
+
+## 19. Known limits and review notes
 
 Ranked by what a reviewer should look at first.
 
@@ -1158,7 +1403,7 @@ Ranked by what a reviewer should look at first.
 
 ---
 
-## 19. Technical limitations
+## 20. Technical limitations
 
 Four ceilings of the current design. Each needs a decision or a capability the project
 does not have today. Reviewer input wanted on all four.

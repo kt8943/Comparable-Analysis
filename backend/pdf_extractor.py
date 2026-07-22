@@ -498,6 +498,39 @@ def _is_unit_subtitle_row(row: list) -> bool:
     )
 
 
+_HDR_UNIT_TOKEN_RE = re.compile(
+    r"(sgd|s\$|psf|per\s*sf|million|billion|/sf|/psf|ppr|sqm|sq\s?ft|nla|gfa|%)",
+    re.I,
+)
+
+
+def _is_header_cont_row(row: list) -> bool:
+    """
+    True if a row is a WRAPPED header continuation — the unit subtitle of a
+    multi-line column header that camelot 'stream' split onto its own row(s),
+    e.g. a Colliers 'Property | Price | Unit | Buyer | Seller' header whose
+    unit lines wrap as ['', '(SGD', 'Price', '', ''] then
+    ['', 'million)', '(SGD/psf)', '', ''].
+
+    _is_unit_subtitle_row only catches a subtitle that is a SINGLE row of
+    fully-parenthetical cells; this catches the harder case where the subtitle
+    is split across two rows and mixes a bare label word ('Price') with a
+    partial parenthetical ('(SGD', 'million)'). Kept deliberately tight so it
+    can never swallow a real transaction row: no cell may contain a digit (every
+    transaction carries a numeric price), at least one cell must be a
+    parenthetical fragment carrying a currency/area unit token, and every cell
+    must be short (a header tail, not a property name).
+    """
+    ne = [str(c or "").strip() for c in row if str(c or "").strip()]
+    if not ne:
+        return False
+    if any(any(ch.isdigit() for ch in c) for c in ne):
+        return False
+    if not any(("(" in c or ")" in c) and _HDR_UNIT_TOKEN_RE.search(c) for c in ne):
+        return False
+    return all(len(c) <= 20 for c in ne)
+
+
 def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
     """
     Reassemble transaction rows whose cells wrapped onto several physical rows.
@@ -525,6 +558,30 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
     )
     if price_col is None:
         return rows
+    # The unit-price / psf column, if the table has one. Used to rescue a psf
+    # value that camelot wrapped onto the PRICE cell's second line instead of
+    # placing it in its own column (see the price-cell cleanup below).
+    psf_col = next(
+        (i for i, h in enumerate(headers)
+         if ('unit' in hn(h) and 'price' in hn(h)) or 'psf' in hn(h)),
+        None
+    )
+
+    # A table-footer citation line ("Sources: Colliers, RCA.", "Source: CBRE
+    # Research") sometimes survives as its own camelot row directly below the
+    # last transaction, with every other column empty and no price of its
+    # own — so it has no anchor and gets treated as an ownerless fragment.
+    # The nearest-anchor logic below then (correctly, by distance) attaches
+    # it to the last real transaction, gluing the citation onto that row's
+    # property name (e.g. "REC facility (51%) Sources: Colliers, RCA."). That
+    # fused string reads as a sentence and trips _is_sentence_fragment()
+    # downstream, discarding the ENTIRE record — including its real, valid
+    # name. Drop citation-only rows here, before fragment assignment, so
+    # they never get the chance to attach to anything.
+    _FOOTER_CITATION_RE = _re.compile(r'^sources?\s*:', _re.I)
+    rows = [r for r in rows
+            if not (sum(1 for c in r if str(c).strip()) == 1
+                    and _FOOTER_CITATION_RE.match(str(next(c for c in r if str(c).strip())).strip()))]
 
     name_col = next(
         (i for i, h in enumerate(headers)
@@ -627,6 +684,27 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
             collected[max(above)].append((i, row))
             continue
 
+        # A row with NO name-column text at all cannot be a lead-in fragment of
+        # a not-yet-reached transaction's wrapped name (a genuine name-wrap has
+        # name text on every one of its lines — see the chain logic above,
+        # which already claims those). It can only be a continuation of some
+        # OTHER column (e.g. a Buyer/Seller cell's tail line), which is always
+        # printed AFTER its own anchor's row and BEFORE the next one (camelot
+        # preserves top-to-bottom order — nothing wraps backward above its own
+        # row) — so the correct anchor is the nearest one ABOVE. Bidirectional
+        # nearest-distance breaks the moment such a cell (e.g. a 4-line Buyer
+        # name) has more lines than roughly half the gap to the NEXT anchor,
+        # pulling its own tail lines onto that later, unrelated transaction.
+        # A row that DOES carry name text keeps the original bidirectional
+        # rule below — it may legitimately be the lead-in of an anchor not
+        # reached yet (e.g. 'Portfolio of two properties (9 Tai' wrapping
+        # forward into a price row several lines later).
+        if not frag_name:
+            same_or_above = [a for a in anchor_idxs if a <= i]
+            if same_or_above:
+                collected[max(same_or_above)].append((i, row))
+                continue
+
         def _key(a):
             dist = abs(a - i)
             # prefer an anchor that still has an empty cell where this fragment
@@ -650,16 +728,64 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
                     out_row[ci] = (out_row[ci] + ' ' + v).strip() if out_row[ci] else v
         merged.append(out_row)
 
+    # Is this table row-INDEX enumerated at all? A camelot fragment-wrap can
+    # place the SAME table's index digit with a newline on one row ("1\nSouth
+    # Beach") and a plain space on another ("2 Mapletree Industrial Trust
+    # portfolio") — both are the same 1,2,3… numbering scheme, just wrapped
+    # differently — so evidence from EITHER separator counts toward "this
+    # table is enumerated". Only the SPACE-separated shape is ambiguous on its
+    # own (it also matches a real street number that coincidentally equals its
+    # own row position, e.g. "5 Science Park Drive" at row 5), so it is gated
+    # on this table-wide evidence; a NEWLINE-separated leading index is
+    # unambiguous by itself (a real street number is never typed with a line
+    # break straight after just the digits) and is always stripped regardless
+    # (see the loop below) — it doesn't need this gate, but still contributes
+    # evidence that the table as a whole is numbered.
+    if name_col < len(merged[0] if merged else []):
+        _n_enum = sum(
+            1 for _p, _r in enumerate(merged, 1)
+            if name_col < len(_r)
+            and _re.match(rf'^0*{_p}[\s\n]', str(_r[name_col]))
+        )
+        _is_space_enumerated = _n_enum >= 2 and _n_enum >= len(merged) * 0.5
+    else:
+        _is_space_enumerated = False
+
     # Clean up cell values
     for pos, row in enumerate(merged, 1):
         # Property name: strip a leading row-INDEX only — a number that equals
         # this row's position in the table (the sequential 1,2,3… that some
-        # reports print before each deal). A leading number that does NOT match
-        # the position is a real street number ("78 Shenton Way", "21 Carpenter")
-        # and is kept.
+        # reports print before each deal). A NEWLINE-separated index is always
+        # stripped (unambiguous); a SPACE-separated one only when the table is
+        # confirmed space-enumerated (see above) — otherwise it is a real
+        # street number ("78 Shenton Way", "5 Science Park Drive") and is kept.
         if name_col < len(row):
-            p = _re.sub(r'\n\d+\s*', ' ', row[name_col])  # "Raffles \n3 Place" → "Raffles  Place"
-            p = _re.sub(rf'^0*{pos}[\s\n]+', '', p)       # "1\nSouth Beach"/"2 Mapletree" → name
+            # Strip the leading row-index FIRST, then clean up any remaining
+            # embedded digit. Doing it in the other order is wrong whenever the
+            # real name's own leading street number directly follows the index
+            # newline (e.g. "3\n20 Harbour Drive", pos=3): the embedded-digit
+            # regex used to run first and matched '\n20 ' as if it were a
+            # stray mid-name artifact, deleting the genuine street number ("3
+            # Harbour Drive") before the index-strip step even got a chance to
+            # remove just the "3". Stripping the known index first removes the
+            # ambiguity — nothing after it can be mistaken for the index.
+            p = _re.sub(rf'^0*{pos}\n\s*', '', row[name_col])            # "1\nSouth Beach"/"3\n20 Harbour Drive" → name (always safe)
+            if _is_space_enumerated:
+                p = _re.sub(rf'^0*{pos}[^\S\n]+', '', p)                 # "2 Mapletree" → name (only when table is confirmed enumerated)
+            # Embedded stray digit cleanup: a wrapped fragment can land the
+            # index mid-cell instead of at the very start ("Portfolio of 7
+            # \n2 industrial properties", "REC facility (51%)\n3") after
+            # column-wise fragment joining. Always safe — a newline directly
+            # before a bare number inside a cell is a layout artifact, never
+            # part of a real name.
+            p = _re.sub(r'\n\d+\s*', ' ', p)               # "Raffles \n3 Place" → "Raffles  Place"
+            # Strip a trailing footnote-marker digit that follows a CLOSED
+            # parenthetical qualifier ("Woods Square (33.33% stake) 2" →
+            # "Woods Square (33.33% stake)"). A real name never ends in ") N",
+            # so this only ever removes a superscript footnote reference that
+            # camelot flattened onto the name; names ending in a bare number
+            # ("… Tower 2") have no preceding ')', so they are untouched.
+            p = _re.sub(r'(\))\s*\d{1,2}$', r'\1', p.strip())
             row[name_col] = ' '.join(p.split())
         # Price: keep only the first numeric line (drop overflowed unit-price text)
         if price_col < len(row):
@@ -668,6 +794,17 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
                 first_line = pv.split('\n')[0].strip()
                 if _re.search(r'[\d,]+\.?\d*', first_line):
                     row[price_col] = first_line
+                    # camelot sometimes wraps the UNIT-PRICE cell onto the price
+                    # cell's second line instead of its own column, e.g.
+                    # '439.00\n165 (NLA)' with the psf column left empty. The line
+                    # above keeps only '439.00' and would DROP '165 (NLA)'. If the
+                    # remainder is a psf value and the psf column is empty, move it
+                    # back there rather than discarding it.
+                    rest = ' '.join(l.strip() for l in pv.split('\n')[1:] if l.strip())
+                    if (rest and _re.search(r'\d', rest)
+                            and psf_col is not None and psf_col < len(row)
+                            and not str(row[psf_col] or '').strip()):
+                        row[psf_col] = rest
             # Pull out the numeric price, ignoring a leading '~'/'≈' or trailing
             # footnote markers ('1,231.7**', '~490.0').
             m = _re.search(r'[\d,]+\.?\d*', row[price_col])
@@ -675,6 +812,42 @@ def _merge_transaction_cont_rows(headers: list, rows: list) -> list:
                 row[price_col] = m.group(0)
 
     return merged
+
+
+def _lattice_table_likely_truncated(pdf_path: str, page_num: int, bbox) -> bool:
+    """True if more horizontal ruling lines exist directly below a camelot
+    lattice table's own bottom edge, in the same column span — a signal real
+    rows continue past what lattice actually captured.
+
+    Root cause this catches: camelot lattice builds cells from the
+    INTERSECTION of horizontal and vertical ruling lines. Some source PDFs
+    draw the vertical column dividers only alongside the FIRST data row (a
+    real, observed authoring quirk — the header + row 1 form a proper grid,
+    but rows 2+ only have horizontal top/bottom boundaries, no vertical
+    dividers). Lattice then has no line-intersections to build cells for
+    those later rows at all, and silently returns a tiny "complete-looking"
+    table (header + 1 row) with no signal that anything is missing — Phase
+    1's own completeness check (`len(rows) <= 1`) doesn't catch this, since
+    2 rows still passes it. Checking for further same-width horizontal lines
+    just below the table's own bottom edge catches it before Phase 1 accepts
+    a truncated table over the Phase 2 path (pdfplumber column hints +
+    camelot stream) that's actually built to handle partial ruling lines."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return False
+    x0, y_low, x1, y_high = bbox   # camelot bbox: y measured from page BOTTOM
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[page_num - 1]
+            bottom = page.height - y_low   # -> top-origin y of the table's own bottom edge
+            for line in page.lines:
+                if (bottom + 1 < line["top"] < bottom + 200
+                        and abs(line["x0"] - x0) < 20 and abs(line["x1"] - x1) < 20):
+                    return True
+    except Exception:
+        return False
+    return False
 
 
 def _camelot_raw_tables(pdf_path: str, page_num: int) -> list:
@@ -720,6 +893,11 @@ def _camelot_raw_tables(pdf_path: str, page_num: int) -> list:
             if any('\n' in h for h in first_ne):
                 continue
             if first_ne and sum(len(h) for h in first_ne) / len(first_ne) > 60:
+                continue
+            if _lattice_table_likely_truncated(pdf_path, page_num, tbl._bbox):
+                print(f"      [camelot] lattice table looks truncated ({len(rows)} "
+                      f"row(s), more ruling lines follow below it) — skipping, "
+                      f"falling through to Phase 2")
                 continue
             complete.append(rows)
         if complete:
@@ -832,11 +1010,22 @@ def _camelot_raw_tables(pdf_path: str, page_num: int) -> list:
                 # This excludes charts/sidebars that share the same horizontal band.
                 _COL_HDR_KWS = {'Seller', 'Buyer', 'Property', 'Price',
                                  'Tenant', 'Date', 'Area', 'Floor', 'Size'}
+                # First pass, no left bound (only the y-band near the anchor) — the
+                # anchor phrase (a caption like 'Figure 4: Significant Private
+                # Transactions...') is not always left-aligned with the table's own
+                # header row, and can start to the RIGHT of the table's leftmost
+                # column. Filtering by region_x0 too early then excludes that
+                # column's own header word (e.g. 'Property') from detection
+                # entirely, merging it into the next column. Find the header words
+                # first, then let them pull region_x0 left if they extend past it.
+                _hdr_band = [w for w in words
+                             if w['text'] in _COL_HDR_KWS
+                             and abs(w['top'] - anchor_y) <= 50]
+                if _hdr_band:
+                    region_x0 = min(region_x0,
+                                     max(0, min(w['x0'] for w in _hdr_band) - 10))
                 col_hdr_wds = sorted(
-                    [w for w in words
-                     if w['text'] in _COL_HDR_KWS
-                     and w['x0'] >= region_x0
-                     and abs(w['top'] - anchor_y) <= 50],
+                    [w for w in _hdr_band if w['x0'] >= region_x0],
                     key=lambda w: w['x0']
                 )
                 if col_hdr_wds:
@@ -874,6 +1063,17 @@ def _camelot_raw_tables(pdf_path: str, page_num: int) -> list:
                             if len(rows) <= 1:
                                 continue
                             if not any(c for c in rows[0]):
+                                continue
+                            # Same truncated-lattice check as Phase 1 (see
+                            # _lattice_table_likely_truncated) — a lattice table
+                            # here can be just as truncated as a whole-page one,
+                            # and this loop's own break-on-success would
+                            # otherwise stop before ever trying 'stream', which
+                            # doesn't depend on line intersections and can
+                            # actually capture the missing rows.
+                            if (flavor == "lattice"
+                                    and _lattice_table_likely_truncated(
+                                        pdf_path, page_num, tbl._bbox)):
                                 continue
                             found.append(rows)
                         if found:
@@ -1020,7 +1220,7 @@ def _table_prices(tbl: list) -> set:
 
 
 def _map_cols(headers: list, rows: list, field_schema: list,
-              llm_cfg: dict) -> tuple:
+              llm_cfg: dict, pdf_path: str = None, page_num: int = None) -> tuple:
     """Tiered column mapping via tools/column_mapper.map_columns()."""
     col_to_key = {col: key for col, key, _ in field_schema}
     ocfg = llm_cfg.get("ollama", {}) if llm_cfg else {}
@@ -1032,6 +1232,8 @@ def _map_cols(headers: list, rows: list, field_schema: list,
         base_url=ocfg.get("base_url", "http://localhost:11434"),
         model=ocfg.get("model", "qwen2.5:3b"),
         llm_cfg=llm_cfg,
+        pdf_path=pdf_path,
+        page_num=page_num,
     )
 
 
@@ -1140,7 +1342,18 @@ def extract_page_tables(pdf_path: str, page_infos: list,
             _nonempty = [h for h in headers if h]
             if any('\n' in h for h in _nonempty):
                 _flat = [h.replace('\n', ' ').strip() for h in headers]
-                if _is_col_hdr_row(_flat):
+                # _is_col_hdr_row only recognises ALL-CAPS header words (by design —
+                # a capitalised first word alone, e.g. 'Portfolio of three...', is a
+                # false positive for the far more common case of a data row). Title-
+                # Case reports (Colliers: 'Property' / 'Buyer' / 'Seller') fail that
+                # check whenever camelot fuses two header cells onto one wrapped line
+                # (e.g. 'Property\nPrice'), so the flattened header IS still short,
+                # recognisable column vocabulary — accept that specific shape too.
+                _short_titlecase_hdr = (
+                    _hdr_has_name(_flat) and _hdr_has_price(_flat)
+                    and all(len(h.split()) <= 4 for h in _flat if h)
+                )
+                if _is_col_hdr_row(_flat) or _short_titlecase_hdr:
                     # genuine multi-line column header (e.g. pdfplumber line table
                     # 'TRANSACTION\nDATE' / 'PRICE\n(S$ MILLION)') — flatten the
                     # newlines and keep it as the header rather than discarding.
@@ -1175,9 +1388,13 @@ def extract_page_tables(pdf_path: str, page_infos: list,
             if not rows:
                 continue
 
-            # Fold a unit-subtitle row (e.g. '(SGD million)' / '(SGD/psf)') into
-            # the header so it doesn't pollute the first transaction's cells.
-            if rows and _is_unit_subtitle_row(rows[0]):
+            # Fold unit-subtitle / wrapped-header-continuation rows (e.g.
+            # '(SGD million)' / '(SGD/psf)', or a Colliers header whose unit
+            # lines wrap as ['', '(SGD', 'Price', ...] then ['', 'million)',
+            # '(SGD/psf)', ...]) into the header so they don't pollute the first
+            # transaction's cells. Loop: the subtitle can span more than one row.
+            while rows and (_is_unit_subtitle_row(rows[0])
+                            or _is_header_cont_row(rows[0])):
                 sub = rows[0]
                 # Take only the FIRST unit line per cell: when camelot merges two
                 # columns, the subtitle cell holds several units (e.g.
@@ -1189,7 +1406,7 @@ def extract_page_tables(pdf_path: str, page_infos: list,
                     for j, h in enumerate(headers)
                 ]
                 rows = rows[1:]
-                print(f"      table {tbl_idx+1}: folded unit-subtitle row into header → {headers[:4]}")
+                print(f"      table {tbl_idx+1}: folded subtitle/header-cont row into header → {headers[:4]}")
             if not rows:
                 continue
 
@@ -1259,7 +1476,14 @@ def extract_page_tables(pdf_path: str, page_infos: list,
             try:
                 import pdfplumber
                 with pdfplumber.open(pdf_path) as _pdf:
-                    text = (_pdf.pages[page_num - 1].extract_text() or "").strip()
+                    # Default x_tolerance (3) glues adjacent words together when
+                    # a PDF's text stream omits an explicit space glyph between
+                    # them (common in this report family — e.g. 'Visioncrest
+                    # Commercial' → 'VisioncrestCommercial'). A tighter tolerance
+                    # correctly splits these real word gaps without breaking
+                    # normal intra-word kerning (verified against several
+                    # reports: only ever splits genuine word boundaries).
+                    text = (_pdf.pages[page_num - 1].extract_text(x_tolerance=1.5) or "").strip()
             except Exception:
                 pass
             if text:
@@ -1385,9 +1609,6 @@ def _from_table(headers: list, rows: list, col_map: dict, unit_map: dict,
         name = str(next((rec.get(k, "") for k in _NAME_KEYS if rec.get(k)), ""))
         if _is_category_label(name):
             print(f"      SKIP (category label, not a property): {name!r}")
-            continue
-        if len(name) > 80:
-            print(f"      SKIP (garbage — name too long): {name[:60]!r}")
             continue
         if _is_sentence_fragment(name):
             print(f"      SKIP (garbage — prose sentence, not a property name): {name[:60]!r}")
@@ -1590,6 +1811,18 @@ def _norm_price(p: str) -> str:
     return re.sub(r"[*†‡\s]", "", str(p or ""))
 
 
+def _rec_table(rec: dict):
+    """The source-table id (e.g. 'p2#3') a record was extracted from, read off
+    its provenance. None when the record carries no table provenance (e.g. a
+    text-extracted record). Used to tell a genuine same-table wrapped-name
+    fragment from a same-NAME collision across two different tables."""
+    prov = rec.get("_prov") or {}
+    for v in prov.values():
+        if isinstance(v, dict) and v.get("table"):
+            return v["table"]
+    return None
+
+
 def _dedup(records: list) -> list:
     """
     Remove duplicates by exact name match OR by truncation match.
@@ -1628,24 +1861,47 @@ def _dedup(records: list) -> list:
                     break
 
         if dup_reason is not None:
-            # A comp whose name wrapped onto several PDF rows is emitted as a
-            # name-only fragment (no price) followed by the data row (with price).
-            # Merge the duplicate into the kept record — filling any empty fields
-            # and adopting a price when the kept copy lacks one — instead of
-            # discarding it (which would otherwise drop the priced copy).
             kept = kept_recs[dup_idx]
-            _rec_prov = rec.get("_prov") or {}
-            for k, v in rec.items():
-                if k == "_prov":
-                    continue
-                if v not in ("", None) and kept.get(k) in ("", None):
-                    kept[k] = v
-                    # adopt the merged copy's provenance for the field we filled
-                    if k in _rec_prov:
-                        kept.setdefault("_prov", {})[k] = _rec_prov[k]
-            if not kept_prices[dup_idx] and price:
-                kept_prices[dup_idx] = price
-            print(f"    [dedup] merged {dup_reason} duplicate: {raw!r:.60s}")
+            # A same-NAME match across two DIFFERENT source tables is not a
+            # wrapped-name fragment — it is the same building appearing in two
+            # unrelated tables (e.g. a lease table with leased SF and a sales
+            # table with a price, both on one page). Field-filling across them
+            # leaks one table's data into the other (the lease SF surfacing as
+            # the sales comp's GFA). Never cross-fill in that case: keep the
+            # copy that carries a PRICE (the real sales comp) and drop the other,
+            # importing nothing. `out` holds the same dict object as
+            # kept_recs[dup_idx], so mutate `kept` in place to propagate.
+            kt, rt = _rec_table(kept), _rec_table(rec)
+            if kt is not None and rt is not None and kt != rt:
+                kept_has_price = bool(str(kept.get("price_sgd_m") or "").strip())
+                if price and not kept_has_price:
+                    kept.clear()
+                    kept.update(rec)
+                    kept_prices[dup_idx] = price
+                    print(f"    [dedup] cross-table name collision — kept priced "
+                          f"copy: {raw!r:.50s}")
+                else:
+                    print(f"    [dedup] cross-table name collision — dropped "
+                          f"non-priced copy: {raw!r:.50s}")
+            else:
+                # Genuine same-table duplicate / wrapped-name fragment: a comp
+                # whose name wrapped onto several PDF rows is emitted as a
+                # name-only fragment (no price) followed by the data row (with
+                # price). Merge into the kept record — filling any empty fields
+                # and adopting a price when the kept copy lacks one — instead of
+                # discarding it (which would otherwise drop the priced copy).
+                _rec_prov = rec.get("_prov") or {}
+                for k, v in rec.items():
+                    if k == "_prov":
+                        continue
+                    if v not in ("", None) and kept.get(k) in ("", None):
+                        kept[k] = v
+                        # adopt the merged copy's provenance for the field filled
+                        if k in _rec_prov:
+                            kept.setdefault("_prov", {})[k] = _rec_prov[k]
+                if not kept_prices[dup_idx] and price:
+                    kept_prices[dup_idx] = price
+                print(f"    [dedup] merged {dup_reason} duplicate: {raw!r:.60s}")
         else:
             kept_norms.append(norm)
             kept_prices.append(price)
@@ -1729,7 +1985,8 @@ def _merge_tenant_fragments(rows: list, col_map: dict) -> list:
 def map_to_schema(page_tables: list, field_schema: list,
                   subject_name: str, llm_cfg: dict, dedup: bool = True,
                   reject_table_headers: list = None,
-                  extra_exclusion_note: str = "") -> list:
+                  extra_exclusion_note: str = "",
+                  pdf_path: str = None) -> list:
     """
     Stage 3 + 4: for each page entry build records.
 
@@ -1744,6 +2001,10 @@ def map_to_schema(page_tables: list, field_schema: list,
             a land/GLS table on an asset-sales run) — passed through here so
             the text-fallback path (_from_text) applies the identical check
             when that same table survives only as page text instead of a grid.
+    pdf_path : when given, lets column-mapping Stage C cross-check a flagged
+            column against the source page's rendered image (see
+            tools/column_mapper.map_columns' pdf_path/page_num). None for
+            Excel/CSV input scanning, which has no PDF page to render.
     """
     subj_tokens = (set(re.sub(r"\W+", " ", subject_name.lower()).split())
                    if subject_name else set())
@@ -1795,6 +2056,7 @@ def map_to_schema(page_tables: list, field_schema: list,
             label = f"Page {pg:>3}" + (f" {n_of}" if n_of else "")
             col_map, unit_map = _map_cols(
                 entry["headers"], entry["rows"], field_schema, llm_cfg,
+                pdf_path=pdf_path, page_num=pg,
             )
             print(f"      col_map: { {k: (entry['headers'][v] if v is not None and v < len(entry['headers']) else None) for k, v in col_map.items()} }")
             if entry["rows"]:
@@ -1912,6 +2174,14 @@ _FIELD_RANGES = {
 
 
 _PLACEHOLDER_VALUES = {"", "-", "–", "—", "n/a", "n.a.", "na", "nil", "none", "null"}
+
+# Scale/per-unit qualifiers that change a bare number's MEANING (e.g. "0.78 mil
+# per key" is a per-key price, not a psf figure) — the same class of qualifier
+# the Stage 5 system prompt already tells the model never to strip. A value
+# carrying one of these is not "just a number" for guardrail purposes, even
+# though it contains one.
+_SCALE_QUALIFIER_WORDS = ("million", "mil", "per key", "per unit", "per room",
+                           "per sf", "psf")
 
 
 def _is_placeholder(v) -> bool:
@@ -2154,6 +2424,49 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
                               f"{fk}: {before!r} → blank (value still verbatim in "
                               f"SOURCE — not a genuine mismatch)")
                         continue
+                # GUARDRAIL: never let the verifier BLANK a value that carries a
+                # real number AND a scale/per-unit qualifier (e.g. "0.78 mil per
+                # key", "0.94 million/per key") when it's still verbatim in
+                # SOURCE. This is the numeric counterpart of the text guard just
+                # above — that one explicitly excludes anything containing a
+                # number (`_sig_number(before) is None`), and the numeric-swap
+                # guard further up only blocks swapping one non-empty number for
+                # ANOTHER non-empty number, not blanking to None — so a qualified
+                # number-with-text value fell through both. Observed failure: a
+                # hotel/hospitality per-key unit price ("Hotel G", Colliers Q1
+                # 2024; "Citadines Raffles Place", Colliers Q2 2025) was blanked
+                # outright by Stage 5 on both, even though the system prompt
+                # given to the model explicitly says never to strip this exact
+                # kind of qualifier — blanking is a more destructive version of
+                # the same mistake the prompt already warns against.
+                if (val in (None, "") and before not in (None, "")
+                        and _sig_number(before) is not None
+                        and any(q in str(before).lower() for q in _SCALE_QUALIFIER_WORDS)):
+                    if str(before).lower() in context_text.lower():
+                        print(f"      [verify] BLOCKED blanking qualified value on "
+                              f"record {idx} {fk}: {before!r} → blank (value still "
+                              f"verbatim in SOURCE — not a genuine mismatch)")
+                        continue
+                # GUARDRAIL: never let the verifier BLANK a bare, unqualified
+                # NUMBER (e.g. price_sgd_m='1,012.6') that is still verbatim in
+                # SOURCE. This is the same "don't blank what's still there"
+                # protection as the two guards just above (short text values,
+                # qualified numbers) — this is the one value shape neither of
+                # those covers (the text guard explicitly requires "not a bare
+                # number"; the qualified-number guard requires a scale word like
+                # "million"/"psf"), and the shape a real Savills Q3 2025 land
+                # price fell through: Stage 5 nulled a correct, still-verbatim
+                # price_sgd_m with no genuine mismatch to justify it, on 2 of 3
+                # identical reruns — the same LLM-inconsistency failure mode the
+                # other two guards were added for, just on a bare number.
+                if (val in (None, "") and before not in (None, "")
+                        and _sig_number(before) is not None
+                        and not any(q in str(before).lower() for q in _SCALE_QUALIFIER_WORDS)):
+                    if _value_in_context(before, _ctx_norm, _ctx_nocomma):
+                        print(f"      [verify] BLOCKED blanking bare number on "
+                              f"record {idx} {fk}: {before!r} → blank (value "
+                              f"still verbatim in SOURCE — not a genuine mismatch)")
+                        continue
                 # 1a EVIDENCE GATE: any correction that sets a NON-NULL value must
                 # be traceable to the source — either the model's supplied evidence
                 # quote is verbatim in SOURCE, or the corrected value itself is.
@@ -2193,6 +2506,169 @@ def _llm_verify_records(records: list, context_text: str, field_schema: list,
     return out
 
 
+# Character pairs that look identical or near-identical in common PDF fonts —
+# the only substitutions _vision_verify_names is allowed to apply. Anything
+# outside this set is treated as a wholesale rewrite and blocked, same
+# discipline as the property_name guardrail in _llm_verify_records above.
+_CONFUSABLE_CHAR_GROUPS = (
+    frozenset({"I", "l", "1", "|"}),
+    frozenset({"O", "0"}),
+    frozenset({"S", "5"}),
+    frozenset({"B", "8"}),
+)
+
+
+def _confusable_only_diff(a: str, b: str) -> bool:
+    """True if ``a`` and ``b`` are the same length and differ only in
+    characters that are known font-confusable pairs (e.g. 'I' vs 'l')."""
+    if a == b or len(a) != len(b):
+        return False
+    for ca, cb in zip(a, b):
+        if ca == cb:
+            continue
+        if not any({ca, cb} <= grp for grp in _CONFUSABLE_CHAR_GROUPS):
+            return False
+    return True
+
+
+def _vision_verify_names(pdf_path: str, records: list, llm_cfg: dict) -> list:
+    """
+    Stage 6 (optional, off by default) — cross-check name fields against the
+    RENDERED PAGE IMAGE, not the text layer. Exists for one specific failure
+    mode no text-based stage can ever catch: a PDF whose embedded font maps
+    the glyph that *displays* as one character to a *different* character's
+    code in the text layer (e.g. a capital 'I' rendered on the page but
+    embedded as lowercase 'l'). The extracted text still reads as perfectly
+    plausible English in that case — nothing about it looks wrong — so no
+    amount of re-reading the same text (which is all Stage 5 ever does) can
+    recover the true character. Only reading the actual pixels can.
+
+    Deliberately narrow: only name fields are checked (the ones that reach
+    the deliverable), and a correction is only ever applied when it differs
+    from the original by known font-confusable characters at the same
+    positions (_confusable_only_diff) — e.g. 'l22-24FL' -> 'I22-24FL' is
+    accepted, but a differently-worded or reordered name is rejected, same
+    evidence discipline as the rest of Stage 5.
+
+    GPT-only (project preference — see llm_cfg["provider"]); no-ops for any
+    other provider rather than silently switching. No-ops if pymupdf isn't
+    installed. Costs one extra vision-LLM call per source page that
+    contributed a record — call it explicitly, it is not run by default.
+    """
+    if not records:
+        return records
+    provider = (llm_cfg or {}).get("provider", "ollama")
+    if provider != "openai":
+        return records
+    try:
+        import fitz as _fitz
+    except ImportError:
+        print("      [vision-verify] skipped — pymupdf not installed")
+        return records
+
+    from tools.vision_llm import call_vision_llm
+    import tempfile
+
+    by_page: dict = {}
+    for i, r in enumerate(records):
+        prov = r.get("_prov", {})
+        pg = None
+        for k in _NAME_KEYS:
+            m = prov.get(k)
+            if m and m.get("table"):
+                mm = re.match(r"p(\d+)#", m["table"])
+                if mm:
+                    pg = int(mm.group(1))
+                    break
+        if pg:
+            by_page.setdefault(pg, []).append(i)
+    if not by_page:
+        return records
+
+    out = [dict(r) for r in records]
+    n_checked, n_fixed = 0, 0
+    try:
+        doc = _fitz.open(pdf_path)
+    except Exception as exc:
+        print(f"      [vision-verify] could not open PDF: {exc}")
+        return records
+
+    for pg, idxs in by_page.items():
+        names = {}
+        for i in idxs:
+            n = str(next((out[i].get(k, "") for k in _NAME_KEYS if out[i].get(k)), ""))
+            if n:
+                names[i] = n
+        if not names:
+            continue
+
+        img_path = None
+        try:
+            pix = doc[pg - 1].get_pixmap(matrix=_fitz.Matrix(2, 2))
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                pix.save(tf.name)
+                img_path = tf.name
+
+            listing = "\n".join(f"{i}: {n}" for i, n in names.items())
+            prompt = (
+                "Below are property/building names extracted from this page's text, "
+                "each with an index number. Compare each one to how it is actually "
+                "printed in the image.\n\n"
+                f"{listing}\n\n"
+                "Only flag a name if a SPECIFIC CHARACTER is misread due to a font "
+                "look-alike (e.g. capital I vs lowercase l, digit 1 vs I/l, O vs 0, "
+                "S vs 5, B vs 8). Do NOT flag wording, spacing, punctuation, or "
+                "anything else — only character look-alike misreads. Output ONLY a "
+                "JSON array: [{\"index\": int, \"corrected\": \"name exactly as it "
+                "appears in the image\"}, ...]. Omit any index with no such issue."
+            )
+            raw = call_vision_llm(img_path, prompt, llm_cfg)
+        except Exception as exc:
+            print(f"      [vision-verify] page {pg} failed: {exc}")
+            continue
+        finally:
+            if img_path:
+                try:
+                    os.unlink(img_path)
+                except OSError:
+                    pass
+
+        n_checked += len(names)
+        m = re.search(r"\[[\s\S]*\]", raw)
+        if not m:
+            continue
+        try:
+            verdicts = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(verdicts, list):
+            continue
+
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            idx, corrected = v.get("index"), v.get("corrected")
+            if not isinstance(idx, int) or idx not in names or not corrected:
+                continue
+            before = names[idx]
+            if not _confusable_only_diff(before, corrected):
+                print(f"      [vision-verify] BLOCKED non-confusable rewrite on "
+                      f"record {idx}: {before!r} → {corrected!r}")
+                continue
+            for k in _NAME_KEYS:
+                if out[idx].get(k) == before:
+                    out[idx][k] = corrected
+            out[idx].setdefault("_verify_edits", []).append(
+                f"name (vision): {before!r} → {corrected!r}")
+            print(f"      [vision-verify] record {idx}: {before!r} → {corrected!r}")
+            n_fixed += 1
+
+    if n_checked:
+        print(f"      [vision-verify] {n_checked} name(s) checked against page image, "
+              f"{n_fixed} confusable-character fix(es)")
+    return out
+
+
 def extract_pdf_records(
     pdf_path: str,
     section_keywords: list,
@@ -2203,6 +2679,7 @@ def extract_pdf_records(
     reject_table_headers: list = None,
     dedup: bool = True,
     extra_exclusion_note: str = "",
+    vision_verify_names: bool = False,
 ) -> list:
     """
     Full 4-stage PDF extraction pipeline.  Public API unchanged.
@@ -2215,6 +2692,12 @@ def extract_pdf_records(
     llm_cfg          : LLM config dict from deal config
     subject_name     : subject property name to exclude from results
     max_pages        : max pages to scan (default 60)
+    vision_verify_names : run the optional Stage 6 page-image cross-check on
+                     name fields (see _vision_verify_names). Off by default —
+                     costs one extra vision-LLM call per source page and only
+                     catches one narrow failure mode (a font-encoding artifact
+                     no text-based stage can see). Also enabled by setting the
+                     PDF_VISION_VERIFY=1 environment variable.
 
     Returns
     -------
@@ -2260,7 +2743,8 @@ def extract_pdf_records(
     print(f"\n  [PDF Stage 3+4] Assembling records ...")
     records = map_to_schema(page_tables, field_schema, subject_name, llm_cfg, dedup=dedup,
                             reject_table_headers=reject_table_headers,
-                            extra_exclusion_note=extra_exclusion_note)
+                            extra_exclusion_note=extra_exclusion_note,
+                            pdf_path=pdf_path)
     print(f"  [PDF] {len(records)} record(s) extracted")
 
     if records and os.environ.get("PDF_SKIP_STAGE5") != "1":
@@ -2296,4 +2780,8 @@ def extract_pdf_records(
             records = _llm_verify_records(
                 records, _page_tables_context(page_tables, tables_only=True),
                 field_schema, llm_cfg)
+
+    if records and (vision_verify_names or os.environ.get("PDF_VISION_VERIFY") == "1"):
+        print(f"\n  [PDF Stage 6] Vision cross-check on name fields ...")
+        records = _vision_verify_names(pdf_path, records, llm_cfg)
     return records

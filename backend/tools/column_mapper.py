@@ -28,6 +28,7 @@ map_columns_ollama(...)  — legacy alias, returns only col_map
 """
 
 import json
+import os
 import re
 
 try:
@@ -38,6 +39,7 @@ except ImportError:
     _EMBED_AVAILABLE = False
 
 from tools.llm_client import ollama_post, openai_chat
+from tools.vision_llm import call_vision_llm
 
 # Minimum quality bar for LLM-tier column candidates:
 #   header must contain ≥4 consecutive letters (rules out '', ')', 'T', truncated fragments)
@@ -269,6 +271,26 @@ _embed_model = None
 _field_embed_cache: dict = {}  # field_key → np.ndarray (cached across calls)
 
 
+def _render_page_image(pdf_path: str, page_num: int) -> str:
+    """Render a PDF page to a temp PNG (2x scale, matches Stage 6's
+    _vision_verify_names in pdf_extractor.py). Returns the temp file path, or
+    None if pymupdf isn't installed or the page can't be opened. Caller must
+    delete the file."""
+    try:
+        import fitz as _fitz
+    except ImportError:
+        return None
+    import tempfile
+    try:
+        doc = _fitz.open(pdf_path)
+        pix = doc[page_num - 1].get_pixmap(matrix=_fitz.Matrix(2, 2))
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            pix.save(tf.name)
+            return tf.name
+    except Exception:
+        return None
+
+
 def _get_embed_model():
     global _embed_model
     if _embed_model is None:
@@ -383,6 +405,8 @@ def map_columns(
     extra_fields: list = None,
     llm_cfg: dict = None,
     passthrough_units: bool = False,
+    pdf_path: str = None,
+    page_num: int = None,
 ) -> tuple[dict, dict]:
     """
     Map input Excel/PDF headers to schema field keys.
@@ -397,6 +421,16 @@ def map_columns(
                           an LLM (GPT or Ollama) then re-maps ONLY the flagged fields, with
                           the confident ones locked. In rule-based mode the flags are
                           emitted as warnings and mappings are left unchanged.
+
+    pdf_path, page_num : when both are given AND provider is "openai", the flagged-field
+                          re-map in Stage C is cross-checked against the RENDERED PAGE
+                          IMAGE instead of header text alone — catches a column whose
+                          true identity survives only in the page's visual layout (e.g.
+                          a title fused onto the header text by table extraction), not in
+                          what the text layer preserved. Falls back to the text-only call
+                          on any error (missing pymupdf, render failure, bad response) —
+                          never a regression versus not passing these at all. Not used for
+                          Excel/CSV input scanning, which has no page image to render.
 
     Returns
     -------
@@ -555,11 +589,39 @@ def map_columns(
                 + "\n\nFor each flagged field pick the best column index by its values, or null if none fits.")
             messages = [{"role": "system", "content": system},
                         {"role": "user", "content": user}]
-            try:
+
+            def _text_remap():
                 raw = (openai_chat(llm_cfg, messages, json_mode=True) if provider == "openai"
                        else ollama_post(base_url, model, messages))
                 raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-                raw = re.sub(r"\n?```$", "", raw)
+                return re.sub(r"\n?```$", "", raw)
+
+            raw = None
+            if provider == "openai" and pdf_path and page_num:
+                img_path = _render_page_image(pdf_path, page_num)
+                if img_path:
+                    try:
+                        vision_prompt = (
+                            system + "\n\nCross-check against the rendered page image — "
+                            "the header text below may be corrupted (e.g. a table title "
+                            "fused onto a header by automatic extraction); the image shows "
+                            "the true column headers as printed.\n\n" + user)
+                        raw = call_vision_llm(img_path, vision_prompt, llm_cfg)
+                        m = re.search(r"\{[\s\S]*\}", raw)
+                        raw = m.group(0) if m else None
+                        if raw:
+                            print("      [verify] cross-checked against page image")
+                    except Exception as e:
+                        print(f"      [verify] vision remap failed ({e}) — falling back to text")
+                        raw = None
+                    finally:
+                        try:
+                            os.unlink(img_path)
+                        except OSError:
+                            pass
+            try:
+                if raw is None:
+                    raw = _text_remap()
                 result = json.loads(raw)
             except Exception as e:
                 print(f"      [verify] LLM remap skipped: {e} — mappings unchanged")
@@ -579,6 +641,79 @@ def map_columns(
                     ci = orig[fk]
                     if ci is not None and ci not in claimed:
                         _assign(fk, ci, "embed(kept)")
+
+            # 3) Rescue property_name specifically if it's STILL unmapped after the
+            # above. A missing name drops the whole record — worse than any other
+            # field being wrong — so unlike every other field, it's worth
+            # reconsidering columns the normal reflect step above treats as
+            # untouchable, but ONLY the ones that were never strongly evidenced to
+            # begin with (a 'gpt' guess, or an embedding below the same 0.45
+            # confidence bar used above). A genuine [exact]/[price-rule]/[value:*]
+            # match stays locked. Observed failure this rescues: a table with an
+            # explicit numbered index column whose header literally reads
+            # 'Property' claims property_name via exact match, while the real name
+            # column (blank header) gets guessed into 'address' by a later, weak
+            # tier — the reflect step above then correctly flags property_name as
+            # 'pure numbers', but its LLM re-map is blocked from using the address
+            # column because 'never reuse a locked column' treats that weak guess
+            # as equally sacred as the exact match that caused the problem.
+            if "property_name" in flags and col_map.get("property_name") is None:
+                def _is_weak_method(m: str) -> bool:
+                    if m.startswith("gpt"):
+                        return True
+                    mm = re.match(r"embed\(([0-9.]+)\)", m)
+                    return bool(mm and float(mm.group(1)) < 0.45)
+
+                weak_locked = {fk: idx for fk, idx in col_map.items()
+                               if fk != "property_name" and idx is not None
+                               and _is_weak_method(methods.get(fk, ""))}
+                if weak_locked:
+                    strong_locked = {fk: idx for fk, idx in col_map.items()
+                                     if idx is not None and fk != "property_name"
+                                     and fk not in weak_locked}
+                    all_cols2, all_descs2, sample_str2 = _build_llm_inputs(["property_name"])
+                    system2 = (
+                        "The field 'property_name' has NO valid column mapping, which drops "
+                        "every row in this table — this must be fixed if at all possible. "
+                        "Some OTHER fields below were only ever a low-confidence guess; "
+                        "reconsider them if their column's values actually fit property_name "
+                        "better (e.g. a column of building/site names). Do not touch the "
+                        "strongly-evidenced columns. Return ONLY a JSON object "
+                        "{\"property_name\": column_index_or_null}.")
+                    user2 = (
+                        f"All columns (index: header):\n{json.dumps(all_cols2, indent=2)}\n\n"
+                        f"Sample rows:\n{sample_str2}\n\n"
+                        f"Strongly-evidenced columns (do not reuse):\n"
+                        f"{json.dumps(strong_locked)}\n\n"
+                        f"Low-confidence guesses for OTHER fields (may be reassigned to "
+                        f"property_name if a better fit):\n{json.dumps(weak_locked)}\n\n"
+                        f"property_name: {all_descs2.get('property_name', '')}")
+                    try:
+                        raw2 = (openai_chat(llm_cfg, [{"role": "system", "content": system2},
+                                                       {"role": "user", "content": user2}],
+                                             json_mode=True)
+                                if provider == "openai" else
+                                ollama_post(base_url, model,
+                                            [{"role": "system", "content": system2},
+                                             {"role": "user", "content": user2}]))
+                        raw2 = re.sub(r"^```[a-z]*\n?", "", raw2.strip())
+                        raw2 = re.sub(r"\n?```$", "", raw2)
+                        col_idx2 = json.loads(raw2).get("property_name")
+                        if col_idx2 is not None:
+                            col_idx2 = int(col_idx2)
+                            stolen_fk = next((f for f, i in weak_locked.items()
+                                              if i == col_idx2), None)
+                            if stolen_fk:
+                                del claimed[col_idx2]
+                                col_map[stolen_fk] = None
+                                methods.pop(stolen_fk, None)
+                                print(f"      [verify] property_name rescue: reclaiming "
+                                      f"col {col_idx2} from {stolen_fk!r} "
+                                      f"(was a low-confidence guess)")
+                            if col_idx2 not in claimed:
+                                _assign("property_name", col_idx2, "verify(rescue)")
+                    except Exception as e:
+                        print(f"      [verify] property_name rescue skipped: {e}")
         except Exception as e:
             col_map.clear();  col_map.update(_snap[0])
             unit_map.clear(); unit_map.update(_snap[1])
