@@ -56,7 +56,7 @@ from generate_sales_comps_table import (
 )
 from generate_sales_comps_map import render_map
 import generate_global_sales_comps_table as _global_sales_tbl
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name, resolve_geocode_queries as _resolve_geocode_queries
 from generate_comps_map_base import shared_mapbox_token as _shared_mapbox_token
 from tools.calculations import (
     haversine_km as _haversine_km,
@@ -64,6 +64,8 @@ from tools.calculations import (
     parse_num as _num,
     parse_remaining_yrs as _parse_remaining_yrs,
     parse_sale_date as _parse_sale_date,
+    dedup_cross_source as _dedup_cross_source_shared,
+    flag_cross_source_conflicts as _flag_cross_source_conflicts_shared,
 )
 from tools.json_utils import (
     fix_json as _fix_json,
@@ -1038,197 +1040,27 @@ def compute_metrics(comps: list, subject_cfg: dict) -> list:
 # GEOCODING
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Generic asset-class / sector words that sometimes leak into the address column
-# (e.g. a "PROPERTY TYPE" column with values Office/Logistics/Hospitality). These
-# are NOT geocodable addresses — geocoding must ignore them and fall back to the
-# property name, otherwise every comp of the same type stacks on one point.
-_NON_ADDRESS_WORDS = {
-    "office", "logistics", "retail", "industrial", "hospitality", "hotel",
-    "residential", "commercial", "mixed", "mixed-use", "mixed use",
-    "warehouse", "business park", "data centre", "data center", "others",
-    # Placeholder / "no address" values — geocoding these returns the country
-    # centroid, stacking every such comp on one point. Fall back to the name.
-    "n/a", "na", "n.a.", "n.a", "nil", "none", "tbd", "-", "--", "—",
-    "not available", "not applicable", "not appl.", "unknown", ".",
-}
+# Cross-source dedup/conflict-flagging logic itself lives in tools/calculations.py
+# (shared with rent/land) — these are thin per-comp-type wrappers over it.
+#
+# exact_km=0.02 (20m): near-identical coordinates force a merge even if price
+# disagrees — safe for sales, since a building is normally sold once per window
+# (unlike rent, which never sets this — see scan_input_rent_comps.py).
 
-
-def _record_completeness(r: dict) -> int:
-    """Count of non-blank canonical fields — used to pick the most complete
-    record as the base when merging cross-source duplicates."""
-    _skip = {'lon', 'lat', 'distance_km', 'map_marker'}
-    return sum(1 for k, v in r.items()
-               if k not in _skip and not str(k).startswith('_') and str(v or '').strip())
-
-
-def _dedup_cross_source(records: list, threshold_km: float = 0.2,
-                        price_tol_frac: float = 0.15) -> list:
-    """
-    Merge records that represent the SAME transaction reported by DIFFERENT
-    input sources (e.g. the same deal appears in both an uploaded Colliers PDF
-    and a CBRE PDF for one deal, under different property-name spellings —
-    'MBFC (T3)' vs 'Marina Bay Financial Centre Tower 3'). Name-matching would
-    miss this; geocode proximity catches it regardless of how each source
-    wrote the name.
-
-    Two records are treated as the same deal ONLY when BOTH:
-      - they geocoded within `threshold_km` of each other (same building), AND
-      - their price_sgd_m values agree within `price_tol_frac` (guards against
-        merging two genuinely different, merely-adjacent buildings, e.g. two
-        towers in the same complex, which can land within threshold_km of
-        each other in a dense CBD).
-    Records sharing the same `_source` tag are never merged here — same-file
-    duplicates are a different bug, handled earlier by name-based `_dedup`.
-
-    For each matched pair/group, keeps the MOST COMPLETE record (most non-blank
-    fields) as the base and fills any of its still-blank fields from the other
-    record(s) — so complementary data from both sources survives (e.g. one
-    source has psf, the other has the cap rate).
-    """
-    n = len(records)
-    used = [False] * n
-    groups: list = []
-    for i in range(n):
-        if used[i] or records[i].get('lon') is None or records[i].get('lat') is None:
-            continue
-        group = [i]
-        for j in range(i + 1, n):
-            if used[j] or records[j].get('lon') is None or records[j].get('lat') is None:
-                continue
-            if records[i].get('_source') and records[i].get('_source') == records[j].get('_source'):
-                continue  # same source — not a cross-source duplicate
-            dist = _haversine_km(records[i]['lon'], records[i]['lat'],
-                                 records[j]['lon'], records[j]['lat'])
-            if dist > threshold_km:
-                continue
-            try:
-                p1 = float(re.sub(r'[^\d.]', '', str(records[i].get('price_sgd_m') or '')))
-                p2 = float(re.sub(r'[^\d.]', '', str(records[j].get('price_sgd_m') or '')))
-                if p1 <= 0 or p2 <= 0 or abs(p1 - p2) / max(p1, p2) > price_tol_frac:
-                    continue
-            except (TypeError, ValueError):
-                continue
-            group.append(j)
-        if len(group) > 1:
-            groups.append(group)
-            for idx in group:
-                used[idx] = True
-
-    if not groups:
-        return records
-
-    grouped_idx = {idx for g in groups for idx in g}
-    result = [r for i, r in enumerate(records) if i not in grouped_idx]
-
-    for group in groups:
-        group_recs = sorted((records[i] for i in group),
-                            key=_record_completeness, reverse=True)
-        base = dict(group_recs[0])
-        sources = [s for s in (r.get('_source') for r in group_recs) if s]
-        filled = []
-        for other in group_recs[1:]:
-            for k, v in other.items():
-                if k in ('lon', 'lat', 'distance_km', 'map_marker') or str(k).startswith('_'):
-                    continue
-                if not str(base.get(k) or '').strip() and str(v or '').strip():
-                    base[k] = v
-                    filled.append(k)
-        if sources:
-            base['_source'] = '+'.join(dict.fromkeys(sources))  # de-dup, keep order
-        if filled:
-            base['_dedup_note'] = (f"merged {len(group_recs)} cross-source record(s); "
-                                   f"filled from other source: {', '.join(sorted(set(filled)))}")
-        print(f"      [cross-source dedup] merged {len(group_recs)} record(s) → "
-              f"{str(base.get('property_name',''))[:40]!r} "
-              f"(sources: {base.get('_source','')})")
-        result.append(base)
-    return result
-
-
-def _price_num(v) -> float | None:
-    """Parse a price-ish cell to a float, or None. Handles '1,133.00', '600-630'
-    (takes the low end), stray currency/footnote chars."""
-    s = re.sub(r"[^\d.\-]", "", str(v or ""))
-    m = re.search(r"\d+(?:\.\d+)?", s)
-    try:
-        return float(m.group(0)) if m else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _name_overlap(a: str, b: str) -> float:
-    """Token Jaccard of two property names (0..1). Used to confirm two records
-    from different sources really are the SAME building before treating a value
-    mismatch as a conflict (vs. two genuinely different adjacent buildings)."""
-    ta = set(re.sub(r"\W+", " ", str(a or "").lower()).split())
-    tb = set(re.sub(r"\W+", " ", str(b or "").lower()).split())
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
+def _dedup_cross_source(records: list, threshold_km: float = 0.05,
+                        price_tol_frac: float = 0.05) -> list:
+    return _dedup_cross_source_shared(
+        records, value_fields=("price_sgd_m",), name_min_overlap=0.9,
+        threshold_km=threshold_km, price_tol_frac=price_tol_frac, exact_km=0.02)
 
 
 def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.2,
-                                 price_tol_frac: float = 0.15,
-                                 name_min_overlap: float = 0.5) -> list:
-    """Flag (do NOT merge, do NOT drop) records that are the SAME building
-    reported by DIFFERENT sources but whose key numeric value DISAGREES.
-
-    Complements _dedup_cross_source: that function MERGES cross-source records
-    whose prices AGREE (within price_tol_frac); this one catches the opposite
-    case — same building, sources report DIFFERENT numbers (e.g. Colliers vs
-    Cushman MarketBeat both list 'Northpoint City South Wing' but at different
-    prices). Silently keeping both rows, or silently picking one, hides a real
-    data question, so instead we attach a ``_review_flag`` to both records and
-    print a run-log warning (same surfacing channel as the geocode-centroid
-    warning) so the analyst can verify which source is right.
-
-    'Same building' requires BOTH geocode proximity (≤ threshold_km) AND a name
-    token overlap ≥ name_min_overlap, so two genuinely different buildings that
-    merely sit within threshold_km of each other in a dense CBD are not flagged.
-    """
-    n = len(records)
-    n_flagged = 0
-    for i in range(n):
-        ri = records[i]
-        if ri.get("lon") is None or ri.get("lat") is None:
-            continue
-        for j in range(i + 1, n):
-            rj = records[j]
-            if rj.get("lon") is None or rj.get("lat") is None:
-                continue
-            if ri.get("_source") and ri.get("_source") == rj.get("_source"):
-                continue  # same source — not cross-source
-            if _haversine_km(ri["lon"], ri["lat"],
-                             rj["lon"], rj["lat"]) > threshold_km:
-                continue
-            if _name_overlap(ri.get("property_name"),
-                             rj.get("property_name")) < name_min_overlap:
-                continue  # nearby but a different building — not a conflict
-
-            conflicts = []
-            for fk, label in (("price_sgd_m", "price"),
-                              ("price_psf_gfa", "unit price")):
-                a, b = _price_num(ri.get(fk)), _price_num(rj.get(fk))
-                if a and b and a > 0 and b > 0 \
-                        and abs(a - b) / max(a, b) > price_tol_frac:
-                    conflicts.append(
-                        f"{label}: {ri.get('_source','?')}={a:g} vs "
-                        f"{rj.get('_source','?')}={b:g}")
-            if not conflicts:
-                continue
-
-            note = ("Cross-source disagreement for the same building — "
-                    + "; ".join(conflicts) + ". Verify which source is correct.")
-            for r in (ri, rj):
-                r["_review_flag"] = note
-            n_flagged += 1
-            print(f"      [cross-source CONFLICT] "
-                  f"{str(ri.get('property_name',''))[:40]!r}: {'; '.join(conflicts)} "
-                  f"— flagged for review")
-    if n_flagged:
-        print(f"      Cross-source conflict check: {n_flagged} disagreement(s) "
-              f"flagged for review (kept both rows; not merged)")
-    return records
+                                 price_tol_frac: float = 0.05,
+                                 name_min_overlap: float = 0.9) -> list:
+    return _flag_cross_source_conflicts_shared(
+        records, value_fields=(("price_sgd_m", "price"), ("price_psf_gfa", "unit price")),
+        threshold_km=threshold_km, price_tol_frac=price_tol_frac,
+        name_min_overlap=name_min_overlap)
 
 
 def _geocode_comps(records: list, google_key: str,
@@ -1271,29 +1103,11 @@ def _geocode_comps(records: list, google_key: str,
 
         # Geocoding priority: if an Address is present (the analyst can fill it in
         # the preview when a property name is too rough to geocode), use it — it
-        # overrides the name. Address-first, with the name kept as a fallback.
-        # If Address is blank, geocode by the property name as before.
-        # Country suffix helps foreign-address geocoding (Mapbox especially).
-        _sfx = (f", {country_name}"
-                if country_name and country_name.strip().lower() not in ("", "singapore")
-                else "")
-        # Use the address only if it looks like a real location — a bare
-        # asset-class word (Office/Logistics/…) that slipped into the address
-        # column must NOT be geocoded, or all same-type comps stack on one point.
-        if addr and addr.strip().lower() not in _NON_ADDRESS_WORDS:
-            # Address present → geocode by ADDRESS ONLY (no name fallback).
-            # Falling back to the name collapses distinct properties that share a
-            # brand: "Weave Place – Hoegi" and "Weave Place – Gangnam Station" both
-            # strip to "Weave Place" → same pin. Address-only keeps them distinct.
-            queries = _build_geocode_queries("", addr, _sfx)
-            source  = "address"
-        else:
-            # Geocode by NAME, adding the submarket/district as a locality HINT
-            # (backend only — never shown) so a weak building name still resolves
-            # to the right area instead of failing or hitting the country centroid.
-            _hint = str(r.get("submarket") or "").strip()
-            queries = _build_geocode_queries(name, _hint, _sfx)
-            source  = "name"
+        # overrides the name; otherwise geocode by NAME with the submarket as a
+        # backend-only locality hint. Shared with rent/land (resolve_geocode_queries)
+        # so all three comp types apply the same address-vs-name policy.
+        _hint = str(r.get("submarket") or "").strip()
+        queries, source = _resolve_geocode_queries(name, addr, _hint, country_name, suffix)
 
         try:
             lon, lat, geo_note = geocode_with_fallbacks(queries, google_key, country_code)

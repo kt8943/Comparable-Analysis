@@ -59,14 +59,19 @@ from pathlib import Path
 import openpyxl
 
 from generate_land_comps_map import render_map
-from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name
+from generate_comps_map_base import geocode_any as geocode_with_fallbacks, build_geocode_queries as _build_geocode_queries, near_country_centroid as _near_country_centroid, country_code_from_name as _cc_from_name, clean_property_name as _clean_name, resolve_geocode_queries as _resolve_geocode_queries
 from generate_comps_map_base import shared_mapbox_token as _shared_mapbox_token
 from generate_land_comps_table import (
     get_land_schema, bala_factor,
     subject_to_row, comp_to_row, build_workbook,
 )
 import generate_global_land_comps_table as _global_land_tbl
-from tools.calculations import haversine_km as _haversine_km, parse_num as _num
+from tools.calculations import (
+    haversine_km as _haversine_km,
+    parse_num as _num,
+    dedup_cross_source as _dedup_cross_source_shared,
+    flag_cross_source_conflicts as _flag_cross_source_conflicts_shared,
+)
 from tools.json_utils import fix_json as _fix_json, split_json_arrays as _split_json_arrays
 from tools.llm_client import ollama_post as _ollama_post, apply_refinement as _apply_refinement
 from tools.excel_reader import find_best_sheet as _find_best_sheet, find_header_row as _find_header_row, sheet_keywords as _sheet_keywords, split_tables as _split_tables
@@ -716,6 +721,31 @@ def _classify_rules(records: list, subject_cfg: dict = None):
 # GEOCODING
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Cross-source dedup/conflict-flagging logic itself lives in tools/calculations.py
+# (shared with sales/rent) — these are thin per-comp-type wrappers over it.
+#
+# exact_km=0.02 (20m): near-identical coordinates force a merge even if price
+# disagrees — safe for land, since a site is normally sold/tendered once per
+# window (unlike rent, which never sets this — see scan_input_rent_comps.py).
+
+def _dedup_cross_source(records: list, threshold_km: float = 0.05,
+                        price_tol_frac: float = 0.05) -> list:
+    return _dedup_cross_source_shared(
+        records, value_fields=("price_sgd_m",),
+        name_keys=("site_name", "property_name"), name_min_overlap=0.9,
+        threshold_km=threshold_km, price_tol_frac=price_tol_frac, exact_km=0.02)
+
+
+def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.2,
+                                 price_tol_frac: float = 0.05,
+                                 name_min_overlap: float = 0.9) -> list:
+    return _flag_cross_source_conflicts_shared(
+        records, value_fields=(("price_sgd_m", "price"), ("price_psf_ppr", "psf ppr")),
+        name_keys=("site_name", "property_name"),
+        threshold_km=threshold_km, price_tol_frac=price_tol_frac,
+        name_min_overlap=name_min_overlap)
+
+
 def _geocode_comps(records: list, google_key: str,
                    country_code: str, country_name: str,
                    s_lon: float, s_lat: float) -> list:
@@ -733,19 +763,11 @@ def _geocode_comps(records: list, google_key: str,
             print(f"      {'(no name)':<46}  NOT PLOTTED — no address or name")
             continue
 
-        _STREET_TYPES = {"street", "st", "road", "rd", "avenue", "ave",
-                         "crescent", "drive", "dr", "lane", "ln",
-                         "place", "pl", "way", "boulevard", "blvd",
-                         "terrace", "court", "ct", "close", "circle",
-                         "jalan", "lorong", "tanjong"}
-        _addr_words = set(re.sub(r"[^\w\s]", " ", addr.lower()).split())
-        _real_addr  = addr if (re.search(r"\d", addr) and _addr_words & _STREET_TYPES) else ""
-
-        # No real street address → use the submarket as a locality HINT (backend only)
-        # so a weak site name still resolves to the right area.
-        _hint   = _real_addr or str(r.get("submarket") or "").strip()
-        queries = _build_geocode_queries(name, _hint, suffix)
-        source  = "address" if _real_addr else "name"
+        # Address-vs-name policy shared with sales/rent (resolve_geocode_queries):
+        # a real street address is geocoded alone; otherwise geocode by name with
+        # the submarket as a backend-only hint.
+        _hint = str(r.get("submarket") or "").strip()
+        queries, source = _resolve_geocode_queries(name, addr, _hint, country_name, suffix)
 
         try:
             lon, lat, geo_note = geocode_with_fallbacks(queries, google_key, country_code)
@@ -1062,6 +1084,16 @@ def run(config_path: str = "configs/deal_config.json",
         print(f"\n[4/5] Geocoding comparables")
         records = _geocode_comps(records, google_key, country_code, country_name,
                                   s_lon, s_lat)
+
+        # Flag same-site cross-source value disagreements BEFORE merging, so the
+        # (deliberately unmerged) conflicting rows carry their review note.
+        records = _flag_cross_source_conflicts(records)
+
+        _before_dedup = len(records)
+        records = _dedup_cross_source(records)
+        if len(records) < _before_dedup:
+            print(f"      Cross-source dedup: {_before_dedup} → {len(records)} "
+                  f"record(s) (merged duplicates reported by multiple sources)")
     else:
         print(f"\n[4/5] Geocoding skipped — comps kept in input order")
 

@@ -540,6 +540,73 @@ def build_geocode_queries(name: str, addr: str, suffix: str) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ADDRESS-VS-NAME POLICY — shared by sales/rent/land _geocode_comps()
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Generic asset-class / sector words that sometimes leak into the address column
+# (e.g. a "PROPERTY TYPE" column with values Office/Logistics/Hospitality). These
+# are NOT geocodable addresses — geocoding must ignore them and fall back to the
+# property name, otherwise every comp of the same type stacks on one point.
+_NON_ADDRESS_WORDS = {
+    "office", "logistics", "retail", "industrial", "hospitality", "hotel",
+    "residential", "commercial", "mixed", "mixed-use", "mixed use",
+    "warehouse", "business park", "data centre", "data center", "others",
+    "n/a", "na", "n.a.", "n.a", "nil", "none", "tbd", "-", "--", "—",
+    "not available", "not applicable", "not appl.", "unknown", ".",
+}
+
+_STREET_TYPES = {"street", "st", "road", "rd", "avenue", "ave",
+                 "crescent", "drive", "dr", "lane", "ln",
+                 "place", "pl", "way", "boulevard", "blvd",
+                 "terrace", "court", "ct", "close", "circle",
+                 "jalan", "lorong", "tanjong"}
+
+
+def looks_like_real_address(addr: str, country_name: str = "") -> str:
+    """Return `addr` if it looks like a genuine street address worth geocoding
+    directly by itself; otherwise "".
+
+    Market-report tables sometimes put a bare asset-class word (Office/Retail)
+    or a submarket/district name in the address column — neither should be
+    geocoded as if it were a street address (it would either fail outright or,
+    worse, resolve to a broad area shared by every comp of that type/submarket).
+    Requires a digit AND (a recognised street-type keyword, OR the property is
+    in a foreign market — a full local address is still worth geocoding as-is
+    even without an English street-type word, e.g. Korean/Japanese addresses).
+    """
+    addr = str(addr or "").strip()
+    if not addr or addr.lower() in _NON_ADDRESS_WORDS:
+        return ""
+    if not re.search(r"\d", addr):
+        return ""
+    is_foreign = bool(country_name) and country_name.strip().lower() != "singapore"
+    if is_foreign:
+        return addr
+    addr_words = set(re.sub(r"[^\w\s]", " ", addr.lower()).split())
+    return addr if addr_words & _STREET_TYPES else ""
+
+
+def resolve_geocode_queries(name: str, addr: str, hint: str,
+                            country_name: str, suffix: str) -> tuple:
+    """Build the ordered geocode query list + a source label ('address'/'name')
+    for one comp record — the single address-vs-name policy shared by sales,
+    rent and land so all three geocode a comp the same way.
+
+    If `addr` looks like a real street address (`looks_like_real_address`),
+    geocode by ADDRESS ONLY — no name fallback. Falling back to the name would
+    collapse distinct properties that share a brand ("Weave Place – Hoegi" and
+    "Weave Place – Gangnam Station" both strip to "Weave Place" → same pin).
+    Otherwise geocode by NAME, with `hint` (submarket/district — backend only,
+    never shown) as a locality aid so a weak building name still resolves to
+    the right area instead of failing or hitting the country centroid.
+    """
+    real_addr = looks_like_real_address(addr, country_name)
+    if real_addr:
+        return build_geocode_queries("", real_addr, suffix), "address"
+    return build_geocode_queries(name, hint, suffix), "name"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAP RENDERING  — Mapbox Static Images API + Pillow pin drawing
 # ═══════════════════════════════════════════════════════════════════════════════
 

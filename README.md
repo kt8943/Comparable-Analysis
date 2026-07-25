@@ -314,11 +314,19 @@ land sorts by distance from the subject.
 ### Stage 3 — Geocoding
 
 `geocode_any()` in `generate_comps_map_base.py`. Provider is chosen by
-`shared_settings.geocoding_provider`, falling back to Mapbox on any failure.
+`shared_settings.geocoding_provider`, **falling back to Google** on any failure —
+not Mapbox, which is only ever used to render the static map image (§10.2); the two
+are fully independent and share no credential.
 
-Only records with a **real address** are geocoded. Property names are not used as
-geocoding queries — they resolve unreliably. A comp that geocodes to the country
-centroid is flagged `ON COUNTRY CENTROID` for the analyst rather than silently plotted.
+For file/upload comps (sales, rent, land — `scan_input_*.py`), every record is
+geocoded using one shared address-vs-name policy across all three comp types
+(`resolve_geocode_queries()`, detailed in §10.1): a genuine street address is geocoded
+alone; a building name with no real address falls back to NAME plus a submarket/
+district hint, since most market-report tables give only a name and no address. A comp
+that resolves to the country centroid is flagged `ON COUNTRY CENTROID` (`_geo_suspect`)
+for the analyst rather than silently plotted — see §10.1 for exactly what that flag
+does and does not catch. Records from different uploaded reports describing the same
+comp are then merged (if they agree) or flagged for review (if they don't) — §10.3.
 
 ### Stage 4 — Trim to `max_results`
 
@@ -762,15 +770,62 @@ Google** if the chosen provider fails or is misconfigured:
 | `onemap` | Singapore, free, best SG accuracy | none |
 | `kakao` | Korea | `kakao_api_key` |
 
-Deal configs carry **no** geocoding token; the key lives in Shared Settings only.
+Deal configs carry **no** geocoding token; the key lives in Shared Settings only —
+`shared_settings.json`'s `google_maps_key` locally, or the `GOOGLE_MAPS_KEY` secret on
+Streamlit Cloud (bootstrapped into `shared_settings.json` at startup, §16). This is a
+single **global** setting, not per-country — a Korea deal and a Singapore deal use
+whichever provider is configured, both locally and on the cloud; there is no per-deal
+or per-country override.
 
-`geocode_with_fallbacks(queries, …)` tries each query in order and returns the first
-hit, so callers pass a descending-specificity list:
-`["<name>, <address>", "<address>", "<name>"]`.
+`geocode_any(queries, …)` tries each query in `queries` **in order** and returns the
+first one any provider resolves — it does not compare candidates for precision, so a
+broad-but-successful early match wins over a more precise query later in the list.
 
-`country_code` is applied as a component filter and must be set explicitly in the
-config. There is deliberately **no address-sniffing heuristic** — a wrong country guess
-silently geocodes a comp onto the wrong continent.
+**Address-vs-name query policy — shared by sales, rent and land**
+(`resolve_geocode_queries()` in `generate_comps_map_base.py`, used identically by all
+three `scan_input_*_comps.py` scripts):
+
+1. **`looks_like_real_address(addr, country_name)`** decides whether the Address field
+   is worth geocoding on its own: it must be non-empty, not a bare asset-class/
+   placeholder word (`_NON_ADDRESS_WORDS` — "Office", "N/A", "—", …), contain a digit,
+   and — for Singapore — also contain a recognised street-type keyword (Road, Street,
+   Ave, …); for any other country a digit alone is enough (a full local address is
+   still worth geocoding even without an English street-type word, e.g. a Korean or
+   Japanese address).
+2. **If it looks like a real address → geocode by ADDRESS ONLY**, with the country name
+   appended as a text suffix (`", Singapore"`, `", South Korea"`, …) — no name fallback
+   is added to that query list. Falling back to the name would collapse distinct
+   properties that share a brand ("Weave Place – Hoegi" and "Weave Place – Gangnam
+   Station" both strip to "Weave Place" → the same pin).
+3. **Otherwise → geocode by NAME**, with the submarket/district value (if the source
+   table has one) passed as a locality hint, and the country name appended as a text
+   suffix here too.
+
+**The country-name text suffix matters even for Singapore, not just foreign
+countries.** `country_code` is *also* applied separately as an API-level component
+filter (`components=country:SG`), but that restricts *where* a match may land — it does
+not help Google's free-text matcher recognise an ambiguous name. Measured case: Google
+resolves `"Bank of Singapore Centre"` (name only, `components=country:SG`) to the
+country centroid, but resolves `"Bank of Singapore Centre, Singapore"` (same
+restriction, country name added to the query **text**) to the correct rooftop address.
+Every comp type now includes this suffix unconditionally (a 2026-07 fix — sales
+previously omitted it specifically for Singapore, rent/land omitted it for every
+country; §18 has no bearing on this, it's a geocoding fix, not an extraction one).
+
+**The `ON COUNTRY CENTROID` flag only catches one specific failure mode — a geocode
+landing within 1.5 km of the country's centroid — and nothing else.** It does **not**
+catch: a result that resolves to the correct country/city but the wrong specific
+building (e.g. a same-named branch elsewhere, or a submarket/neighbourhood centroid
+that is not the actual building — still off by up to ~1 km but far enough from the
+country centroid to go unflagged); or a precisely-geocoded but wrong address (if the
+extracted address itself was wrong, Google will happily geocode it precisely to the
+wrong place, silently). A comp with no flag is not proof its pin is correct — only proof
+it isn't the crudest kind of failure. There is currently no automated check beyond this;
+verifying pin placement for any given comp is a manual, spot-check exercise.
+
+`country_code` must be set explicitly in the deal config. There is deliberately **no
+address-sniffing heuristic** — a wrong country guess silently geocodes a comp onto the
+wrong continent.
 
 ### 10.2 Rendering — Mapbox
 
@@ -807,6 +862,92 @@ of the image resolution in a client-facing Word document for no benefit.
 Comps that failed to geocode are simply absent from the PNG. The number of plotted pins
 can therefore be lower than the row count in the table; the run log states which comps
 were dropped.
+
+### 10.3 Cross-report dedup and conflict-flagging (uploaded files)
+
+**This is a different mechanism from §11.6** — that one dedups results from ONLINE
+search; this one dedups records extracted from multiple UPLOADED reports (e.g. the
+analyst drops in both a Colliers PDF and a Savills PDF, and one deal appears in both).
+Both solve the same underlying problem (the same real-world thing reported by more than
+one source) but use different code, different thresholds, and run at a different point
+in the pipeline — they are not the same check twice.
+
+The shared logic lives in `tools/calculations.py` (`dedup_cross_source()` and
+`flag_cross_source_conflicts()`), called identically by all three
+`scan_input_*_comps.py` scripts right after geocoding, before map markers are numbered.
+As of 2026-07, **all three comp types get this** — previously only sales did; rent and
+land are now on the same code path.
+
+Two records are only ever compared when they came from *different* uploaded files
+(`_source` differs) — same-file duplicates are a different problem, handled earlier by
+the extraction pipeline's own name-based dedup.
+
+**Merge when they agree** (`dedup_cross_source`) — geocoded within **50 m** of each
+other, AND (for sales/land only) the property names token-overlap ≥ **90%**, AND the
+first mutually-present value field agrees within a per-type tolerance:
+
+| Comp type | Also requires name overlap? | Value field(s) checked, in order | Tolerance |
+|---|---|---|---|
+| Sales | Yes | `price_sgd_m` | 5% |
+| Land | Yes | `price_sgd_m` | 5% |
+| Rent | **No** | `eff_rent`, then `asking_rent` | 5% |
+
+Rent is deliberately the odd one out: the SAME building legitimately produces many
+different leases at many different rents (different tenants, different units,
+different dates). Its name always "matches" trivially against itself, so requiring
+name overlap on top of that would add nothing — the rent figure agreeing is what
+actually establishes "this is the same lease reported twice," not the name. All three
+comp types now use the same 5% value tolerance — even a lump-sum sale/land price is
+not expected to legitimately vary more than that across two sources describing the
+same deal.
+
+Sales/land get the name-overlap check because the reverse risk dominates there: a
+building is normally sold/tendered once in a reporting window, so two DIFFERENT nearby
+buildings that happen to land within 50 m of each other and coincidentally report a
+similar price are a real (if rarer) risk without it.
+
+**Exact-coordinate override (sales/land only, `exact_km=0.02` — 20 m).** If two
+records (the name check above still applies) geocode within 20 m of each other —
+near-identical, not just "same building" — that alone is treated as sufficient
+evidence to merge, even if the value fields disagree by more than 5%: two sources
+rounding or transcribing one real price differently is judged more likely than two
+unrelated deals landing on the exact same rooftop pin. **This never applies to
+rent, deliberately** — it would merge away a genuine price *disagreement* between two
+different leases at the same coordinates, which for rent is the entire point (many
+legitimately different leases, same building, same pin); silently discarding one
+there instead of flagging it would be a real data-loss bug, not a convenience. For
+sales/land, that same risk doesn't arise the same way, since a building is normally
+sold once.
+
+The most complete record (most non-blank fields) is kept as the base; any field still
+blank on it is filled from the other record, so complementary data from both sources
+survives (e.g. one source has psf, the other has the cap rate). `_source` becomes the
+combined list (`"colliers+savills"`).
+
+**Flag, don't merge, when they disagree** (`flag_cross_source_conflicts`) — geocoded
+within **200 m** (looser than the merge check above — flagging is low-risk, it never
+deletes a row, so it can afford to be more inclusive), plus a property-name token-
+overlap check (≥ 90%, all three comp types — the flag check, unlike the merge check,
+has no reason to skip this for rent: flagging two same-named, nearby, disagreeing rows
+for review is harmless even there) so two genuinely different buildings that merely
+sit close together in a dense CBD are never flagged, but the value field(s) disagree
+by more than 5%:
+
+| Comp type | Value fields checked (both, independently) |
+|---|---|
+| Sales | `price_sgd_m`, `price_psf_gfa` |
+| Rent | `eff_rent`, `asking_rent` |
+| Land | `price_sgd_m`, `price_psf_ppr` |
+
+Both rows are kept, both get a `_review_flag` note naming the disagreeing sources and
+values, and the run log prints a `[cross-source CONFLICT]` line — silently picking one
+source or silently keeping both without comment would hide a real data question, so
+neither happens.
+
+Threshold note: the merge check's 50 m now matches §11.6's online-search dedup radius
+(both were tightened for the same reason — two distinct nearby buildings should not be
+silently fused into one row); the conflict-flag check stays at a looser 200 m since it
+only raises a flag, never deletes data.
 
 ---
 
@@ -894,6 +1035,10 @@ binding constraint: 5 queries may be spent before tier 3 is reached.
 the most relevant comps (nearest, for land).
 
 ### 11.6 Cross-source dedup
+
+**For ONLINE search results only** — the different mechanism that dedups records across
+multiple UPLOADED files is §10.3, not this section. The two are separate code paths with
+different thresholds; §10.3 explains why.
 
 Two mechanisms:
 

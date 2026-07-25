@@ -312,3 +312,224 @@ def find_same_building(records, lon, lat, value, value_of,
         if abs(rv - v) <= tol * max(rv, v):
             return i
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPLOADED-REPORT CROSS-SOURCE DEDUP  (used by scan_input_{sales,rent,land}_comps.py)
+#
+# Different from find_same_building() above: that one is a single lookup used
+# while building the ONLINE-search list one record at a time. These two merge/
+# flag an already-assembled list of UPLOADED-file records against each other —
+# same idea (same real-world thing reported by two different sources), applied
+# after all of them are geocoded.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_COMP_NAME_KEYS = ("property_name", "site_name", "building_name", "property")
+
+
+def _comp_name(r: dict, name_keys=_COMP_NAME_KEYS) -> str:
+    return str(next((r.get(k) for k in name_keys if r.get(k)), "") or "")
+
+
+def record_completeness(r: dict) -> int:
+    """Count of non-blank canonical fields — used to pick the most complete
+    record as the base when merging cross-source duplicates."""
+    _skip = {"lon", "lat", "distance_km", "map_marker"}
+    return sum(1 for k, v in r.items()
+              if k not in _skip and not str(k).startswith("_") and str(v or "").strip())
+
+
+def name_overlap(a: str, b: str) -> float:
+    """Token Jaccard of two property/building names (0..1). Used to confirm two
+    records from different sources really are the SAME building before treating
+    a value mismatch as a conflict (vs. two genuinely different adjacent ones)."""
+    ta = set(re.sub(r"\W+", " ", str(a or "").lower()).split())
+    tb = set(re.sub(r"\W+", " ", str(b or "").lower()).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def dedup_cross_source(records: list, value_fields=("price_sgd_m",),
+                       name_keys=_COMP_NAME_KEYS, name_min_overlap: float = 0.0,
+                       threshold_km: float = 0.05, price_tol_frac: float = 0.15,
+                       exact_km: float = 0.0) -> list:
+    """
+    Merge records that represent the SAME transaction/lease reported by DIFFERENT
+    input sources (e.g. the same deal appears in both an uploaded Colliers PDF
+    and a CBRE PDF, under different property-name spellings — 'MBFC (T3)' vs
+    'Marina Bay Financial Centre Tower 3').
+
+    Two records are treated as the same deal when:
+      - they geocoded within `threshold_km` of each other, AND
+      - if `name_min_overlap` > 0, their names token-overlap at least that much
+        (guards against merging two genuinely different, merely-adjacent
+        buildings that happen to land within `threshold_km`) — set to 0 (the
+        default) to skip this check entirely, AND
+      - EITHER the first of `value_fields` present as a positive number on BOTH
+        records agrees within `price_tol_frac`, OR (`exact_km` > 0) they geocoded
+        within `exact_km` of each other — near-identical coordinates are treated
+        as sufficient evidence of the same building on their own, overriding a
+        value disagreement (two sources rounding/reporting a price differently
+        is more likely than two unrelated deals landing on the same rooftop
+        pin). `exact_km` is disabled (0) by default; leave it off for comp types
+        where the SAME building legitimately carries multiple, genuinely
+        different transactions (e.g. rent: many leases, many different rents).
+    Records sharing the same `_source` tag are never merged here — same-file
+    duplicates are a different bug, handled earlier by the extraction pipeline's
+    own name-based dedup.
+
+    Why `name_min_overlap` defaults to off (sales/land turn it on; rent doesn't):
+    for sales/land, a building is normally sold/tendered once in a reporting
+    window, so requiring the names to also match is a cheap extra safety check
+    against a coincidental proximity+price match between two different buildings.
+    For rent, the SAME building legitimately produces many different leases at
+    many different rents, so its own name will always "match" trivially — the
+    `value_fields` (rent) agreement is what actually establishes "same lease
+    reported twice", and requiring name overlap on top of that adds nothing.
+
+    For each matched pair/group, keeps the MOST COMPLETE record (most non-blank
+    fields) as the base and fills any of its still-blank fields from the other
+    record(s) — so complementary data from both sources survives (e.g. one
+    source has psf, the other has the cap rate). Note the `exact_km` path can
+    therefore merge away a genuine price/rent DISAGREEMENT between two records at
+    the same coordinates — for a comp type where the same building can carry more
+    than one distinct sale, that would silently discard one instead of flagging
+    it, which is exactly why it must stay off for those comp types.
+
+    value_fields: ordered field names to compare — the first one present as a
+    positive number on both records decides agreement (e.g. rent comps may only
+    have eff_rent OR asking_rent filled in, not both).
+    """
+    n = len(records)
+    used = [False] * n
+    groups: list = []
+    for i in range(n):
+        if used[i] or records[i].get("lon") is None or records[i].get("lat") is None:
+            continue
+        group = [i]
+        for j in range(i + 1, n):
+            if used[j] or records[j].get("lon") is None or records[j].get("lat") is None:
+                continue
+            if records[i].get("_source") and records[i].get("_source") == records[j].get("_source"):
+                continue  # same source — not a cross-source duplicate
+            dist = haversine_km(records[i]["lon"], records[i]["lat"],
+                               records[j]["lon"], records[j]["lat"])
+            if dist > threshold_km:
+                continue
+            if name_min_overlap and name_overlap(
+                    _comp_name(records[i], name_keys),
+                    _comp_name(records[j], name_keys)) < name_min_overlap:
+                continue  # nearby but a different building — not a duplicate
+            if exact_km and dist <= exact_km:
+                group.append(j)
+                continue  # near-identical coordinates — duplicate regardless of value agreement
+            agree = False
+            for vf in value_fields:
+                p1, p2 = parse_num(records[i].get(vf)), parse_num(records[j].get(vf))
+                if p1 and p2 and p1 > 0 and p2 > 0:
+                    agree = abs(p1 - p2) / max(p1, p2) <= price_tol_frac
+                    break
+            if not agree:
+                continue
+            group.append(j)
+        if len(group) > 1:
+            groups.append(group)
+            for idx in group:
+                used[idx] = True
+
+    if not groups:
+        return records
+
+    grouped_idx = {idx for g in groups for idx in g}
+    result = [r for i, r in enumerate(records) if i not in grouped_idx]
+
+    for group in groups:
+        group_recs = sorted((records[i] for i in group),
+                            key=record_completeness, reverse=True)
+        base = dict(group_recs[0])
+        sources = [s for s in (r.get("_source") for r in group_recs) if s]
+        filled = []
+        for other in group_recs[1:]:
+            for k, v in other.items():
+                if k in ("lon", "lat", "distance_km", "map_marker") or str(k).startswith("_"):
+                    continue
+                if not str(base.get(k) or "").strip() and str(v or "").strip():
+                    base[k] = v
+                    filled.append(k)
+        if sources:
+            base["_source"] = "+".join(dict.fromkeys(sources))  # de-dup, keep order
+        if filled:
+            base["_dedup_note"] = (f"merged {len(group_recs)} cross-source record(s); "
+                                   f"filled from other source: {', '.join(sorted(set(filled)))}")
+        print(f"      [cross-source dedup] merged {len(group_recs)} record(s) → "
+              f"{_comp_name(base, name_keys)[:40]!r} (sources: {base.get('_source','')})")
+        result.append(base)
+    return result
+
+
+def flag_cross_source_conflicts(records: list, value_fields=(("price_sgd_m", "price"),),
+                                name_keys=_COMP_NAME_KEYS,
+                                threshold_km: float = 0.2, price_tol_frac: float = 0.15,
+                                name_min_overlap: float = 0.5) -> list:
+    """Flag (do NOT merge, do NOT drop) records that are the SAME building/unit
+    reported by DIFFERENT sources but whose key numeric value DISAGREES.
+
+    Complements dedup_cross_source: that function MERGES cross-source records
+    whose value agrees; this one catches the opposite case — same building,
+    sources report DIFFERENT numbers (e.g. Colliers vs Cushman MarketBeat both
+    list 'Northpoint City South Wing' but at different prices). Silently keeping
+    both rows, or silently picking one, hides a real data question, so instead
+    we attach a ``_review_flag`` to both records and print a run-log warning
+    (same surfacing channel as the geocode-centroid warning) so the analyst can
+    verify which source is right.
+
+    'Same building' requires BOTH geocode proximity (≤ threshold_km) AND a name
+    token overlap ≥ name_min_overlap, so two genuinely different buildings that
+    merely sit within threshold_km of each other in a dense CBD are not flagged.
+
+    value_fields: ordered (field_key, label) pairs — every pair present as a
+    positive number on both records is checked (unlike dedup_cross_source,
+    which only needs the first mutually-present field to agree).
+    """
+    n = len(records)
+    n_flagged = 0
+    for i in range(n):
+        ri = records[i]
+        if ri.get("lon") is None or ri.get("lat") is None:
+            continue
+        for j in range(i + 1, n):
+            rj = records[j]
+            if rj.get("lon") is None or rj.get("lat") is None:
+                continue
+            if ri.get("_source") and ri.get("_source") == rj.get("_source"):
+                continue  # same source — not cross-source
+            if haversine_km(ri["lon"], ri["lat"], rj["lon"], rj["lat"]) > threshold_km:
+                continue
+            if name_overlap(_comp_name(ri, name_keys),
+                            _comp_name(rj, name_keys)) < name_min_overlap:
+                continue  # nearby but a different building — not a conflict
+
+            conflicts = []
+            for fk, label in value_fields:
+                a, b = parse_num(ri.get(fk)), parse_num(rj.get(fk))
+                if a and b and a > 0 and b > 0 \
+                        and abs(a - b) / max(a, b) > price_tol_frac:
+                    conflicts.append(
+                        f"{label}: {ri.get('_source','?')}={a:g} vs "
+                        f"{rj.get('_source','?')}={b:g}")
+            if not conflicts:
+                continue
+
+            note = ("Cross-source disagreement for the same building — "
+                    + "; ".join(conflicts) + ". Verify which source is correct.")
+            for r in (ri, rj):
+                r["_review_flag"] = note
+            n_flagged += 1
+            print(f"      [cross-source CONFLICT] "
+                  f"{_comp_name(ri, name_keys)[:40]!r}: {'; '.join(conflicts)} "
+                  f"— flagged for review")
+    if n_flagged:
+        print(f"      Cross-source conflict check: {n_flagged} disagreement(s) "
+              f"flagged for review (kept both rows; not merged)")
+    return records
