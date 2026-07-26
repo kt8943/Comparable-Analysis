@@ -2488,8 +2488,15 @@ def _add_pgim_table_to_doc(doc, excel_path, subject_banner: str, comp_banner: st
             for j in range(1, ncol):
                 merged = merged.merge(row.cells[j])
             merged.text = vals
-            merged.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            # Shade BEFORE setting vertical_alignment: w:tcPr children must
+            # appear in strict schema order (w:shd precedes w:vAlign) — Word for
+            # Mac renders this leniently regardless of order, but Word for
+            # Windows validates it and rejects the file as unreadable if shd
+            # lands after vAlign, which unconditionally appending it here would
+            # always do. Setting vertical_alignment AFTER is safe: python-docx's
+            # own vAlign insertion logic places it correctly relative to shd.
             _set_cell_bg(merged, _PGIM_NAVY.lstrip("#"))
+            merged.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             for p in merged.paragraphs:               # banner stays left-aligned
                 for r in p.runs:
                     r.font.bold = True
@@ -2503,9 +2510,12 @@ def _add_pgim_table_to_doc(doc, excel_path, subject_banner: str, comp_banner: st
         for j, v in enumerate(cvals):
             cell = row.cells[j]
             cell.text = v
-            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            # Shade before vertical_alignment — see comment on the banner-row
+            # cell above: w:shd must precede w:vAlign in tcPr per the OOXML
+            # schema, or Word for Windows flags the file as unreadable.
             if grey:
                 _set_cell_bg(cell, "D6DCE4")
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             for p in cell.paragraphs:
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 for r in p.runs:
