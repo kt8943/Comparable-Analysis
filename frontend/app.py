@@ -2611,13 +2611,36 @@ def _style_section_title(paragraph, name: str = "Arial", size_pt: float = 11,
 
 
 def _png_size(path):
-    """(width, height) in pixels from a PNG header, else (None, None)."""
+    """(width, height) in pixels, from a PNG or JPEG header, else (None, None).
+
+    Map images are saved as JPEG (see generate_comps_map_base.render_map — a
+    truecolor PNG of map-tile imagery compresses far worse than JPEG, and the
+    original Mapbox-served indexed PNG breaks Word on Windows) but keep the
+    "*_map.png" filename the rest of the app's path/glob logic expects; both
+    python-docx and PIL detect the real format from the file's byte signature,
+    not its extension, so this needs the same tolerance to size either one."""
+    import struct
     try:
         with open(path, "rb") as f:
             head = f.read(24)
         if len(head) >= 24 and head[:8] == b"\x89PNG\r\n\x1a\n":
-            import struct
             return struct.unpack(">II", head[16:24])
+        if head[:2] == b"\xff\xd8":   # JPEG SOI — scan markers for a SOFn segment
+            with open(path, "rb") as f:
+                f.seek(2)
+                while True:
+                    marker = f.read(2)
+                    if len(marker) < 2 or marker[0] != 0xFF:
+                        break
+                    seg_type = marker[1]
+                    if seg_type in (0xD8, 0xD9) or 0xD0 <= seg_type <= 0xD7:
+                        continue   # no length field on these markers
+                    seg_len = struct.unpack(">H", f.read(2))[0]
+                    if 0xC0 <= seg_type <= 0xCF and seg_type not in (0xC4, 0xC8, 0xCC):
+                        data = f.read(5)   # precision(1) + height(2) + width(2)
+                        h, w = struct.unpack(">HH", data[1:5])
+                        return w, h
+                    f.seek(seg_len - 2, 1)
     except Exception:
         pass
     return None, None

@@ -796,9 +796,18 @@ def render_map(subject_lonlat: tuple,
         if plot_subject:
             overlays.append(_marker(sz, "star", _SUBJECT_COLOR, slon, slat))
         overlay_str = ",".join(overlays)
+        # No "@2x" (retina) suffix: at {width}x{height}, each embedded map is a
+        # few hundred KB; @2x quadruples the pixel count and roughly doubles
+        # that. The combined Word report (up to 3 maps) downloading as a
+        # consistently truncated ~1MB file — reproduced across networks and
+        # browsers, with no server-side error in the app's own logs — pointed
+        # at a size/time limit in how the hosting platform serves a
+        # download_button response, not a bug in this codebase. Shrinking the
+        # payload is the only lever available to work around it; @1x is still
+        # plenty sharp at the size a map renders in the report.
         url = (
             f"https://api.mapbox.com/styles/v1/mapbox/{style}/static/"
-            f"{overlay_str}/auto/{width}x{height}@2x"
+            f"{overlay_str}/auto/{width}x{height}"
             f"?padding={padding}&access_token={token}"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "pgim-comps-map/1.0"})
@@ -814,16 +823,30 @@ def render_map(subject_lonlat: tuple,
         # to save bandwidth. Windows' native Word/Office picture renderer (GDI+)
         # is known to be unreliable with indexed PNGs — "The picture can't be
         # displayed because it contains errors" — even though the exact same
-        # file opens fine in a browser or in Word on macOS. Re-encode to plain
-        # RGB (truecolor) before saving so the embedded map is safe everywhere.
+        # file opens fine in a browser or in Word on macOS.
+        #
+        # Re-encode as JPEG (not RGB PNG) despite the "*_map.png" filename: a
+        # truecolor PNG of map-tile imagery is actually LARGER than the
+        # original indexed PNG (more bytes/pixel, and PNG's lossless deflate
+        # doesn't compress photographic/gradient content well), whereas JPEG
+        # was built for exactly this kind of content. Kept the ~2-4x smaller
+        # payload was needed after the combined Word report (up to 3 embedded
+        # maps) was found to reproducibly truncate around ~1MB downloading
+        # from Streamlit Cloud — across different networks/browsers, with no
+        # server-side error in the app's own logs — pointing at a size/time
+        # limit in how the platform serves a download_button response.
+        # Both python-docx's add_picture() and PIL/Streamlit's st.image()
+        # detect image format from the file's own byte signature, not its
+        # extension, so keeping the .png filename here is safe and avoids
+        # touching every *_map.png glob/path across the app.
         try:
             from PIL import Image as _PILImage
             _img = _PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
-            _img.save(output_path, format="PNG")
+            _img.save(output_path, format="JPEG", quality=90)
         except ImportError:
             with open(output_path, "wb") as f:
                 f.write(img_bytes)
-        print(f"  Saved → {output_path}  ({len(img_bytes)//1024} KB, {width*2}×{height*2}px @2x)")
+        print(f"  Saved → {output_path}  ({Path(output_path).stat().st_size//1024} KB, {width}×{height}px)")
         return
 
     # Custom oversized pins via Pillow
