@@ -288,16 +288,68 @@ A name-match post-correction pass then overrides the LLM where a header unambigu
 matches one field's keywords (a column literally named "Address" always maps to the
 address field).
 
-**PDF inputs** route through `pdf_extractor.py`:
+**PDF inputs** route through `pdf_extractor.py`: keyword page discovery →
+`camelot`/`pdfplumber` table detection → column mapping → row assembly + dedup. This
+one pipeline runs for both Ollama and GPT — they differ only in which model backs the
+LLM-dependent steps (column mapping's LLM tier, the text-fallback prose parser), not in
+a separate "vision path" that reads whole pages up front. (An earlier version of this
+doc described a standalone whole-PDF vision extraction mode; that was never actually
+implemented as a distinct path — what exists instead are the three narrower,
+targeted vision checks below, all GPT-only.)
 
-- **Ollama path** — keyword page discovery → `pdfplumber` table detection → rule-based
-  column mapping → row assembly + dedup.
-- **GPT-4o vision path** — `pymupdf` renders every page to an image; all pages go in one
-  call. The model locates the table visually and returns JSON records.
+Three separate, narrow places where a rendered page image gets involved — not one
+big "vision path":
 
-The vision path exists because some PDFs render property names as floating text that
-sits visually inside a cell but outside its boundary box. `pdfplumber.extract_tables()`
-returns empty strings for those cells; the vision model reads what is on the page.
+- **Column-mapping vision cross-check** (§7.6) — fires when a column mapping is
+  already flagged low-confidence; renders that page and asks the model to confirm
+  which column is which. Corrects a *mapping*, never invents a row.
+- **Stage 3+4 vision retry** (below) — fires when a page Stage 1 was confident about
+  (title matched) ended up with zero usable rows after column mapping + assembly;
+  renders that page and asks the model to locate and extract the missing table
+  directly, bypassing table-grid detection. Evidence-bound against the page's own
+  text layer — see below.
+- **Stage 6 name cross-check** (§7.10, off by default) — renders a page to catch a
+  font-encoding glyph substitution no text-based stage can see. Only ever corrects a
+  name's characters, never adds a row or a value.
+
+#### Stage 3+4 vision retry (new 2026-07)
+
+Not a new numbered stage — a retry loop inside record assembly (Stage 3+4/§7.6-7.7),
+not a standalone step, because its trigger condition (did this page's assembly
+actually produce a record with the field we need) can only be evaluated *after*
+column mapping has run — Stage 2's table-grid detection has no way to know yet
+whether a table it found is even the right type.
+
+Table-grid detection (camelot) sometimes merges the target table with a neighbouring
+one — e.g. a report page with a 2-row "Key Sales Transactions" table sitting flush
+against a much larger market-statistics table; camelot grabs both as one region, and
+after that region gets auto-split it can lose its header row and end up unmapped
+(`property_name`/`price_sgd_m` both read "not found") even though the 2 real rows are
+still sitting there in the page's own text, just outside any table camelot could
+isolate cleanly. Before this fix such a page silently produced 0 records — Stage E's
+fallback gate (§7.5) never re-tried it, because camelot *did* find something on that
+page (the stats table, or a wrong-type table like a lease table), and the gate only
+tracks "did this page yield any table," not "did it yield the table we actually need."
+
+Fires only when BOTH hold: (a) Stage 1's page discovery matched this page by its own
+title/heading keyword (independent evidence the target table should be here), and
+(b) after full table detection + column mapping, that page contributed zero records
+with a real value for the type's key field(s) (`price_sgd_m`/`price_psf_gfa` for sales,
+`asking_rent`/`eff_rent`/`nla_sf` for rent, `price_sgd_m`/`price_psf_ppr` for land —
+passed in as `value_fields`). A page whose only "records" are name-only rows from the
+WRONG table (e.g. a lease table's rows, which have a name and an SF value but no price)
+still counts as zero and triggers the rescue — see `_is_useful` in `pdf_extractor.py`.
+
+When it fires: renders the page, sends it to GPT-4o with the target field
+definitions, and asks it to locate the one matching table on the page and copy its
+rows — explicitly told to preserve numbers exactly as printed (no reformatting) and to
+ignore any other table on the page (statistics, or the wrong transaction type).
+**Evidence-bound like every other stage**: every returned field value must appear
+verbatim in that page's own `pdfplumber` text layer or it is dropped from the row (not
+the whole row); vision can only relocate/re-associate a value the text layer already
+contains, never introduce a number the page's own text doesn't have. GPT-only; on by
+default (only fires on an already-failing page, so it adds no cost to a page that
+already works); `PDF_VISION_RESCUE=0` disables it.
 
 Records extracted from **prose** rather than a detected table grid are tagged
 `_llm_parsed` and surfaced in the UI as an AI-judgment notice, because a table grid is
@@ -1358,28 +1410,39 @@ rendered one, and doesn't count against a report below):
 
 | Source | Quarters covered | Passing |
 | --- | --- | --- |
-| Colliers | Q3 2023 – Q1 2026 (sales) | 9/11 |
+| Colliers | Q3 2023 – Q1 2026 (sales) | 10/11 |
 | CMMB Capital Markets | Q4 2023 – Q1 2026 (sales) | 9/9 |
-| CMMB Office MarketBeat | Q1 2025 – Q1 2026 (sales + rent) | 9/10 |
+| CMMB Office MarketBeat | Q1 2025 – Q1 2026 (sales + rent) | 10/10 |
 | Savills | Q3 2023 – Q1 2026 (sales + land) | 21/22 |
-| **Total** | | **48/52** |
+| **Total** | | **50/52** |
 
 Each unit counted above is one report-and-type combination (e.g. "Savills Q1 2025
 sales" is one unit), not one row. 52 is the count of unique gold files; one duplicate
 upload (`singapore-capital-markets-mb-4q2023__sales.gold (1).json`, byte-identical to
 the non-duplicate copy) is excluded.
 
-**How to read the matrix below:** ✅ means every row matched gold exactly. A fraction
-(`4/5`) means 1 of 5 rows differed from gold on at least one field — tagged either
-⚠️ or ❌:
+**How to read the matrix below:** ✅ means every row matched gold exactly, **or** every
+difference from gold was confirmed to be gold/source fidelity rather than a pipeline
+capability gap (see the counting rule just below) — a fraction (`4/5`) means at least
+one row still has a real, uncounted-as-fine difference, tagged ❌ or a still-counted ⚠️:
 
-- **⚠️ = checked and confirmed harmless** — the underlying information is the same;
-  the difference is a font/character ambiguity, a typo already present in the source
-  PDF itself, or gold's own transcription being less complete than the pipeline's. Not
-  a pipeline defect.
+- **Counts as passing (not a capability gap)** — the pipeline's output is *provably*
+  the correct one: either the source PDF's own text layer literally contains what the
+  pipeline extracted (confirmed via ≥2 independent extractors and/or a vision
+  cross-check, so no extraction approach could ever produce gold's answer instead —
+  e.g. Collyer Quay's `l22-24FL`), or the difference is a lossless, purely cosmetic
+  character-encoding variant with zero effect on meaning or readability (e.g. a curly
+  vs. straight apostrophe). Getting *this* right isn't a matter of the pipeline trying
+  harder — there is no alternative correct output to reach.
+- **Still counts as a real gap (⚠️, not ❌ — confirmed non-destructive, but still
+  open)** — the difference is something a better extraction approach *could* in
+  principle fix: a name genuinely truncated by the text-fallback path (info is lost,
+  not just re-encoded), or a word visibly split by a ligature-rendering artifact (the
+  output reads wrong to a person, even though the root cause is the PDF's font, not a
+  wrong-field mapping). Two such gaps remain — see footnotes 1 and 4.
 - **❌ = a real extraction error** — a value landed in the wrong field, was fabricated,
-  or was lost. None of the 4 remaining differences below are this category — the last
-  one (B6, a unit price leaking into the GFA field) was fixed 2026-07-20.
+  or was lost. None of the differences below are this category — the last one (B6, a
+  unit price leaking into the GFA field) was fixed 2026-07-20.
 
 `—` means that source/type wasn't published or checked for that quarter. Buyer and
 Sale Type are excluded from this check since neither is a column in the Excel output.
@@ -1403,7 +1466,7 @@ gap, not a pipeline defect.
 | Q2 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
 | Q3 2024 | ✅ | — | — | — | ✅ | ✅ |
 | Q4 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
-| Q1 2025 | 2/3⚠️² | ✅ | ✅ | 1/2⚠️³ | ✅ | 4/5⚠️⁴ |
+| Q1 2025 | ✅² | ✅ | ✅ | ✅³ | ✅ | 4/5⚠️⁴ |
 | Q2 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Q3 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Q4 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -1411,15 +1474,20 @@ gap, not a pipeline defect.
 
 1. Property name truncated by the text-extraction fallback (this report has no gridded
    table on that page) — "Visioncrest Commercial" → "Visioncrest". A real accuracy gap
-   in that fallback path, but not a wrong-field defect, so ⚠️ not ❌.
+   in that fallback path, but not a wrong-field defect, so ⚠️ not ❌ — **still counts
+   against the 50/52 total**, unlike footnotes 2-3 below.
 
 2. "Northpoint city South Wing" — the raw table cell in the source PDF itself already
-   has the lowercase `c`; the pipeline reproduces it faithfully.
+   has the lowercase `c`; the pipeline reproduces it faithfully. Counted as ✅: there is
+   no correct output other than what the pipeline already produces.
 
 3. The gold file and the PDF's own text layer disagree on one character — see below.
+   Counted as ✅ for the same reason as footnote 2 — confirmed via two independent text
+   extractors *and* a vision cross-check that the source itself reads this way.
 
 4. A ligature-splitting cosmetic near-miss ("floors" → "fl oors") — the pipeline's own
-   text-layer extraction, not a gold-file error.
+   text-layer extraction, not a gold-file error, but the output does visibly read wrong
+   to a person — **still counts against the 50/52 total**.
 
 **CMMB Office Q1 2025 sales' Collyer Quay row isn't a pipeline bug — the gold file and
 the PDF's text layer disagree on one character.** The PDF's own text layer reads "20
@@ -1468,11 +1536,11 @@ near-miss remains in that combination.
 
 | Source | Quarters covered | Passing |
 | --- | --- | --- |
-| Colliers | Q3 2023 – Q1 2026 (sales) | 8/11 |
+| Colliers | Q3 2023 – Q1 2026 (sales) | 9/11 |
 | CMMB Capital Markets | Q4 2023 – Q1 2026 (sales) | 9/9 |
-| CMMB Office MarketBeat | Q1 2025 – Q1 2026 (sales + rent) | 9/10 |
+| CMMB Office MarketBeat | Q1 2025 – Q1 2026 (sales + rent) | 10/10 |
 | Savills | Q3 2023 – Q1 2026 (sales + land) | 21/22 |
-| **Total** | | **47/52** |
+| **Total** | | **49/52** |
 
 | Quarter | Colliers (sales) | CMMB CapMkt (sales) | CMMB Office (rent) | CMMB Office (sales) | Savills (land) | Savills (sales) |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -1482,7 +1550,7 @@ near-miss remains in that combination.
 | Q2 2024 | ✅ | ✅ | — | — | ✅ | ✅ |
 | Q3 2024 | ✅ | — | — | — | ✅ | ✅ |
 | Q4 2024 | 0/3❌⁶ | ✅ | — | — | ✅ | ✅ |
-| Q1 2025 | 2/3⚠️² | ✅ | ✅ | 1/2⚠️³ | ✅ | 4/5⚠️⁴ |
+| Q1 2025 | ✅² | ✅ | ✅ | ✅³ | ✅ | 4/5⚠️⁴ |
 | Q2 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Q3 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Q4 2025 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -1493,7 +1561,7 @@ page with no gridded structure camelot/pdfplumber can recover at all — the pip
 falls through to its text-only prose-extraction path, which is itself an LLM call
 (read a paragraph, pull out name/price/psf as JSON). With no LLM reachable that path
 fails outright (`Connection refused`) and the page contributes zero records. With GPT
-this same path correctly parses it back to the 2/3⚠️² result in the table above — no
+this same path correctly parses it back to the ✅² result in the table above — no
 deterministic rule-based approach can substitute here; parsing structured facts out
 of free-form prose is exactly the kind of task only a language model does
 ⁶ different failure mode from Q4 2023 — a real gridded table IS found here, but its
@@ -1503,12 +1571,48 @@ unmapped, the assembled rows come out with almost no fields filled, and the
 pre-Stage-5 garbage filter (correctly) discards them as noise before they'd ever reach
 a human. With GPT the LLM tier resolves the missing columns and the report passes.
 
-The other three ⚠️ combinations (Colliers Q1 2025, CMMB Office Q1 2025 sales, Savills
+The other three combinations (Colliers Q1 2025, CMMB Office Q1 2025 sales, Savills
 Q1 2025 sales) show **identical results with or without any LLM** — proof those
 particular differences are text-layer/gold-transcription artifacts, not something an
-LLM stage is fixing or could fix. Net effect of every LLM stage in this pipeline,
-measured across all 52 files: it rescues exactly 2 files (6 rows) that are otherwise
-completely unextractable by deterministic code alone; it changes nothing else.
+LLM stage is fixing or could fix (two of the three, footnotes 2-3, are ✅ under the
+counting rule above regardless; the third, Savills' "fl oors" ligature, is a real gap
+neither the LLM nor its absence changes). Net effect of every LLM stage in this
+pipeline, measured across all 52 files: it rescues exactly 2 files (6 rows) that are
+otherwise completely unextractable by deterministic code alone; it changes nothing else.
+
+**2026-07-26: passing rate refined from 48/52 to 50/52 — a counting-convention fix, not
+a code change.** Re-running the full 52-file suite with a stricter field-by-field
+diff (not just name+price) turned up two more confirmed-cosmetic variants (a curly vs.
+straight apostrophe in "Moody's" and in "MCL Land's assets" — already ✅ cells, unaffected)
+and, in reviewing all of it together, established the counting rule in the legend above:
+a difference only counts against the total when the pipeline *could* in principle have
+produced a different, more correct output. Applying that consistently moved Colliers
+Q1 2025 sales and CMMB Office Q1 2025 sales from ⚠️-fractions to ✅ (their only
+differences — the "Northpoint city" lowercase `c` and the Collyer Quay `l` — are both
+confirmed source-fidelity, not pipeline misses), while Colliers Q4 2023 sales
+(Visioncrest truncation) and Savills Q1 2025 sales (the "fl oors" ligature) correctly
+stay counted, since both are the kind of gap a better extraction approach genuinely
+could fix. **48/52 and 50/52 describe the exact same underlying results** — nothing in
+the pipeline changed between them, only which differences are judged to count.
+
+**Same date: a new vision retry was added for table detection itself** (§7, "Stage 3+4
+vision retry") — the extraction stages already documented here (§7.6's column-mapping
+cross-check, §7.9's evidence-bound guardrails) assume the right table was already
+located; this new retry fires when it wasn't. A page Stage 1 confidently matched by its
+own title/heading that nonetheless assembled zero records with a real value for the
+type's key field(s) gets re-read via vision, evidence-bound against that page's own
+text layer exactly like every other LLM-touching stage in this pipeline. A full
+52-file regression (this stricter field-by-field diff) confirms **zero change** — the
+retry never fires on any of the 52, because none of them have a page Stage 1 matched
+that still comes up empty after assembly. It was written for, and fixes, a report
+**outside this 52-file set**: a Cushman & Wakefield Singapore Office Q2 2026 report
+where camelot merged a genuine 2-row "Key Sales Transactions" table with a much larger
+neighbouring statistics table, losing both real rows entirely (0 records) even though
+Stage 1 had correctly matched the page by title. The retry recovers both rows correctly
+(confirmed against the PDF's own text). A second, related addition: if Stage 1 finds
+*no* candidate page at all for a comp type deliberately run on this file (routed there
+by the classifier or by analyst override), a blind vision search of the first few pages
+now runs before giving up outright, using the same evidence-binding.
 
 ---
 

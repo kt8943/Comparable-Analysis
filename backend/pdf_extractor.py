@@ -2669,6 +2669,121 @@ def _vision_verify_names(pdf_path: str, records: list, llm_cfg: dict) -> list:
     return out
 
 
+def _vision_rescue_page(pdf_path: str, page_num: int, field_schema: list,
+                        llm_cfg: dict, page_text: str,
+                        value_fields: list = None) -> list:
+    """
+    Stage 3+4 retry — fires only when Stage 1 was confident a page holds the
+    target table (its title/heading matched a section keyword) but Stage 2's
+    grid detection ended up contributing ZERO real rows from it. That mismatch
+    means the table most likely exists but got merged with or mis-split from a
+    neighbouring table (e.g. a 2-row sales table sitting flush against a much
+    larger statistics table, both grabbed by camelot as one region) — not that
+    the table genuinely isn't there.
+
+    Renders the page and asks GPT-4o vision to locate and extract the table
+    directly from the pixels, bypassing camelot/pdfplumber's grid detection
+    entirely. GPT-only (project preference); no-ops for any other provider or
+    if pymupdf is unavailable.
+
+    Evidence-bound like every other stage: every returned field value must
+    appear verbatim in the page's own pdfplumber text layer or it is dropped
+    from that row (not the whole row — a row keeps whichever fields survive);
+    a row that fails to keep a name AND at least one other field is discarded
+    entirely (_is_real_candidate). Vision can only relocate/re-associate a
+    value the text layer already contains — it is never allowed to introduce
+    a number the page's own text doesn't have.
+    """
+    provider = (llm_cfg or {}).get("provider", "ollama")
+    if provider != "openai":
+        return []
+    try:
+        import fitz as _fitz
+    except ImportError:
+        print(f"      [vision-rescue] skipped — pymupdf not installed")
+        return []
+
+    from tools.vision_llm import call_vision_llm
+    import tempfile
+
+    field_lines = "\n".join(f"- {key}: {desc}" for _, key, desc in field_schema)
+    prompt = (
+        "This page has more than one table on it. Find the ONE table whose rows "
+        "are individual real-estate transactions best described by the fields "
+        "below — ignore any other table on the page (e.g. aggregate market "
+        "statistics, or a different transaction type such as a lease/rental deal "
+        "when you are looking for a sale, or vice versa).\n\n"
+        "Extract every row of that ONE table as a JSON object using these field "
+        "definitions (omit a key entirely if that row has no value for it — "
+        "never guess or estimate one):\n"
+        f"{field_lines}\n\n"
+        "Copy every value EXACTLY as printed on the page, character for "
+        "character (same digits, same commas, same decimal points) — never "
+        "reformat, round, or convert a number.\n\n"
+        "Output ONLY a JSON array of objects, one per transaction row, using "
+        "only the field keys listed above. If no such table exists on this "
+        "page, output an empty array []."
+    )
+
+    img_path = None
+    try:
+        doc = _fitz.open(pdf_path)
+        pix = doc[page_num - 1].get_pixmap(matrix=_fitz.Matrix(2, 2))
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            pix.save(tf.name)
+            img_path = tf.name
+        raw = call_vision_llm(img_path, prompt, llm_cfg)
+    except Exception as exc:
+        print(f"      [vision-rescue] page {page_num} failed: {exc}")
+        return []
+    finally:
+        if img_path:
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+
+    m = re.search(r"\[[\s\S]*\]", raw or "")
+    if not m:
+        return []
+    try:
+        rows = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(rows, list):
+        return []
+
+    schema_keys     = {key for _, key, _ in field_schema}
+    context_norm    = _norm_ctx(page_text)
+    context_nocomma = context_norm.replace(",", "")
+
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rec = {}
+        for k, v in row.items():
+            if k not in schema_keys or v in (None, ""):
+                continue
+            if not _value_in_context(v, context_norm, context_nocomma):
+                continue   # not evidence-bound — drop this field, not the whole row
+            rec[k] = v
+        _useful = (any(str(rec.get(vf) or "").strip() for vf in value_fields)
+                  if value_fields else _is_real_candidate(rec))
+        if _useful and _is_real_candidate(rec):
+            rec["_prov"] = None
+            rec["_source"] = "vision-rescue"
+            out.append(rec)
+
+    if out:
+        print(f"      [vision-rescue] page {page_num}: recovered {len(out)} "
+              f"evidence-bound record(s) from the page image")
+    else:
+        print(f"      [vision-rescue] page {page_num}: no evidence-bound rows "
+              f"recovered from the page image")
+    return out
+
+
 def extract_pdf_records(
     pdf_path: str,
     section_keywords: list,
@@ -2680,6 +2795,7 @@ def extract_pdf_records(
     dedup: bool = True,
     extra_exclusion_note: str = "",
     vision_verify_names: bool = False,
+    value_fields: list = None,
 ) -> list:
     """
     Full 4-stage PDF extraction pipeline.  Public API unchanged.
@@ -2698,6 +2814,18 @@ def extract_pdf_records(
                      catches one narrow failure mode (a font-encoding artifact
                      no text-based stage can see). Also enabled by setting the
                      PDF_VISION_VERIFY=1 environment variable.
+    value_fields     : field key(s) that make a record actually USEFUL for this
+                     comp type (e.g. ("price_sgd_m", "price_psf_gfa") for sales),
+                     as opposed to merely present — a record can have a name and
+                     several populated fields yet still be worthless if none of
+                     them is the figure the deliverable needs (e.g. a lease-table
+                     row that mapped cleanly onto property_name/gfa_sf/sale_type
+                     but has no price). Used only to gate the Stage 3+4 vision
+                     retry below: without this, a page whose only "records" are
+                     name-only/priceless rows from the WRONG table would look
+                     like it "already has records" and the rescue would never
+                     fire. Falls back to the looser _is_real_candidate check
+                     (name + any one other field) when omitted.
 
     Returns
     -------
@@ -2719,6 +2847,31 @@ def extract_pdf_records(
     page_infos = find_relevant_pages(pdf_path, section_keywords, max_pages)
     if not page_infos:
         print(f"  [PDF] No pages matched.  Keywords searched: {section_keywords}")
+        # This file was deliberately routed to THIS scan — by the classifier or
+        # by the analyst overriding it in the UI — so the fact that the run got
+        # this far already IS the "this file should have this content" signal;
+        # no need to separately thread the classifier's own confidence through.
+        # Stage 1's own keyword + embedding match still missed every page (a
+        # different failure mode than the Stage 3+4 retry below, which handles
+        # "found the right page, extraction from it failed" — here we don't
+        # even know which page). Fall back to a blind vision search of the
+        # first few pages rather than giving up outright.
+        if os.environ.get("PDF_VISION_RESCUE", "1") != "0" and (llm_cfg or {}).get("provider") == "openai":
+            _cap = min(max_pages, 6)
+            print(f"      Falling back to blind vision search of the first "
+                  f"{_cap} page(s) ...")
+            _blind_records = []
+            try:
+                import pdfplumber as _pdfplumber
+                with _pdfplumber.open(pdf_path) as _pdf:
+                    for _pg in range(1, min(_cap, len(_pdf.pages)) + 1):
+                        _txt = (_pdf.pages[_pg - 1].extract_text() or "")
+                        _blind_records.extend(
+                            _vision_rescue_page(pdf_path, _pg, field_schema, llm_cfg, _txt,
+                                               value_fields=value_fields))
+            except Exception as _e:
+                print(f"      [vision-rescue] blind search skipped: {_e}")
+            return _blind_records
         return []
     print(f"  [PDF] {len(page_infos)} page(s) matched: "
           f"{[p['page_num'] for p in page_infos]}")
@@ -2746,6 +2899,49 @@ def extract_pdf_records(
                             extra_exclusion_note=extra_exclusion_note,
                             pdf_path=pdf_path)
     print(f"  [PDF] {len(records)} record(s) extracted")
+
+    # Stage 3+4 retry — a page Stage 1 was confident about (its title/heading
+    # matched a section keyword) that nonetheless contributed zero real rows
+    # above gets re-assembled via vision. See _vision_rescue_page for why that
+    # mismatch means "table detection mis-split it", not "there is no such
+    # table". On by default for GPT (only fires on an already-failing page, so
+    # no cost on a page that already works); set PDF_VISION_RESCUE=0 to disable.
+    if os.environ.get("PDF_VISION_RESCUE", "1") != "0" and (llm_cfg or {}).get("provider") == "openai":
+        def _is_useful(rec: dict) -> bool:
+            if value_fields:
+                return any(str(rec.get(vf) or "").strip() for vf in value_fields)
+            return _is_real_candidate(rec)
+
+        _pages_with_records = set()
+        for _r in records:
+            if not _is_useful(_r):
+                continue
+            _prov = _r.get("_prov") or {}
+            for _k in _NAME_KEYS:
+                _m = _prov.get(_k)
+                if _m and _m.get("table"):
+                    _mm = re.match(r"p(\d+)#", _m["table"])
+                    if _mm:
+                        _pages_with_records.add(int(_mm.group(1)))
+                    break
+        _rescue_candidates = [
+            p for p in page_infos
+            if p.get("matched_keywords") and p["page_num"] not in _pages_with_records
+        ]
+        if _rescue_candidates:
+            print(f"\n  [PDF Stage 3+4 retry] Vision rescue — {len(_rescue_candidates)} "
+                  f"page(s) matched by title but yielded no table rows ...")
+            try:
+                import pdfplumber as _pdfplumber
+                with _pdfplumber.open(pdf_path) as _pdf:
+                    for _p in _rescue_candidates:
+                        _pg = _p["page_num"]
+                        _txt = (_pdf.pages[_pg - 1].extract_text() or "")
+                        records.extend(
+                            _vision_rescue_page(pdf_path, _pg, field_schema, llm_cfg, _txt,
+                                               value_fields=value_fields))
+            except Exception as _e:
+                print(f"      [vision-rescue] skipped: {_e}")
 
     if records and os.environ.get("PDF_SKIP_STAGE5") != "1":
         # Pre-filter garbage/incomplete records BEFORE Stage 5, not after.

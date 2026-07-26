@@ -433,6 +433,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "Rental activity. Those are land or lease tables, not building sales, "
             "regardless of whether individual rows say Residential or Commercial."
         ),
+        value_fields=("price_sgd_m", "price_psf_gfa"),
     )
     if not raw_records:
         return []

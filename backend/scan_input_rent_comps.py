@@ -303,6 +303,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "Tenderer' / 'Date of Award' / 'psf ppr'), or aggregate market statistics "
             "(vacancy, supply pipeline, average rents by zone)."
         ),
+        value_fields=("asking_rent", "eff_rent", "nla_sf"),
     )
     if not raw_records:
         return []

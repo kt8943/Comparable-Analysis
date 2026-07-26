@@ -340,6 +340,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "completed buildings / investment assets (e.g. a Buyer/Purchaser column "
             "with built-property names) or Leasing / Rental activity."
         ),
+        value_fields=("price_sgd_m", "price_psf_ppr"),
     )
     if not raw_records:
         return []
