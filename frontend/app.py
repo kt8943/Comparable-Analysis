@@ -1872,8 +1872,12 @@ def _show_results(config_path: str, prefix: str, context: str = "",
                 _CONFIDENT_PROVIDERS = {"onemap", "kakao", "google"}
                 _confident = [r for r in _geo_records
                               if r.get("_geo_provider") in _CONFIDENT_PROVIDERS]
-                _fallback  = [r for r in _geo_records
-                              if str(r.get("_geo_provider") or "").startswith("mapbox")]
+                # Geocoding is Google/OneMap/Kakao only now (Mapbox is never
+                # returned as a geocode provider — it only renders the static
+                # map PNG), so a provider-based "mapbox fallback" bucket would
+                # always be empty. The real low-confidence signal is landing
+                # on the country centroid (_geo_suspect, set in scan_input_*).
+                _fallback  = [r for r in _geo_records if r.get("_geo_suspect")]
                 _failed    = [r for r in _geo_records
                               if r.get("_geo_provider") == "failed"]
                 _unknown   = [r for r in _geo_records
@@ -1886,7 +1890,7 @@ def _show_results(config_path: str, prefix: str, context: str = "",
                         (ROOT / "configs" / "shared_settings.json").read_text(encoding="utf-8"))
                 except Exception:
                     pass
-                _active_geo = _local_ss.get("geocoding_provider", "mapbox").lower()
+                _active_geo = _local_ss.get("geocoding_provider", "google").lower()
                 _confident_label = {
                     "onemap": "✅ Confident (OneMap)",
                     "kakao":  "✅ Confident (Kakao)",
@@ -1904,7 +1908,7 @@ def _show_results(config_path: str, prefix: str, context: str = "",
                 with st.expander(_geo_label, expanded=_has_issues):
                     g1, g2, g3 = st.columns(3)
                     g1.metric(_confident_label,      len(_confident))
-                    g2.metric("⚠️ Mapbox fallback",  len(_fallback))
+                    g2.metric("⚠️ Centroid (Invalid)", len(_fallback))
                     g3.metric("❌ Not plotted",       len(_failed))
 
                     def _prop_name(r):
@@ -1914,7 +1918,7 @@ def _show_results(config_path: str, prefix: str, context: str = "",
                     if _fallback:
                         st.write("")
                         st.markdown(
-                            "**⚠️ Mapped via Mapbox — position may be approximate:**")
+                            "**⚠️ Plotted on the country centroid — likely invalid, verify:**")
                         st.dataframe(
                             pd.DataFrame([
                                 {"Property": _prop_name(r),

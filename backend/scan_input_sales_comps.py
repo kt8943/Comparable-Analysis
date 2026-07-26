@@ -1532,6 +1532,7 @@ def run(config_path: str = "configs/deal_config.json",
                         "map_marker":   r.get("map_marker"),
                         "_geo_provider": r.get("_geo_provider"),
                         "_geo_note":    r.get("_geo_note"),
+                        "_geo_suspect": r.get("_geo_suspect"),
                         # location competitiveness label — sync so the preview
                         # shows it, not the raw extracted location text.
                         "location":     r.get("location"),
@@ -1560,8 +1561,8 @@ def run(config_path: str = "configs/deal_config.json",
                     _meta = _meta_by_name.get(_name)
                     if _meta:
                         for _fld in ("lon", "lat", "map_marker",
-                                     "_geo_provider", "_geo_note", "location",
-                                     "land_zoning"):
+                                     "_geo_provider", "_geo_note", "_geo_suspect",
+                                     "location", "land_zoning"):
                             if _meta.get(_fld) is not None and sr.get(_fld) != _meta[_fld]:
                                 sr[_fld] = _meta[_fld]
                                 _any_updated = True
