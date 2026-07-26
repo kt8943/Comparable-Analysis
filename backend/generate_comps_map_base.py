@@ -810,8 +810,19 @@ def render_map(subject_lonlat: tuple,
         content_type = resp.headers.get("Content-Type", "")
         if "image" not in content_type:
             raise RuntimeError(f"Unexpected response ({content_type}): {img_bytes[:200]}")
-        with open(output_path, "wb") as f:
-            f.write(img_bytes)
+        # Mapbox's static API serves these as palette-indexed PNGs (color type 3)
+        # to save bandwidth. Windows' native Word/Office picture renderer (GDI+)
+        # is known to be unreliable with indexed PNGs — "The picture can't be
+        # displayed because it contains errors" — even though the exact same
+        # file opens fine in a browser or in Word on macOS. Re-encode to plain
+        # RGB (truecolor) before saving so the embedded map is safe everywhere.
+        try:
+            from PIL import Image as _PILImage
+            _img = _PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+            _img.save(output_path, format="PNG")
+        except ImportError:
+            with open(output_path, "wb") as f:
+                f.write(img_bytes)
         print(f"  Saved → {output_path}  ({len(img_bytes)//1024} KB, {width*2}×{height*2}px @2x)")
         return
 
