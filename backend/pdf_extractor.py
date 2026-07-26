@@ -1241,7 +1241,8 @@ def extract_page_tables(pdf_path: str, page_infos: list,
                         field_schema: list = None,
                         base_url: str = "", model: str = "",
                         llm_cfg: dict = None,
-                        reject_table_headers: list = None) -> list:
+                        reject_table_headers: list = None,
+                        rejected_pages_out: set = None) -> list:
     """
     Stage 2: extract tables from each flagged page.
 
@@ -1251,6 +1252,13 @@ def extract_page_tables(pdf_path: str, page_infos: list,
     Returns list of dicts:
         source="table" → {page_num, section_title, headers, rows}
         source="text"  → {page_num, section_title, raw_text}
+
+    rejected_pages_out : optional set the caller passes in to be populated
+        with page numbers whose only table(s) were deliberately rejected as
+        out-of-scope (reject_table_headers matched — e.g. a GLS/land-tender
+        table on an asset-sales run). Lets a later stage (the vision rescue
+        retry) know NOT to re-mine that same page — otherwise vision would
+        happily re-extract the very table Stage 2 correctly excluded.
     """
     results = []
 
@@ -1446,6 +1454,8 @@ def extract_page_tables(pdf_path: str, page_infos: list,
             # as a "text" record after its table was correctly excluded).
             print(f"    Page {page_num:>3}: only out-of-scope table(s) found — "
                   f"not falling back to text/img2table")
+            if rejected_pages_out is not None:
+                rejected_pages_out.add(page_num)
         if not found_any and not _had_rejected_table:
             print(f"    Page {page_num:>3}: camelot found no tables — trying img2table")
             ocr_tbls = _img2table_page_tables(pdf_path, page_num)
@@ -2671,7 +2681,8 @@ def _vision_verify_names(pdf_path: str, records: list, llm_cfg: dict) -> list:
 
 def _vision_rescue_page(pdf_path: str, page_num: int, field_schema: list,
                         llm_cfg: dict, page_text: str,
-                        value_fields: list = None) -> list:
+                        value_fields: list = None,
+                        extra_exclusion_note: str = "") -> list:
     """
     Stage 3+4 retry — fires only when Stage 1 was confident a page holds the
     target table (its title/heading matched a section keyword) but Stage 2's
@@ -2685,6 +2696,12 @@ def _vision_rescue_page(pdf_path: str, page_num: int, field_schema: list,
     directly from the pixels, bypassing camelot/pdfplumber's grid detection
     entirely. GPT-only (project preference); no-ops for any other provider or
     if pymupdf is unavailable.
+
+    extra_exclusion_note carries the same comp-type exclusion rules Stage 2/3
+    apply via reject_table_headers (e.g. "skip GLS/land-tender tables on an
+    asset-sales run") into the vision prompt itself — vision never sees
+    reject_table_headers directly, so without this it would happily extract
+    rows from the exact table Stage 2 already rejected as out-of-scope.
 
     Evidence-bound like every other stage: every returned field value must
     appear verbatim in the page's own pdfplumber text layer or it is dropped
@@ -2723,6 +2740,7 @@ def _vision_rescue_page(pdf_path: str, page_num: int, field_schema: list,
         "Output ONLY a JSON array of objects, one per transaction row, using "
         "only the field keys listed above. If no such table exists on this "
         "page, output an empty array []."
+        + (f"\n\n{extra_exclusion_note}" if extra_exclusion_note else "")
     )
 
     img_path = None
@@ -2868,7 +2886,8 @@ def extract_pdf_records(
                         _txt = (_pdf.pages[_pg - 1].extract_text() or "")
                         _blind_records.extend(
                             _vision_rescue_page(pdf_path, _pg, field_schema, llm_cfg, _txt,
-                                               value_fields=value_fields))
+                                               value_fields=value_fields,
+                                               extra_exclusion_note=extra_exclusion_note))
             except Exception as _e:
                 print(f"      [vision-rescue] blind search skipped: {_e}")
             return _blind_records
@@ -2877,11 +2896,13 @@ def extract_pdf_records(
           f"{[p['page_num'] for p in page_infos]}")
 
     print(f"\n  [PDF Stage 2] Extracting + filtering tables ...")
+    _rejected_pages: set = set()
     page_tables = extract_page_tables(
         pdf_path, page_infos,
         field_schema=field_schema,
         llm_cfg=llm_cfg,
         reject_table_headers=reject_table_headers,
+        rejected_pages_out=_rejected_pages,
     )
     if not page_tables:
         print(f"  [PDF] No content found on matched pages.")
@@ -2906,6 +2927,13 @@ def extract_pdf_records(
     # mismatch means "table detection mis-split it", not "there is no such
     # table". On by default for GPT (only fires on an already-failing page, so
     # no cost on a page that already works); set PDF_VISION_RESCUE=0 to disable.
+    # Pages in _rejected_pages are excluded from candidates: their only table
+    # was already correctly identified as out-of-scope (e.g. a GLS/land-tender
+    # table on an asset-sales run) and deliberately dropped zero rows on
+    # purpose — re-mining it via vision, which never sees reject_table_headers
+    # applied at the row-detection level, would silently undo that rejection
+    # and leak the wrong-type table's rows back in (same failure mode the
+    # img2table/text fallback above is guarded against via _had_rejected_table).
     if os.environ.get("PDF_VISION_RESCUE", "1") != "0" and (llm_cfg or {}).get("provider") == "openai":
         def _is_useful(rec: dict) -> bool:
             if value_fields:
@@ -2927,6 +2955,7 @@ def extract_pdf_records(
         _rescue_candidates = [
             p for p in page_infos
             if p.get("matched_keywords") and p["page_num"] not in _pages_with_records
+            and p["page_num"] not in _rejected_pages
         ]
         if _rescue_candidates:
             print(f"\n  [PDF Stage 3+4 retry] Vision rescue — {len(_rescue_candidates)} "
@@ -2939,7 +2968,8 @@ def extract_pdf_records(
                         _txt = (_pdf.pages[_pg - 1].extract_text() or "")
                         records.extend(
                             _vision_rescue_page(pdf_path, _pg, field_schema, llm_cfg, _txt,
-                                               value_fields=value_fields))
+                                               value_fields=value_fields,
+                                               extra_exclusion_note=extra_exclusion_note))
             except Exception as _e:
                 print(f"      [vision-rescue] skipped: {_e}")
 
