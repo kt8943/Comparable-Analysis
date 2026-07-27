@@ -352,50 +352,44 @@ def name_overlap(a: str, b: str) -> float:
 
 def dedup_cross_source(records: list, value_fields=("price_sgd_m",),
                        name_keys=_COMP_NAME_KEYS, name_min_overlap: float = 0.0,
-                       threshold_km: float = 0.05, price_tol_frac: float = 0.15,
-                       exact_km: float = 0.0) -> list:
+                       threshold_km: float = 0.05, price_tol_frac: float = 0.15) -> list:
     """
     Merge records that represent the SAME transaction/lease reported by DIFFERENT
     input sources (e.g. the same deal appears in both an uploaded Colliers PDF
     and a CBRE PDF, under different property-name spellings — 'MBFC (T3)' vs
     'Marina Bay Financial Centre Tower 3').
 
-    Two records are treated as the same deal when:
+    Two records are treated as the same deal when ALL of:
       - they geocoded within `threshold_km` of each other, AND
       - if `name_min_overlap` > 0, their names token-overlap at least that much
         (guards against merging two genuinely different, merely-adjacent
         buildings that happen to land within `threshold_km`) — set to 0 (the
         default) to skip this check entirely, AND
-      - EITHER the first of `value_fields` present as a positive number on BOTH
-        records agrees within `price_tol_frac`, OR (`exact_km` > 0) they geocoded
-        within `exact_km` of each other — near-identical coordinates are treated
-        as sufficient evidence of the same building on their own, overriding a
-        value disagreement (two sources rounding/reporting a price differently
-        is more likely than two unrelated deals landing on the same rooftop
-        pin). `exact_km` is disabled (0) by default; leave it off for comp types
-        where the SAME building legitimately carries multiple, genuinely
-        different transactions (e.g. rent: many leases, many different rents).
+      - the first of `value_fields` present as a positive number on BOTH records
+        agrees within `price_tol_frac`.
+    There is deliberately no "coordinates alone are close enough" override:
+    proximity is a hint, not proof — two distinct comps in the same reporting
+    window can legitimately share a rooftop pin (e.g. a strata/partial-interest
+    deal at the same building), so a genuine value disagreement is always
+    surfaced (via flag_cross_source_conflicts) rather than silently merged away.
     Records sharing the same `_source` tag are never merged here — same-file
     duplicates are a different bug, handled earlier by the extraction pipeline's
     own name-based dedup.
 
-    Why `name_min_overlap` defaults to off (sales/land turn it on; rent doesn't):
-    for sales/land, a building is normally sold/tendered once in a reporting
-    window, so requiring the names to also match is a cheap extra safety check
-    against a coincidental proximity+price match between two different buildings.
-    For rent, the SAME building legitimately produces many different leases at
-    many different rents, so its own name will always "match" trivially — the
-    `value_fields` (rent) agreement is what actually establishes "same lease
-    reported twice", and requiring name overlap on top of that adds nothing.
+    Why `name_min_overlap` defaults to off (sales/land turn it on; rent needs an
+    even stricter, near-exact overlap — see scan_input_rent_comps.py): for
+    sales/land, a building is normally sold/tendered once in a reporting window,
+    so requiring the names to also match is a cheap extra safety check against a
+    coincidental proximity+price match between two different buildings. For
+    rent, the SAME building legitimately produces many different leases at many
+    different rents, so name/value agreement alone isn't enough — merging there
+    is gated much tighter (near-identical coordinates AND name AND rent) to
+    avoid collapsing two genuinely different leases.
 
     For each matched pair/group, keeps the MOST COMPLETE record (most non-blank
     fields) as the base and fills any of its still-blank fields from the other
     record(s) — so complementary data from both sources survives (e.g. one
-    source has psf, the other has the cap rate). Note the `exact_km` path can
-    therefore merge away a genuine price/rent DISAGREEMENT between two records at
-    the same coordinates — for a comp type where the same building can carry more
-    than one distinct sale, that would silently discard one instead of flagging
-    it, which is exactly why it must stay off for those comp types.
+    source has psf, the other has the cap rate).
 
     value_fields: ordered field names to compare — the first one present as a
     positive number on both records decides agreement (e.g. rent comps may only
@@ -421,9 +415,6 @@ def dedup_cross_source(records: list, value_fields=("price_sgd_m",),
                     _comp_name(records[i], name_keys),
                     _comp_name(records[j], name_keys)) < name_min_overlap:
                 continue  # nearby but a different building — not a duplicate
-            if exact_km and dist <= exact_km:
-                group.append(j)
-                continue  # near-identical coordinates — duplicate regardless of value agreement
             agree = False
             for vf in value_fields:
                 p1, p2 = parse_num(records[i].get(vf)), parse_num(records[j].get(vf))

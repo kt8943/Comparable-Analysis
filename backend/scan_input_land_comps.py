@@ -725,20 +725,22 @@ def _classify_rules(records: list, subject_cfg: dict = None):
 # Cross-source dedup/conflict-flagging logic itself lives in tools/calculations.py
 # (shared with sales/rent) — these are thin per-comp-type wrappers over it.
 #
-# exact_km=0.02 (20m): near-identical coordinates force a merge even if price
-# disagrees — safe for land, since a site is normally sold/tendered once per
-# window (unlike rent, which never sets this — see scan_input_rent_comps.py).
+# dedup: 20m + 90% name overlap + price within 3% — tight enough that proximity
+# alone is never treated as sufficient evidence; a price disagreement at close
+# range is a conflict to flag, not a duplicate to silently merge.
+# flag: wider net (100m) for "probably the same site, but the numbers
+# disagree" — surfaced for analyst review rather than merged or dropped.
 
-def _dedup_cross_source(records: list, threshold_km: float = 0.05,
-                        price_tol_frac: float = 0.05) -> list:
+def _dedup_cross_source(records: list, threshold_km: float = 0.02,
+                        price_tol_frac: float = 0.03) -> list:
     return _dedup_cross_source_shared(
         records, value_fields=("price_sgd_m",),
         name_keys=("site_name", "property_name"), name_min_overlap=0.9,
-        threshold_km=threshold_km, price_tol_frac=price_tol_frac, exact_km=0.02)
+        threshold_km=threshold_km, price_tol_frac=price_tol_frac)
 
 
-def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.2,
-                                 price_tol_frac: float = 0.05,
+def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.1,
+                                 price_tol_frac: float = 0.03,
                                  name_min_overlap: float = 0.9) -> list:
     return _flag_cross_source_conflicts_shared(
         records, value_fields=(("price_sgd_m", "price"), ("price_psf_ppr", "psf ppr")),

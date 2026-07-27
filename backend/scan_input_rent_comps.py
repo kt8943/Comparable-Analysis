@@ -559,26 +559,29 @@ def _parse_image_records(image_path: str, llm_cfg: dict, openai_key: str = "",
 # Cross-source dedup/conflict-flagging logic itself lives in tools/calculations.py
 # (shared with sales/land) — these are thin per-comp-type wrappers over it.
 #
-# Rent uses a tighter 5% tolerance than sales/land's 15% default: rent psf figures
-# are quoted with far less legitimate cross-source variance than lump-sum sale
-# prices (which can genuinely differ on rounding or partial-stake adjustments), so
-# a 15% band would merge/pass-as-agreeing rents that are actually different deals.
+# dedup is much tighter than sales/land: the SAME building legitimately produces
+# many different leases at many different rents, so proximity + a fuzzy name
+# match is nowhere near enough evidence to merge two rows without risking two
+# genuinely different leases collapsing into one. Require coordinates, name,
+# AND rent to all be effectively IDENTICAL (1m / full name match / exact rent) —
+# this only catches the same lease literally reported twice across sources, not
+# "different lease, same building".
 #
-# Unlike sales/land, this does NOT also require name overlap to merge: the SAME
-# building legitimately produces many different leases at many different rents, so
-# its name always "matches" trivially — the rent agreement above is what actually
-# establishes "same lease reported twice", not the name.
+# flag uses the same thresholds as sales/land: a cross-source pair that's
+# probably the same building (100m + 90% name overlap) but whose rent actually
+# disagrees is surfaced for analyst review rather than merged or dropped.
 
-def _dedup_cross_source(records: list, threshold_km: float = 0.05,
-                        price_tol_frac: float = 0.05) -> list:
+def _dedup_cross_source(records: list, threshold_km: float = 0.001,
+                        price_tol_frac: float = 0.0) -> list:
     return _dedup_cross_source_shared(
         records, value_fields=("eff_rent", "asking_rent"),
         name_keys=("building_name", "property", "property_name"),
+        name_min_overlap=1.0,
         threshold_km=threshold_km, price_tol_frac=price_tol_frac)
 
 
-def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.2,
-                                 price_tol_frac: float = 0.05,
+def _flag_cross_source_conflicts(records: list, threshold_km: float = 0.1,
+                                 price_tol_frac: float = 0.03,
                                  name_min_overlap: float = 0.9) -> list:
     return _flag_cross_source_conflicts_shared(
         records, value_fields=(("eff_rent", "effective rent"), ("asking_rent", "asking rent")),
