@@ -1870,14 +1870,20 @@ def _show_results(config_path: str, prefix: str, context: str = "",
                 _geo_records = json.loads(
                     _records_path.read_text(encoding="utf-8"))
                 _CONFIDENT_PROVIDERS = {"onemap", "kakao", "google"}
-                _confident = [r for r in _geo_records
-                              if r.get("_geo_provider") in _CONFIDENT_PROVIDERS]
                 # Geocoding is Google/OneMap/Kakao only now (Mapbox is never
                 # returned as a geocode provider — it only renders the static
                 # map PNG), so a provider-based "mapbox fallback" bucket would
                 # always be empty. The real low-confidence signal is landing
                 # on the country centroid (_geo_suspect, set in scan_input_*).
+                # A record can have a "confident" provider (e.g. google) AND
+                # still be geo_suspect (it resolved to the COUNTRY CENTROID,
+                # not a real location) — those buckets must be mutually
+                # exclusive, or a centroid-landed comp gets miscounted as both
+                # confident and flagged at once.
                 _fallback  = [r for r in _geo_records if r.get("_geo_suspect")]
+                _confident = [r for r in _geo_records
+                              if r.get("_geo_provider") in _CONFIDENT_PROVIDERS
+                              and not r.get("_geo_suspect")]
                 _failed    = [r for r in _geo_records
                               if r.get("_geo_provider") == "failed"]
                 _unknown   = [r for r in _geo_records
