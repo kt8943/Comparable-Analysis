@@ -118,7 +118,15 @@ def split_tables(rows: list, keywords: set = None,
                    if any(c not in (None, "") for c in rows[idx])]
         out.append([h_idx, headers, data])
 
-    if not out:   # no header found anywhere — single best-guess table
+    out = [entry for entry in out if entry[2]]   # drop dataless segments
+
+    if not out:   # no header+data found via block-splitting — single best-guess table.
+        # Reached either when no header was detected anywhere, OR when every detected
+        # table's data rows were single-cell rows that the ≤1-cell separator rule above
+        # treated as table boundaries and dropped (e.g. a name-only manual/curated list,
+        # one property name per row). find_header_row keeps ALL rows after the header,
+        # single-cell ones included, so those name-only comps survive instead of the
+        # caller getting an empty list and crashing on segments[0].
         h = find_header_row(rows)
         out = [[h, [str(c) if c is not None else "" for c in rows[h]],
                 [r for r in rows[h + 1:] if any(c not in (None, "") for c in r)]]]

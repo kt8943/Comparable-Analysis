@@ -139,6 +139,9 @@ def parse_input_excel(input_file: str, base_url: str, model: str,
         rows = [tuple(c.value for c in row) for row in ws.iter_rows()]
 
         segments = _split_tables(rows, _sheet_kws)
+        if not segments:
+            print(f"  Sheet {best!r}: no data rows found — nothing to parse.")
+            return []
         if len(segments) > 1:
             print(f"  Sheet {best!r}: {len(segments)} stacked tables detected — "
                   "parsing each with its own header row.")
