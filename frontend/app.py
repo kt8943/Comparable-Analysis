@@ -2887,46 +2887,40 @@ with st.sidebar:
             except Exception:
                 pass
 
-        _tok_val = st.text_input("Mapbox Token",
-                                  value=_ss_data.get("mapbox_token", ""),
-                                  type="password",
-                                  key="ss_mapbox_token")
+        # Secret fields never send their saved value to the browser. A prefilled
+        # type="password" box still ships the real token in the page DOM and offers
+        # an eye/reveal toggle, so on a shared machine it can be revealed or copied.
+        # Instead we render an EMPTY box with a "saved — leave blank to keep" hint:
+        # nothing to reveal, nothing to copy, and on Save a blank input keeps the
+        # existing stored value (see _keep() in the save handler below).
+        def _secret_field(label, field, **kw):
+            _saved = bool(str(_ss_data.get(field, "")).strip())
+            _ph = "•••••••• saved — leave blank to keep" if _saved else "not set"
+            return st.text_input(label, value="", type="password",
+                                 key=f"ss_{field}", placeholder=_ph, **kw)
+
+        _tok_val = _secret_field("Mapbox Token", "mapbox_token")
         _olb_val = st.text_input("Ollama Base URL",
                                   value=_ss_data.get("ollama_base_url",
                                                       "http://localhost:11434"),
                                   key="ss_ollama_base")
 
-        _omt_val = st.text_input("OneMap API Token",
-                                  value=_ss_data.get("onemap_token", ""),
-                                  type="password",
-                                  key="ss_onemap_token",
+        _omt_val = _secret_field("OneMap API Token", "onemap_token",
                                   help="Optional manual token. Tokens expire ~3 days — prefer the Email/Password below for auto-refresh.")
         _ome_val = st.text_input("OneMap Email",
                                   value=_ss_data.get("onemap_email", ""),
                                   key="ss_onemap_email",
                                   help="OneMap account email (developers.onemap.gov.sg). Used to auto-refresh the token for URA zones + the Location proximity score.")
-        _omp_val = st.text_input("OneMap Password",
-                                  value=_ss_data.get("onemap_password", ""),
-                                  type="password",
-                                  key="ss_onemap_password",
+        _omp_val = _secret_field("OneMap Password", "onemap_password",
                                   help="OneMap account password — stored locally to auto-fetch a fresh token (~3-day expiry).")
 
-        _oai_val = st.text_input("OpenAI API Key",
-                                  value=_ss_data.get("openai_api_key", ""),
-                                  type="password",
-                                  key="ss_openai_key",
+        _oai_val = _secret_field("OpenAI API Key", "openai_api_key",
                                   help="Required for GPT-4o models. Get yours at platform.openai.com/api-keys")
 
-        _kakao_val = st.text_input("Kakao REST API Key",
-                                    value=_ss_data.get("kakao_api_key", ""),
-                                    type="password",
-                                    key="ss_kakao_key",
+        _kakao_val = _secret_field("Kakao REST API Key", "kakao_api_key",
                                     help="Required for Korea geocoding. Get yours at developers.kakao.com")
 
-        _gmaps_val = st.text_input("Google Maps API Key",
-                                    value=_ss_data.get("google_maps_key", ""),
-                                    type="password",
-                                    key="ss_google_key",
+        _gmaps_val = _secret_field("Google Maps API Key", "google_maps_key",
                                     help="Best for English-romanized Korean (지번) addresses. "
                                          "Enable the Geocoding API at console.cloud.google.com")
 
@@ -2954,16 +2948,22 @@ with st.sidebar:
                         _existing = json.loads(_ss_path.read_text(encoding="utf-8"))
                     except Exception:
                         pass
+                # A blank secret input means "keep what's already stored" — so an
+                # empty (unrevealed) field never erases a saved token on Save.
+                def _keep(field, typed, strip=True):
+                    _t = (typed or "")
+                    _t = _t.strip() if strip else _t
+                    return _t if _t else _existing.get(field, "")
                 _existing.update({
-                    "mapbox_token":       _tok_val.strip(),
+                    "mapbox_token":       _keep("mapbox_token", _tok_val),
                     "ollama_base_url":    _olb_val.strip(),
                     "geocoding_provider": _geo_val,
-                    "onemap_token":       _omt_val.strip(),
+                    "onemap_token":       _keep("onemap_token", _omt_val),
                     "onemap_email":       _ome_val.strip(),
-                    "onemap_password":    _omp_val,
-                    "openai_api_key":     _oai_val.strip(),
-                    "kakao_api_key":      _kakao_val.strip(),
-                    "google_maps_key":    _gmaps_val.strip(),
+                    "onemap_password":    _keep("onemap_password", _omp_val, strip=False),
+                    "openai_api_key":     _keep("openai_api_key", _oai_val),
+                    "kakao_api_key":      _keep("kakao_api_key", _kakao_val),
+                    "google_maps_key":    _keep("google_maps_key", _gmaps_val),
                 })
                 _ss_path.write_text(json.dumps(_existing, indent=2), encoding="utf-8")
                 st.success("Saved")
@@ -3018,13 +3018,12 @@ with st.sidebar:
             st.session_state["active_page"] = page_id
             st.rerun()
 
-    with st.expander("📊  Analysis Output",
-                     expanded=_active in ("overview", "comps", "rationale", "ask")):
-        _nav_item("📊  Overview",              "overview",  "nav_overview")
-        _nav_item("📋  Comparable Analysis",   "comps",     "nav_comps")
-        _nav_item("✍️  Investment Rationale",  "rationale", "nav_rationale")
-        _nav_item("💬  Ask this Deal",         "ask",       "nav_ask")
+    # Standalone "start here" entry, above the two groups — the landing spot for
+    # a first-time user before any deal exists.
+    _nav_item("📖  How to Use", "guide", "nav_guide")
 
+    # Deal List first — you create or pick a deal BEFORE there's any output to
+    # view, and the app lands on New Deal by default, so its group sits on top.
     with st.expander("📁  Deal List",
                      expanded=_active in ("new_deal", "existing")):
         _nav_item("🏗️  New Deal",       "new_deal", "nav_new_deal")
@@ -3038,6 +3037,13 @@ with st.sidebar:
                              key="deal_nav", label_visibility="collapsed")
             else:
                 st.caption("No deals yet — create one in **New Deal**.")
+
+    with st.expander("📊  Analysis Output",
+                     expanded=_active in ("overview", "comps", "rationale", "ask")):
+        _nav_item("📊  Overview",              "overview",  "nav_overview")
+        _nav_item("📋  Comparable Analysis",   "comps",     "nav_comps")
+        _nav_item("✍️  Investment Rationale",  "rationale", "nav_rationale")
+        _nav_item("💬  Ask this Deal",         "ask",       "nav_ask")
 
     # Vision + online-search model selectors have been retired from the sidebar.
     # The single Analysis model in ⚙️ Shared Settings now drives everything,
@@ -5464,6 +5470,89 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
                 "above and click **Generate**.")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE:  How to Use  →  onboarding guide for first-time users
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_user_guide():
+    """Standalone onboarding page — explains what the tool does and the workflow.
+
+    Static content only (no deal / config dependency), so it always renders even
+    before any deal exists — the natural landing spot for a brand-new user."""
+    st.title("📖  How to Use This Tool")
+    st.caption("A 3-minute orientation. New here? Start at the top and follow the steps.")
+
+    st.markdown(
+        "This tool turns raw broker material into two deliverables for a real-estate "
+        "investment case:\n\n"
+        "1. **Comparable Analysis** — feed it broker reports (PDF / Excel / image) or "
+        "type properties in by hand, and it extracts the comparable sales, rent, and "
+        "land transactions, geocodes each address, scores its location, and produces a "
+        "clean comps table **and a map**.\n"
+        "2. **Investment Rationale** — reads your market reports, writes the rationale "
+        "narrative, then audits every factual claim back to the exact source page.")
+
+    st.divider()
+    st.subheader("🚀  Quick start — the usual workflow")
+    st.markdown(
+        "1. **🏗️ New Deal** — create the deal: name, address, asset class, GFA, tenure. "
+        "You can upload a deal brief and let the tool pre-fill the fields.\n"
+        "2. **📋 Comparable Analysis** — for each comp type (Asset Sales / Rent / Land): "
+        "either **upload** broker files, or open **✏️ Enter or paste records manually** "
+        "and type them in. Click **▶ Run Analysis** to extract, geocode, and map.\n"
+        "3. **✍️ Investment Rationale** — generate the write-up from your market reports, "
+        "with a source-audit sheet showing where each claim came from.\n"
+        "4. **📊 Overview** — finally, see everything for the deal in one place: all comp "
+        "tables, the map, and the rationale together, ready to review or export to Word.")
+
+    st.info("💡 **Just want a map?** In **Comparable Analysis → ✏️ Enter or paste records "
+            "manually**, type a property name (address helps), tick **“Property name "
+            "only”**, and Run. No file upload needed — one property is enough.")
+
+    st.divider()
+    st.subheader("🧭  The sidebar, page by page")
+    with st.expander("📁  Deal List — where deals live"):
+        st.markdown(
+            "- **🏗️ New Deal** — the 2-step wizard that creates a deal. Fill the "
+            "essentials (or upload a brief to auto-fill), preview the generated config, "
+            "and save.\n"
+            "- **📁 Existing Deals** — pick a deal you've already created to open its "
+            "analysis pages.")
+    with st.expander("📊  Analysis Output — where the work happens"):
+        st.markdown(
+            "- **📊 Overview** — the read-only summary of a deal: every comp table, the "
+            "map, and the rationale together, with a one-click combined Word export.\n"
+            "- **📋 Comparable Analysis** — upload or manually enter comps, run the "
+            "extraction, then review and edit the resulting table. Three comp types: "
+            "**Asset Sales**, **Rent**, and **Land**.\n"
+            "- **✍️ Investment Rationale** — upload market reports, generate the "
+            "narrative, and get the RAG source-audit that traces each claim to a PDF "
+            "page (labelled *Verbatim* or *Paraphrased*, with a confidence score).\n"
+            "- **💬 Ask this Deal** — ask free-text questions about the deal's data.")
+
+    st.divider()
+    st.subheader("✅  Good to know")
+    st.markdown(
+        "- **Extraction isn't magic — always review.** The comps table is fully editable "
+        "after a run; fix anything the extractor got wrong before exporting.\n"
+        "- **Location scoring & the map are Singapore-focused.** Comps outside Singapore "
+        "still geocode and plot, but the *Location* competitiveness label is SG-only.\n"
+        "- **Watch the Geocoding Status panel.** Anything flagged *Centroid (Invalid)* "
+        "landed on a country centroid — check that address before trusting its pin.\n"
+        "- **Numbers first, calculation as fallback.** The tool prefers a value the "
+        "source actually reported and only computes one when it's missing — a blank "
+        "cell (—) means it had nothing to trust, never a silent zero.")
+
+    st.divider()
+    _c1, _c2 = st.columns(2)
+    if _c1.button("🏗️  Create a new deal", use_container_width=True, type="primary"):
+        st.session_state["active_page"] = "new_deal"
+        st.rerun()
+    if _c2.button("📁  Open an existing deal", use_container_width=True):
+        st.session_state["active_page"] = "existing"
+        st.rerun()
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ROUTER  — dispatch to the correct render function based on sidebar nav
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5475,7 +5564,9 @@ def _render_overview_preview(deal: str, config_path: str, cfg: dict):
 
 active_page = st.session_state.get("active_page", "new_deal")
 
-if active_page == "new_deal":
+if active_page == "guide":
+    render_user_guide()
+elif active_page == "new_deal":
     render_new_deal_form()
 elif active_page == "existing":
     deal_nav = st.session_state.get("deal_nav")
