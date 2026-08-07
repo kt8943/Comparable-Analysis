@@ -2895,7 +2895,7 @@ with st.sidebar:
         # existing stored value (see _keep() in the save handler below).
         def _secret_field(label, field, **kw):
             _saved = bool(str(_ss_data.get(field, "")).strip())
-            _ph = "•••••••• saved — leave blank to keep" if _saved else "not set"
+            _ph = "••••••••" if _saved else ""
             return st.text_input(label, value="", type="password",
                                  key=f"ss_{field}", placeholder=_ph, **kw)
 
