@@ -19,6 +19,7 @@ whether the value was **mapped** from a source, **calculated** by a rule, or
 ## Table of contents
 
 1. [Quick start](#1-quick-start)
+   - [1.1 The app interface — sidebar pages](#11-the-app-interface--sidebar-pages)
 2. [Architecture](#2-architecture)
 3. [Repository layout](#3-repository-layout)
 4. [The engine — orchestrator, agents, tools, skills](#4-the-engine--orchestrator-agents-tools-skills)
@@ -61,6 +62,103 @@ streamlit run frontend/app.py
 Credentials live in `configs/shared_settings.json` (git-ignored). On Streamlit Cloud
 they come from Streamlit Secrets and are written into that file at startup by
 `_bootstrap_cloud_secrets()` in `frontend/app.py`.
+
+### 1.1 The app interface — sidebar pages
+
+The rest of this document describes the pipeline internals for reviewers; this
+subsection is the map of the Streamlit UI itself. The sidebar has one standalone entry
+plus two collapsible groups (`frontend/app.py`, sidebar block):
+
+- **📖 How to Use** — a static onboarding page (`render_user_guide()`). Explains the
+  two deliverables and the intended workflow order below. No deal/config dependency,
+  so it renders even before any deal exists — the default landing page for a new user.
+
+- **📁 Deal List**
+  - **🏗️ New Deal** — 2-step wizard (`render_new_deal_form()`) that creates a deal
+    config: fill the essentials by hand, or upload a deal brief (PDF/Excel/text) and
+    let `extract_from_document()` pre-fill fields via LLM.
+  - **📁 Existing Deals** — select a previously created deal to open its Analysis
+    Output pages.
+
+- **📊 Analysis Output** — one deal-centric workspace (`render_analysis_output()`)
+  with a single deal selector at the top and four views:
+  - **📊 Overview** — read-only aggregation of everything generated for the deal
+    (all comp tables, the map, the rationale); re-reads `output/<Deal>/` on every
+    rerun, so edits made in the other views show up here automatically. One-click
+    combined Word export (§14).
+  - **📋 Comparable Analysis** — the editable extraction workspace per comp type
+    (Asset Sales / Rent / Land): upload broker files, or use the **✏️ Enter or paste
+    records manually** table for a blank/hand-typed comp list (tick **"Property name
+    only"** to skip price/area requirements — useful for a curated name list to
+    geocode/map with no file at all). **▶ Run Analysis** invokes the matching
+    `scan_input_*.py` backend script as a subprocess (§5).
+    - **🔄 Refine This Output** — a collapsed panel under the generated table: type a
+      free-text instruction ("remove comps sold before 2022", "only keep freehold
+      and 999-year leasehold"), pick an **Engine**, and re-run. This re-invokes the
+      *same* `scan_input_*.py` script with `--from-records <existing records.json>`
+      (skips re-extraction entirely, so it's fast, ~1–2 min) plus
+      `--refinement-file <instructions>`; the script reads the instructions and
+      calls `apply_refinement()` (`tools/llm_client.py:1241`), a router over three
+      distinct mechanisms depending on provider/engine:
+      - **"Standard"** (default, GPT) → `run_agent_loop_gpt()` — a ReAct-style
+        tool-calling loop (not one of §4.2's three named agents, but the same
+        reason→act→observe shape): the model calls *query* tools
+        (`get_field_values`, `compute_stats`) to inspect the data,
+        then *action* tools (`filter_range`, `keep_top_n`, `select_by_name`, …)
+        that Python actually executes — no index-guessing or model-side numeric
+        comparison. Loops up to 6 turns, each tool result fed back before the next
+        decision, until the model calls `no_change` or stops.
+      - **"Advanced (sandbox)"** (GPT, `--refine-engine code_interpreter`) →
+        `run_code_interpreter_refine()` — a different mechanism entirely: sends the
+        record list (each row stamped with a stable `_rid`) to OpenAI's **hosted**
+        Code Interpreter, letting the model write and run real Python for logic
+        fixed tool primitives can't express (e.g. "within 20% of the subject's
+        size"). Executes in OpenAI's own container, never on this host. Safety
+        design: the model must emit a final `RESULT: [id list]` line — only that id
+        list is trusted and applied locally; the model's own echo of the record
+        data is never trusted. Any failure (timeout, bad format) is a safe
+        no-op — all records kept unchanged, not dropped. Opt-in only (sends comp
+        data to OpenAI) — avoid for confidential deals.
+      - **Ollama** (non-OpenAI provider) → `run_agent_loop()` — the same
+        query-tool/action-tool ReAct pattern as "Standard", against a local model
+        instead (5-turn cap vs. GPT's 6).
+      Refined records overwrite `_records.json` and the Excel is regenerated from
+      them — same render path as a normal run, not a separate code path.
+  - **✍️ Investment Rationale** — generate/refine the rationale memo (§12) and its
+    RAG source audit (§13).
+  - **💬 Ask this Deal** (`_render_deal_chat()`) — grounded Q&A restricted to *this
+    deal's* own uploaded documents and generated comp tables (listed in a "N
+    document(s) in scope" expander). **Mechanism: full-text context stuffing by
+    default, retrieval only as a fallback.** `_deal_corpus_files()` collects every
+    in-scope file (raw uploads + shared market reports + this deal's generated comp
+    Excels); `_extract_text_for_chat()` extracts plain text per file (PyMuPDF for
+    PDF, capped 60 pages; CSV dump per Excel sheet), capped at 24k chars/doc and
+    cached in `st.session_state` keyed by each file's (path, mtime, size) — so
+    re-extraction only happens when a file actually changes, not on every message.
+    - **Below `_CHAT_STUFF_BUDGET` (120k chars total, the common case):**
+      `_build_chat_system_prompt()` concatenates ALL cached document text into one
+      system prompt whole — no embedding, no chunking, no similarity search, unlike
+      §13's page-level retrieval. Chosen deliberately: for a deal-sized document set
+      this avoids RAG's main failure mode (a relevant chunk existing but never being
+      retrieved), at the cost of not scaling past the budget.
+    - **At/above the budget:** rather than silently flagging excess files "omitted"
+      (as it did before), it switches to the same retrieval mechanism as §13,
+      reused directly (`generate_investment_rationale._embed_batch` /
+      `_cosine_sim`) — requires an OpenAI key. `_chunk_text_for_rag()` splits every
+      document into overlapping ~2k-char windows (format-agnostic fixed-size
+      chunking, since this has to handle both PDF prose and CSV-dumped Excel
+      uniformly, unlike §13's page-aware PDF-only chunker); `_get_chat_rag_index()`
+      embeds and caches all chunks (same file-signature cache pattern); each
+      question is embedded and ranked against every chunk in the corpus by cosine
+      similarity (`_retrieve_relevant_chunks()`), taking the best matches until the
+      budget is filled; `_build_chat_prompt_from_chunks()` builds the prompt from
+      only those excerpts. Without an OpenAI key, falls back to the old
+      stuff-and-omit behavior instead (embeddings need a key; nothing else does).
+    - A v1 limitation of the retrieval path: only the current question is embedded,
+      not prior chat turns — a bare follow-up ("what about Q3?") may retrieve worse
+      than a self-contained question.
+    - Either way, the built prompt + chat history go to whichever model is selected
+      in ⚙️ Shared Settings (GPT or a local Ollama model) in one chat completion call.
 
 ---
 
@@ -1580,6 +1678,31 @@ neither the LLM nor its absence changes). Net effect of every LLM stage in this
 pipeline, measured across all 52 files: it rescues exactly 2 files (6 rows) that are
 otherwise completely unextractable by deterministic code alone; it changes nothing else.
 
+**Row-level accuracy — same 52 files, 223 rows total, derived from the matrices and
+footnotes above (not a separately re-run metric):**
+
+| Baseline | Rows correct | Wrong rows |
+| --- | --- | --- |
+| GPT | **221 / 223** (99.1%) | 2 |
+| No-LLM | **216 / 223** (96.9%) | 7 |
+
+The wrong rows, by combination:
+
+| Combination | Baseline | Wrong rows | Which rows, and why |
+| --- | --- | --- | --- |
+| Colliers Q4 2023 sales | GPT | 1 of 3 | Footnote 1 — property name truncated by the text-fallback path ("Visioncrest Commercial" → "Visioncrest") |
+| Colliers Q4 2023 sales | No-LLM | 3 of 3 (all) | Footnote 5 — the text-fallback path is itself an LLM call; with no LLM reachable it fails outright and the page contributes zero rows |
+| Colliers Q4 2024 sales | No-LLM | 3 of 3 (all) | Footnote 6 — without the LLM column-mapping fallback, headers stay unresolved, rows come out nearly empty, and the pre-Stage-5 garbage filter correctly discards them |
+| Savills Q1 2025 sales | GPT **and** No-LLM | 1 of 5 (same row, both baselines) | Footnote 4 — a font-ligature artifact ("floors" → "fl oors"), unrelated to the LLM either way |
+
+Reading the table: **Colliers Q4 2023's severity is worse under No-LLM (3 wrong) than
+GPT (1 wrong), but the report-level matrix above counts it as "not clean" in both** —
+it was already 2/3⚠️ under GPT, so going to 0/3❌ under No-LLM doesn't move the
+50/52-vs-49/52 report-count. Only **Colliers Q4 2024** flips from a clean ✅ (GPT) to
+a full miss (No-LLM), which is the one report that does move the report-level count.
+This is why the row-level gap (221 vs 216 = 5 rows) is wider than the report-level
+gap (50 vs 49 = 1 report) — the two counts are answering different questions.
+
 **2026-07-26: passing rate refined from 48/52 to 50/52 — a counting-convention fix, not
 a code change.** Re-running the full 52-file suite with a stricter field-by-field
 diff (not just name+price) turned up two more confirmed-cosmetic variants (a curly vs.
@@ -1620,14 +1743,19 @@ now runs before giving up outright, using the same evidence-binding.
 
 Ranked by what a reviewer should look at first.
 
-1. **Credentials in `configs/`.** Deal configs no longer carry a map credential (the
-   Mapbox token moved to Shared Settings when geocoding split to Google), but ~800
-   `tmp*.json` left by a failed cleanup path still each contain the old token, and the
-   token remains in the local git history. `shared_settings.json` and `tmp*.json` are
-   git-ignored and the cloud repo holds no `configs/` at all — so **GitHub is clean**.
-   The exposure is only if this folder is copied or zipped. **Share via the cloud repo,
-   or clear `configs/tmp*.json` and rotate the token first.** The temp files are safe to
-   delete; the generating path should clean up after itself.
+1. **Credentials live only on disk in `configs/` — never in git.** Deal configs carry no
+   map credential (the Mapbox token moved to Shared Settings when geocoding split to
+   Google). The real secrets are `shared_settings.json` (all API keys) and ~810
+   `tmp*.json` left by a failed cleanup path (each still holds the old Mapbox token).
+   Neither is tracked by git, and — verified — no real token exists in the local git
+   history or the cloud repo, so **git/GitHub is clean**. Caveat: there is no `.gitignore`
+   fencing these off (the local checkout is rooted at the home directory, not the project
+   folder), so they are merely *untracked* — a stray `git add`, or a Finder "Compress" of
+   the project folder, WOULD include them. The only exposure path is copying/zipping
+   `configs/` directly. **Share via the cloud repo, or a zip that excludes
+   `configs/shared_settings.json` and `configs/tmp*.json`.** The temp files are safe to
+   delete; the generating path should clean up after itself. Rotate the Mapbox token only
+   if the raw folder was ever shared outside git.
 2. **The city tier is a radius, not a boundary** (§11.1). Documented, not fixed — fixing it
    needs a locality field the geocoder does not return.
 3. **The query budget can bind before the ladder finishes** (§11.4). On a thin deal, 5

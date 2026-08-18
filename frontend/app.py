@@ -883,6 +883,114 @@ def _render_ai_judgment_notice(records_path):
                 st.markdown(f"- {n}")
 
 
+def _extraction_source_audit(records_path) -> dict:
+    """Per-row provenance stats from _records.json's ``_prov``/``_prov_page``.
+
+    Three tiers, in order of precision:
+      cell  — ``_prov`` is a non-empty dict: at least one value was read from
+              an exact table cell (see _from_table() in pdf_extractor.py).
+      page  — ``_prov`` is absent/None but ``_prov_page`` is set: the record
+              came from the text-fallback or vision-rescue path (no table grid
+              survived), which never knows a cell but always knows the source
+              PAGE it read.
+      none  — neither is set. Only PDF-sourced records ever reach cell/page;
+              records from online search or manual entry have no PDF at all,
+              so "none" is expected and correct for those, not a gap.
+
+    Cell-level only covers fields read DIRECTLY from a table column; fields
+    the pipeline computes downstream (Adj. Cap Rate, Location score, etc.)
+    are never sourced from a single cell, so they have no entry of their own.
+
+    Returns {"total", "cell", "page", "none", "rows": [...]}."""
+    try:
+        records = json.loads(Path(records_path).read_text(encoding="utf-8"))
+    except Exception:
+        return {"total": 0, "cell": 0, "page": 0, "none": 0, "rows": []}
+
+    rows = []
+    n_cell = n_page = n_none = 0
+    for r in records if isinstance(records, list) else []:
+        if not isinstance(r, dict):
+            continue
+        prov      = r.get("_prov")
+        prov_page = r.get("_prov_page")
+        has_cell  = isinstance(prov, dict) and bool(prov)
+        if has_cell:
+            tier = "cell"; n_cell += 1
+        elif prov_page:
+            tier = "page"; n_page += 1
+        else:
+            tier = "none"; n_none += 1
+        rows.append({
+            "marker":    str(r.get("map_marker", "") or "").strip(),
+            "name":      str(r.get("property_name") or r.get("site_name") or "")
+                         .strip() or "(unnamed)",
+            "tier":      tier,
+            "prov":      prov if has_cell else {},
+            "prov_page": prov_page,
+        })
+
+    def _mk(row):
+        return (0, int(row["marker"])) if row["marker"].isdigit() else (1, 0)
+    return {"total": len(rows), "cell": n_cell, "page": n_page, "none": n_none,
+            "rows": sorted(rows, key=_mk)}
+
+
+def _render_extraction_source_audit(records_path):
+    """🔍 Source Audit panel for the Comparable Analysis preview.
+
+    Complements _render_ai_judgment_notice (which flags PROBLEM rows) by
+    showing the full traceability picture for every row — a live coverage
+    statistic (split by cell/page tier, see _extraction_source_audit) plus,
+    per row, the exact source location. Mirrors what the Investment
+    Rationale's source audit sheet does for prose claims (§13), but for
+    extracted comp records."""
+    audit = _extraction_source_audit(records_path)
+    total = audit["total"]
+    if total == 0:
+        return
+    cell, page, none = audit["cell"], audit["page"], audit["none"]
+    traceable = cell + page
+    pct = traceable / total * 100
+    with st.expander(
+        f"🔍 Source Audit — {traceable}/{total} record(s) traced to the source "
+        f"PDF ({pct:.0f}%) — {cell} to an exact cell, {page} to a page",
+        expanded=False,
+    ):
+        st.caption(
+            "**Cell-level**: at least one value was read directly from a table "
+            "cell (exact table/row/column). **Page-level**: no table grid "
+            "survived on that page, so the AI read the fields from raw text — "
+            "no cell to point to, but the source page is always known. Neither "
+            "covers fields the pipeline computes downstream (e.g. Adj. Cap "
+            "Rate) — those are calculated, not read from a single source. Rows "
+            "with no PDF at all (online search, manual entry) show **none** — "
+            "expected, not a gap."
+        )
+        for row in audit["rows"]:
+            _label = f"#{row['marker']} · {row['name']}" if row["marker"] \
+                     else row["name"]
+            if row["tier"] == "cell":
+                with st.expander(f"✅ {_label}  ({len(row['prov'])} field(s) "
+                                 f"traced to an exact cell)"):
+                    for field, cell_info in row["prov"].items():
+                        if not isinstance(cell_info, dict):
+                            continue
+                        st.markdown(
+                            f"**{field}** — table `{cell_info.get('table', '?')}`, "
+                            f"row {cell_info.get('row', '?')}, "
+                            f"col {cell_info.get('col', '?')} "
+                            f"(header: *{cell_info.get('header', '')}*)  \n"
+                            f"source cell text: `{cell_info.get('cell', '')}`"
+                        )
+            elif row["tier"] == "page":
+                st.markdown(f"🟡 {_label} — read from page {row['prov_page']} "
+                           f"(no table grid; not resolved to an exact cell)")
+            else:
+                st.markdown(f"⚪ {_label} — no source location recorded "
+                           f"(not from a PDF)")
+
+
 def _sync_records_json(records_path, edited_df: "pd.DataFrame", marker_map: dict = None):
     """
     Keep _records.json in sync with the edited preview table after a Save.
@@ -1613,6 +1721,9 @@ def _show_results(config_path: str, prefix: str, context: str = "",
             # Flag rows whose values the AI decided instead of transcribing, so
             # the analyst reviews them before the table gets used downstream.
             _render_ai_judgment_notice(_records_path)
+            # Full traceability picture (§ Source Audit) — coverage stat + per-row
+            # exact-cell detail, complementing the AI-decided flags above.
+            _render_extraction_source_audit(_records_path)
 
             # Editable Address column — the analyst fills it when a property name
             # is too rough to geocode. On re-run it takes priority over the name.
@@ -4659,15 +4770,32 @@ def render_existing_deals(deal_name: str | None, config_path: str | None):
 # ═════════════════════════════════════════════════════════════════════════════
 # "Ask this Deal"  — a grounded, deal-scoped chatbox
 # ─────────────────────────────────────────────────────────────────────────────
-# Deliberately simple ("right-sized agency"): the corpus is just ONE deal's
-# uploaded PDFs/Excels + its generated comp tables — a small, bounded set that
-# fits in a single model context, so there is NO vector database and NO
-# embeddings. We read the files, stuff their text into the prompt, and let the
-# LLM answer ONLY from that text. History lives in st.session_state.
+# Default path ("right-sized agency"): the corpus is just ONE deal's uploaded
+# PDFs/Excels + its generated comp tables — usually a small, bounded set that
+# fits in a single model context. So by default there is NO vector database and
+# NO embeddings — we read the files, stuff their text into the prompt, and let
+# the LLM answer ONLY from that text. History lives in st.session_state.
+#
+# Fallback path (only when the corpus is too big to stuff): a deal can
+# accumulate enough large reports to exceed the stuffing budget, at which point
+# whole files were previously silently marked "omitted" — a real document could
+# go completely unseen. When that happens AND an OpenAI key is available, we
+# switch to retrieval instead: chunk every document, embed the chunks (cached,
+# reusing generate_investment_rationale's embed/cosine helpers — the same
+# mechanism §13's source audit uses for PDF pages), embed the question, and
+# stuff only the most relevant chunks. Falls back to the old stuff-and-omit
+# behavior with no OpenAI key, since embeddings require one.
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Only text-extractable inputs go into the chat corpus (images are skipped for now).
 _CHAT_TEXT_EXTS = {".pdf", ".xlsx", ".xls", ".csv", ".txt", ".md"}
+# Total document budget for full-text stuffing. Below this, every document goes
+# in whole (the common, most reliable case — no retrieval-miss risk). At or
+# above it, we switch to retrieval (see module note above) if an OpenAI key is
+# available, else fall back to the old stuff-and-omit truncation.
+_CHAT_STUFF_BUDGET = 120_000
+_CHAT_CHUNK_SIZE   = 2_000   # chars per retrieval chunk — roughly a paragraph/half-page
+_CHAT_CHUNK_OVERLAP = 200    # chars of overlap so a fact split across a boundary survives in one chunk
 # All config keys that may point at a deal's raw input files, across comp types.
 _CHAT_INPUT_KEYS = (
     "input_file", "input_pdf_file", "input_image_file",
@@ -4761,6 +4889,115 @@ def _build_deal_chat_context(deal: str, config_path: str, out_dir: "Path"):
     return docs, files
 
 
+def _chunk_text_for_rag(name: str, text: str, chunk_size: int = _CHAT_CHUNK_SIZE,
+                        overlap: int = _CHAT_CHUNK_OVERLAP) -> list:
+    """Split one document's already-extracted text into overlapping fixed-size
+    chunks: [{"source_file", "text"}, …].
+
+    Deliberately format-agnostic (plain character windows, not paragraph- or
+    page-aware) — unlike generate_investment_rationale._chunk_pdf_by_page, this
+    has to chunk BOTH PDF prose and Excel CSV-dumped sheets uniformly, and only
+    ever sees the flat text _extract_text_for_chat already produced, not the
+    original file. The overlap means a fact split across a chunk boundary still
+    appears whole in at least one chunk."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [{"source_file": name, "text": text}]
+    chunks, start, step = [], 0, chunk_size - overlap
+    while start < len(text):
+        chunks.append({"source_file": name, "text": text[start:start + chunk_size]})
+        start += step
+    return chunks
+
+
+def _get_chat_rag_index(deal: str, docs: list, openai_key: str) -> "list | None":
+    """Chunk + embed every in-scope document, cached in session_state keyed by
+    the same (name, text) content as the doc cache — so re-embedding only
+    happens when the corpus actually changes, not on every chat turn. Returns
+    None if there's no key to embed with (caller falls back to stuffing)."""
+    if not openai_key:
+        return None
+    sig = tuple((name, len(text)) for name, text in docs)
+    rkey = f"_chat_rag_{deal}"
+    cached = st.session_state.get(rkey)
+    if cached and cached.get("sig") == sig:
+        return cached["index"]
+
+    from generate_investment_rationale import _embed_batch
+    chunks = [c for name, text in docs for c in _chunk_text_for_rag(name, text)]
+    if not chunks:
+        return []
+    try:
+        embeddings = _embed_batch([c["text"] for c in chunks], openai_key)
+    except Exception:
+        return None   # embedding call failed → caller falls back to stuffing
+    for c, emb in zip(chunks, embeddings):
+        c["embedding"] = emb
+    st.session_state[rkey] = {"sig": sig, "index": chunks}
+    return chunks
+
+
+def _retrieve_relevant_chunks(question: str, rag_index: list, openai_key: str,
+                              budget_chars: int = _CHAT_STUFF_BUDGET) -> "list | None":
+    """Embed the question, rank every chunk in the corpus by cosine similarity,
+    and greedily take the best ones (best-first) until ``budget_chars``. Ranks
+    across ALL documents together (not per-file), so the most relevant material
+    surfaces regardless of which file it's in — the retrieval half of RAG.
+
+    Only the current question is embedded, not the chat history — a v1
+    simplification: a bare, referent-free follow-up ("what about Q3?") may
+    retrieve worse than a self-contained question. Returns None on embedding
+    failure so the caller can fall back to stuffing."""
+    from generate_investment_rationale import _embed_batch, _cosine_sim
+    try:
+        q_emb = _embed_batch([question], openai_key)[0]
+    except Exception:
+        return None
+    scored = sorted(
+        ((_cosine_sim(q_emb, c["embedding"]), c) for c in rag_index),
+        key=lambda x: x[0], reverse=True,
+    )
+    selected, used = [], 0
+    for score, c in scored:
+        if used >= budget_chars:
+            break
+        selected.append(c)
+        used += len(c["text"])
+    return selected
+
+
+def _build_chat_prompt_from_chunks(deal: str, subj: dict, chunks: list) -> str:
+    """Same grounding rules as _build_chat_system_prompt, but the body is
+    retrieved excerpts (each tagged with its source file) instead of full
+    documents — used only when the corpus was too large to stuff whole."""
+    if chunks:
+        body = "\n".join(f"\n[FILE: {c['source_file']}]\n{c['text']}" for c in chunks)
+    else:
+        body = "(no matching excerpts found)"
+    return (
+        f'You are a meticulous, helpful real-estate investment analyst assisting with the '
+        f'deal "{deal}" ({subj.get("address") or "address n/a"}, '
+        f'{subj.get("country_name", "") or "country n/a"}).\n'
+        "The deal's documents were too large to include in full, so below are the "
+        "EXCERPTS retrieved as most relevant to the question — not the complete "
+        "documents. Ground every answer in them.\n"
+        "Rules:\n"
+        "- Base facts only on the excerpts; do NOT invent figures or pull in outside "
+        "market knowledge. Cite the source file in square brackets after each fact, "
+        "e.g. [singapore-office-mb-2q2025.pdf].\n"
+        "- If the excerpts don't cover the question, say so plainly — they may simply "
+        "not have been retrieved, so suggest the user check that specific document "
+        "directly rather than implying it doesn't exist.\n"
+        "- You MAY reason and estimate FROM the excerpts when asked for a view. Clearly "
+        "label it as an inference and show what you used — never present an estimate as "
+        "a stated fact.\n"
+        "- Prefer exact numbers, dates and short quotes; be concise.\n"
+        f"\n=== RETRIEVED EXCERPTS ({deal}) ===\n{body}\n=== END EXCERPTS ==="
+    )
+
+
 def _build_chat_system_prompt(deal: str, subj: dict, docs: list,
                               total_budget: int = 120000) -> str:
     """Grounding prompt: identity + strict "answer only from these docs" rules,
@@ -4843,6 +5080,14 @@ def _render_deal_chat(deal: str, config_path: str, cfg: dict):
                 "then come back here.")
         return
 
+    # Corpus size decides the mode for THIS render — see the module note above
+    # _CHAT_TEXT_EXTS for why: full-text stuffing is the default and more
+    # reliable path (no retrieval-miss risk), retrieval only kicks in once the
+    # corpus can no longer fit.
+    _total_chars = sum(len(t) for _, t in docs)
+    _openai_key  = os.environ.get("OPENAI_API_KEY", "")
+    _needs_rag   = _total_chars >= _CHAT_STUFF_BUDGET
+
     with st.expander(f"📎  {len(files)} document(s) in scope", expanded=False):
         for p in files:
             try:
@@ -4850,6 +5095,18 @@ def _render_deal_chat(deal: str, config_path: str, cfg: dict):
             except Exception:
                 kb = 0
             st.write(f"• `{p.name}`  ·  {kb:,.0f} KB")
+        if _needs_rag:
+            if _openai_key:
+                st.caption(f"📚 Corpus is {_total_chars:,} chars — over the "
+                           f"{_CHAT_STUFF_BUDGET:,} full-text limit, so answers use "
+                           "**retrieved excerpts** (most relevant passages) rather than "
+                           "the complete documents.")
+            else:
+                st.warning(f"⚠️ Corpus is {_total_chars:,} chars — over the "
+                          f"{_CHAT_STUFF_BUDGET:,} full-text limit. Retrieval needs an "
+                          "OpenAI key (⚙️ Shared Settings) to fetch only the relevant "
+                          "excerpts; without one, the excess documents are **omitted "
+                          "entirely** rather than being searched.")
 
     hkey    = f"_chat_hist_{deal}"
     history = st.session_state.setdefault(hkey, [])
@@ -4875,9 +5132,21 @@ def _render_deal_chat(deal: str, config_path: str, cfg: dict):
         history.append({"role": "user", "content": q})
         with st.chat_message("user"):
             st.markdown(q)
-        system_prompt = _build_chat_system_prompt(deal, subj, docs)
+
         with st.chat_message("assistant"):
-            with st.spinner("Reading the deal's documents…"):
+            _spin_msg = "Retrieving the most relevant passages…" if _needs_rag and _openai_key \
+                       else "Reading the deal's documents…"
+            with st.spinner(_spin_msg):
+                system_prompt = None
+                if _needs_rag and _openai_key:
+                    rag_index = _get_chat_rag_index(deal, docs, _openai_key)
+                    chunks = (_retrieve_relevant_chunks(q, rag_index, _openai_key)
+                             if rag_index else None)
+                    if chunks is not None:
+                        system_prompt = _build_chat_prompt_from_chunks(deal, subj, chunks)
+                    # embedding failed (rag_index/chunks is None) → fall through to stuffing
+                if system_prompt is None:
+                    system_prompt = _build_chat_system_prompt(deal, subj, docs)
                 try:
                     ans = _deal_chat_answer(system_prompt, history[:-1], q)
                 except Exception as e:

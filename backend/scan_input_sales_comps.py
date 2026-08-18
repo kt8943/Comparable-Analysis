@@ -530,6 +530,7 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             # conflict check) can trace each value to its source cell and see
             # what the deterministic/Stage-5 checks flagged.
             "_prov":           item.get("_prov"),
+            "_prov_page":      item.get("_prov_page"),
             "_auto_flags":     item.get("_auto_flags"),
             "_verify_flag":    item.get("_verify_flag"),
             # AI-judgment markers — the preview shows these so the analyst can

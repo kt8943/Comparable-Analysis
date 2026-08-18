@@ -1576,6 +1576,12 @@ def _from_table(headers: list, rows: list, col_map: dict, unit_map: dict,
     This is the provenance backbone — it lets any later stage (Stage 5, the eval
     harness, a future click-through UI) answer "does this value actually exist in
     the source, and where?" as an exact lookup instead of an LLM guess.
+
+    Sibling field ``_prov_page`` (set elsewhere, not here): a coarser, page-only
+    tier for records that never went through a table grid at all (the text-fallback
+    path in extract_pdf_records) — no cell to point to, but the page is always
+    known. The two are deliberately never mixed into one field, so a record is
+    either cell-exact (``_prov``) or page-only (``_prov_page``), never ambiguous.
     """
     # Forward-fill the property_name column: PDFs with visually merged/spanning
     # cells produce empty strings in pdfplumber for all rows after the first.
@@ -2053,11 +2059,19 @@ def map_to_schema(page_tables: list, field_schema: list,
             # which the model picked the name 'Loyang'. The result is plausible
             # and un-checkable from the output alone, so mark the rows here and
             # let the review UI tell the analyst these are judgment calls.
+            #
+            # _prov_page: a coarser, RECORD-level sibling of _prov — this path
+            # doesn't know which cell a value came from (there is no cell), but
+            # it always knows which page it read. Kept as a separate field
+            # rather than folded into _prov itself, so nothing that expects
+            # _prov's {field: {table,row,col,header,cell}} shape ever has to
+            # special-case a page-only entry.
             for _r in recs:
                 _r["_llm_parsed"] = (
                     f"page {pg}: no table grid detected — the AI read the "
                     f"fields out of unstructured page text"
                 )
+                _r["_prov_page"] = pg
             print(f"    Page {pg:>3}: {len(recs)} record(s) from text")
         else:
             _page_tbl_seen[pg] += 1
@@ -2790,6 +2804,7 @@ def _vision_rescue_page(pdf_path: str, page_num: int, field_schema: list,
                   if value_fields else _is_real_candidate(rec))
         if _useful and _is_real_candidate(rec):
             rec["_prov"] = None
+            rec["_prov_page"] = page_num   # coarser sibling of _prov — see _from_table()
             rec["_source"] = "vision-rescue"
             out.append(rec)
 

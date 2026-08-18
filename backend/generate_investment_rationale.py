@@ -1719,8 +1719,13 @@ def _get_cross_check(entry: dict, extracted_reports: list[dict]) -> str:
         return "🌐  Web source — open the URL and verify"
 
     if rag_score is not None:
-        if ctype in ("Deal Config", "General Knowledge"):
-            return ctype
+        if ctype == "Deal Config":
+            return ctype   # checked against subject_cfg — see _claim_matches_deal_config
+        if ctype in ("Unverified", "General Knowledge", "Inferred"):
+            # Matched no PDF page, no web source, AND no deal-config fact —
+            # the honest label for a claim the audit genuinely could not
+            # trace anywhere, instead of the old silent "Deal Config" guess.
+            return "⚠  Not sourced — could not verify against PDF, web search, or deal config"
         page = (entry.get("page_ref") or "?")
         # A snippet the sentence-ranker had to guess at (no number/keyword hit
         # scored above zero — see _extract_best_snippet) is forced into the
@@ -1910,8 +1915,9 @@ def _write_source_audit_excel(
             elif col_idx == 8:  # context — de-emphasised vs. the primary snippet
                 cell.font = _body_font(color="FF666666")
             elif col_idx == 9:  # citation type
-                color = AMBER if ctype in ("Inferred", "General Knowledge") else DARK
-                cell.font = _body_font(bold=(ctype == "Inferred"), color=color)
+                _flagged = ctype in ("Inferred", "General Knowledge", "Unverified")
+                color = AMBER if _flagged else DARK
+                cell.font = _body_font(bold=_flagged, color=color)
             elif col_idx == 10:  # cross-check status
                 if "✓" in cross_chk:
                     cell.font = _body_font(color="FF1A7A2A")
@@ -1934,7 +1940,7 @@ def _write_source_audit_excel(
     n_warn     = sum(1 for e in audit_entries
                      if "⚠" in _get_cross_check(e, extracted_reports))
     n_inferred = sum(1 for e in audit_entries
-                     if e.get("citation_type") in ("Inferred", "General Knowledge"))
+                     if e.get("citation_type") in ("Inferred", "General Knowledge", "Unverified"))
 
     sum_row = total + 4 + 2
     ws.merge_cells(f"A{sum_row}:L{sum_row}")
@@ -1943,7 +1949,7 @@ def _write_source_audit_excel(
         f"SUMMARY:  {total} citations total  |  "
         f"{n_verified} verified  |  "
         f"{n_warn} require manual PDF verification  |  "
-        f"{n_inferred} inferred / general knowledge (review carefully)"
+        f"{n_inferred} unsourced (not matched to any PDF, web search, or deal config — review carefully)"
     )
     sum_cell.font      = Font(name="Calibri", bold=True, color=WHITE, size=9)
     sum_cell.fill      = _fill(NAVY)
@@ -2075,6 +2081,38 @@ def _build_input_summary(extracted_reports: list) -> str:
 
     out.append("---\n")
     return "\n".join(out) + "\n"
+
+
+def _claim_matches_deal_config(claim_text: str, subject_cfg: dict) -> bool:
+    """True if ``claim_text`` actually contains a fact from ``subject_cfg``.
+
+    Used as a real check before labelling an unmatched claim "Deal Config" —
+    replacing what used to be a bare assumption ("nothing else matched, so it
+    must be deal config"). Numeric fields (price, cap rate, GFA, tenure) use
+    the same scale-bridged matching as PDF-page claims (_number_in_text);
+    short text fields (zoning, currency symbol) use substring matching. A
+    claim that matches neither is NOT deal config — see the caller, which
+    labels it "Unverified" instead rather than defaulting to this label.
+    """
+    if not claim_text or not subject_cfg:
+        return False
+    numeric_fields = ("price_sgd_m", "ftm_noi_cap_rate", "remaining_leasehold_yrs",
+                      "gfa_sf")
+    for fld in numeric_fields:
+        v = subject_cfg.get(fld)
+        if v in (None, "", 0):
+            continue
+        for anchor in (str(v), f"{float(v):.1f}", f"{float(v) * 100:.1f}"):
+            if _number_in_text(anchor, claim_text):
+                return True
+    text_fields = ("land_zoning", "currency_symbol", "deal_name", "property_name",
+                  "address", "country_name")
+    claim_lower = claim_text.lower()
+    for fld in text_fields:
+        v = str(subject_cfg.get(fld) or "").strip()
+        if len(v) >= 3 and v.lower() in claim_lower:
+            return True
+    return False
 
 
 def generate_rationale(
@@ -2289,16 +2327,29 @@ def generate_rationale(
                                 "low_confidence": False,
                             })
                         else:
-                            # Low similarity → claim likely originates from deal config
+                            # No PDF page and no web-search match. This used to
+                            # default straight to "Deal Config" on the ASSUMPTION
+                            # that anything unmatched must be deal data — but that
+                            # assumption was never checked, so a genuinely
+                            # unsupported claim (the model inferring or drawing on
+                            # general knowledge, despite being told not to — see
+                            # _RATIONALE_SYSTEM's DATA INTEGRITY rules) could be
+                            # silently mislabelled as if it were verified deal
+                            # data. Now it's an actual check: only label "Deal
+                            # Config" if the claim really contains a deal-config
+                            # fact; otherwise label it honestly as unverified so
+                            # a reviewer sees it, rather than a false all-clear.
+                            _claim_text = claim_dict.get("claim", "")
+                            _is_deal_cfg = _claim_matches_deal_config(_claim_text, subject_cfg)
                             audit_entries.append({
                                 "section_num":    claim_dict.get("section_num"),
                                 "section_title":  claim_dict.get("section_title", ""),
-                                "claim":          claim_dict.get("claim", ""),
-                                "source_file":    "Deal Config",
+                                "claim":          _claim_text,
+                                "source_file":    "Deal Config" if _is_deal_cfg else "Unverified",
                                 "page_ref":       None,
                                 "supporting_text": None,
                                 "context":        "",
-                                "citation_type":  "Deal Config",
+                                "citation_type":  "Deal Config" if _is_deal_cfg else "Unverified",
                                 "rag_score":      round(match["score"], 3) if match else 0.0,
                                 "low_confidence": False,
                             })

@@ -367,6 +367,13 @@ def _parse_pdf_records(pdf_path: str, llm_cfg: dict,
             "tenant":          tnt,
             "lease_type":      l_type,
             "_source":         "pdf",
+            # Carry the extractor's provenance + advisory flags through the
+            # reshape so downstream (review UI, eval harness, cross-source
+            # conflict check) can trace each value to its source cell and see
+            # what the deterministic/Stage-5 checks flagged.
+            "_prov":           item.get("_prov"),
+            "_prov_page":      item.get("_prov_page"),
+            "_auto_flags":     item.get("_auto_flags"),
             # AI-judgment markers — the preview declares these so the analyst can
             # review values the AI decided rather than transcribed from a cell.
             "_llm_parsed":     item.get("_llm_parsed"),
