@@ -2288,14 +2288,31 @@ def generate_rationale(
 
                     # Step 3: for each claim, retrieve the best matching page chunk
                     for claim_dict, claim_emb in zip(claims, claim_embeddings):
-                        match = _rag_find_source(
-                            claim_emb, rag_index, claim_dict.get("claim", "")
-                        )
-                        if match and match["score"] >= 0.3:
+                        _claim_text = claim_dict.get("claim", "")
+                        match = _rag_find_source(claim_emb, rag_index, _claim_text)
+                        _confident_pdf = bool(match and match["score"] >= 0.3
+                                              and not match.get("low_confidence"))
+
+                        # A PDF "match" that cleared the score bar but couldn't pin
+                        # down a real supporting sentence (low_confidence=True) is
+                        # NOT treated as good enough to stop here — a location claim
+                        # (e.g. MRT connectivity) can score >=0.3 against an
+                        # unrelated page purely by page-level semantic similarity
+                        # while the real source is the web location search, which
+                        # would never even get checked otherwise (it was only ever
+                        # tried as a fallback for PDF match FAILURE, not for a
+                        # low-confidence PDF "success"). So a low-confidence PDF
+                        # match is treated the same as no PDF match for this
+                        # decision — only accepted as a last resort below if
+                        # nothing better (location, deal config) is found either.
+                        _loc = None if _confident_pdf else _match_location_context(
+                            _claim_text, location_context, location_sources)
+
+                        if _confident_pdf:
                             audit_entries.append({
                                 "section_num":    claim_dict.get("section_num"),
                                 "section_title":  claim_dict.get("section_title", ""),
-                                "claim":          claim_dict.get("claim", ""),
+                                "claim":          _claim_text,
                                 "source_file":    match["source_file"],
                                 "page_ref":       f"p.{match['page']}",
                                 "supporting_text": match["text"],
@@ -2304,20 +2321,17 @@ def generate_rationale(
                                 "rag_score":      round(match["score"], 3),
                                 "low_confidence": match.get("low_confidence", False),
                             })
-                        elif _match_location_context(claim_dict.get("claim", ""),
-                                                     location_context, location_sources):
-                            # No PDF page matched, but the web location search DID
+                        elif _loc:
+                            # No confident PDF match, but the web location search DID
                             # supply this claim. Without this branch it would fall
                             # through to the "Deal Config" default below and be
                             # attributed to a file it never came from — the audit
                             # must name the real source (the search URL), not the
                             # nearest convenient label.
-                            _loc = _match_location_context(claim_dict.get("claim", ""),
-                                                           location_context, location_sources)
                             audit_entries.append({
                                 "section_num":    claim_dict.get("section_num"),
                                 "section_title":  claim_dict.get("section_title", ""),
-                                "claim":          claim_dict.get("claim", ""),
+                                "claim":          _claim_text,
                                 "source_file":    _loc["source_file"],
                                 "page_ref":       None,
                                 "supporting_text": _loc["supporting_text"],
@@ -2325,6 +2339,24 @@ def generate_rationale(
                                 "citation_type":  _loc["citation_type"],
                                 "rag_score":      None,   # not a PDF match — see cross-check
                                 "low_confidence": False,
+                            })
+                        elif match and match["score"] >= 0.3:
+                            # Low-confidence PDF match, and neither location search
+                            # nor (checked below) deal config had a better answer —
+                            # last resort: keep it, still flagged low_confidence so
+                            # the cross-check forces a manual-verify warning rather
+                            # than presenting it as settled.
+                            audit_entries.append({
+                                "section_num":    claim_dict.get("section_num"),
+                                "section_title":  claim_dict.get("section_title", ""),
+                                "claim":          _claim_text,
+                                "source_file":    match["source_file"],
+                                "page_ref":       f"p.{match['page']}",
+                                "supporting_text": match["text"],
+                                "context":        match.get("context", ""),
+                                "citation_type":  match["citation_type"],
+                                "rag_score":      round(match["score"], 3),
+                                "low_confidence": True,
                             })
                         else:
                             # No PDF page and no web-search match. This used to
@@ -2339,7 +2371,6 @@ def generate_rationale(
                             # Config" if the claim really contains a deal-config
                             # fact; otherwise label it honestly as unverified so
                             # a reviewer sees it, rather than a false all-clear.
-                            _claim_text = claim_dict.get("claim", "")
                             _is_deal_cfg = _claim_matches_deal_config(_claim_text, subject_cfg)
                             audit_entries.append({
                                 "section_num":    claim_dict.get("section_num"),
